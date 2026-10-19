@@ -1,0 +1,311 @@
+{
+  "probe": "V-03 track sampling",
+  "raw_hz": 1,
+  "config": "STRAIGHT 20s / TURN 2s / CLIMB_DESCENT 5s / APPROACH 1s / TAXI 10s, max gap 45s",
+  "cases": [
+    {
+      "case": "track_2h",
+      "duration_min": 126.0,
+      "raw_points": 7560,
+      "saved_points": 1116,
+      "reduction_pct": 85.24,
+      "segments": 12,
+      "modes": {
+        "TAXI": 55,
+        "STRAIGHT": 305,
+        "CLIMB_DESCENT": 496,
+        "TURN": 74,
+        "APPROACH": 186
+      },
+      "save_reasons": {
+        "first": 1,
+        "hdg": 158,
+        "interval:TAXI": 13,
+        "event": 17,
+        "mode:TAXI->STRAIGHT": 1,
+        "mode:STRAIGHT->CLIMB_DESCENT": 2,
+        "interval:CLIMB_DESCENT": 445,
+        "mode:CLIMB_DESCENT->STRAIGHT": 1,
+        "dist": 279,
+        "mode:STRAIGHT->TURN": 2,
+        "interval:TURN": 4,
+        "mode:TURN->STRAIGHT": 2,
+        "interval:STRAIGHT": 4,
+        "mode:CLIMB_DESCENT->APPROACH": 1,
+        "interval:APPROACH": 183,
+        "mode:APPROACH->STRAIGHT": 1,
+        "mode:STRAIGHT->TAXI": 1,
+        "last": 1
+      },
+      "max_gap_s": 20.0,
+      "fidelity": {
+        "n": 7560,
+        "max_m": 27.53,
+        "p95_m": 0.2,
+        "mean_m": 0.14
+      },
+      "quantization_error_m": 0.01,
+      "file_bytes": 13838,
+      "manifest_bytes": 1389,
+      "file_kb": 14.9,
+      "baseline_1hz_kb": 64.9,
+      "budget_kb": 500,
+      "checks": {
+        "reduction_ge_60pct": true,
+        "max_gap_le_45s": true,
+        "deviation_le_30m": true,
+        "size_within_budget": true
+      },
+      "manifest": [
+        {
+          "file": "000-TAXI.bin.gz",
+          "mode": "TAXI",
+          "start_t": 0.0,
+          "end_t": 359.0,
+          "points": 52,
+          "bytes": 540
+        },
+        {
+          "file": "001-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 360.0,
+          "end_t": 360.0,
+          "points": 1,
+          "bytes": 43
+        },
+        {
+          "file": "002-CLIMB_DESCENT.bin.gz",
+          "mode": "CLIMB_DESCENT",
+          "start_t": 361.0,
+          "end_t": 1260.0,
+          "points": 216,
+          "bytes": 3054
+        },
+        {
+          "file": "003-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 1261.0,
+          "end_t": 1549.0,
+          "points": 19,
+          "bytes": 263
+        },
+        {
+          "file": "004-TURN.bin.gz",
+          "mode": "TURN",
+          "start_t": 1560.0,
+          "end_t": 1599.0,
+          "points": 37,
+          "bytes": 432
+        },
+        {
+          "file": "005-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 1601.0,
+          "end_t": 3227.0,
+          "points": 105,
+          "bytes": 1192
+        },
+        {
+          "file": "006-TURN.bin.gz",
+          "mode": "TURN",
+          "start_t": 3240.0,
+          "end_t": 3279.0,
+          "points": 37,
+          "bytes": 430
+        },
+        {
+          "file": "007-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 3281.0,
+          "end_t": 5929.0,
+          "points": 176,
+          "bytes": 1937
+        },
+        {
+          "file": "008-CLIMB_DESCENT.bin.gz",
+          "mode": "CLIMB_DESCENT",
+          "start_t": 5948.0,
+          "end_t": 7323.0,
+          "points": 280,
+          "bytes": 3231
+        },
+        {
+          "file": "009-APPROACH.bin.gz",
+          "mode": "APPROACH",
+          "start_t": 7325.0,
+          "end_t": 7510.0,
+          "points": 186,
+          "bytes": 2597
+        },
+        {
+          "file": "010-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 7511.0,
+          "end_t": 7533.0,
+          "points": 4,
+          "bytes": 63
+        },
+        {
+          "file": "011-TAXI.bin.gz",
+          "mode": "TAXI",
+          "start_t": 7547.0,
+          "end_t": 7559.0,
+          "points": 3,
+          "bytes": 56
+        }
+      ]
+    },
+    {
+      "case": "track_3h",
+      "duration_min": 187.8,
+      "raw_points": 11269,
+      "saved_points": 1342,
+      "reduction_pct": 88.09,
+      "segments": 12,
+      "modes": {
+        "TAXI": 55,
+        "STRAIGHT": 532,
+        "CLIMB_DESCENT": 495,
+        "TURN": 74,
+        "APPROACH": 186
+      },
+      "save_reasons": {
+        "first": 1,
+        "hdg": 152,
+        "interval:TAXI": 13,
+        "event": 17,
+        "mode:TAXI->STRAIGHT": 1,
+        "mode:STRAIGHT->CLIMB_DESCENT": 2,
+        "interval:CLIMB_DESCENT": 445,
+        "mode:CLIMB_DESCENT->STRAIGHT": 1,
+        "dist": 511,
+        "mode:STRAIGHT->TURN": 2,
+        "interval:TURN": 4,
+        "mode:TURN->STRAIGHT": 2,
+        "interval:STRAIGHT": 4,
+        "mode:CLIMB_DESCENT->APPROACH": 1,
+        "interval:APPROACH": 183,
+        "mode:APPROACH->STRAIGHT": 1,
+        "mode:STRAIGHT->TAXI": 1,
+        "last": 1
+      },
+      "max_gap_s": 20.0,
+      "fidelity": {
+        "n": 11269,
+        "max_m": 22.23,
+        "p95_m": 0.19,
+        "mean_m": 0.12
+      },
+      "quantization_error_m": 0.01,
+      "file_bytes": 16179,
+      "manifest_bytes": 1396,
+      "file_kb": 17.2,
+      "baseline_1hz_kb": 91.7,
+      "budget_kb": 750,
+      "checks": {
+        "reduction_ge_60pct": true,
+        "max_gap_le_45s": true,
+        "deviation_le_30m": true,
+        "size_within_budget": true
+      },
+      "manifest": [
+        {
+          "file": "000-TAXI.bin.gz",
+          "mode": "TAXI",
+          "start_t": 0.0,
+          "end_t": 359.0,
+          "points": 52,
+          "bytes": 540
+        },
+        {
+          "file": "001-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 360.0,
+          "end_t": 360.0,
+          "points": 1,
+          "bytes": 43
+        },
+        {
+          "file": "002-CLIMB_DESCENT.bin.gz",
+          "mode": "CLIMB_DESCENT",
+          "start_t": 361.0,
+          "end_t": 1259.0,
+          "points": 215,
+          "bytes": 3033
+        },
+        {
+          "file": "003-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 1261.0,
+          "end_t": 1549.0,
+          "points": 19,
+          "bytes": 265
+        },
+        {
+          "file": "004-TURN.bin.gz",
+          "mode": "TURN",
+          "start_t": 1560.0,
+          "end_t": 1599.0,
+          "points": 37,
+          "bytes": 426
+        },
+        {
+          "file": "005-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 1600.0,
+          "end_t": 3232.0,
+          "points": 103,
+          "bytes": 1163
+        },
+        {
+          "file": "006-TURN.bin.gz",
+          "mode": "TURN",
+          "start_t": 3240.0,
+          "end_t": 3279.0,
+          "points": 37,
+          "bytes": 425
+        },
+        {
+          "file": "007-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 3281.0,
+          "end_t": 9637.0,
+          "points": 405,
+          "bytes": 4337
+        },
+        {
+          "file": "008-CLIMB_DESCENT.bin.gz",
+          "mode": "CLIMB_DESCENT",
+          "start_t": 9657.0,
+          "end_t": 11032.0,
+          "points": 280,
+          "bytes": 3229
+        },
+        {
+          "file": "009-APPROACH.bin.gz",
+          "mode": "APPROACH",
+          "start_t": 11034.0,
+          "end_t": 11219.0,
+          "points": 186,
+          "bytes": 2599
+        },
+        {
+          "file": "010-STRAIGHT.bin.gz",
+          "mode": "STRAIGHT",
+          "start_t": 11220.0,
+          "end_t": 11242.0,
+          "points": 4,
+          "bytes": 63
+        },
+        {
+          "file": "011-TAXI.bin.gz",
+          "mode": "TAXI",
+          "start_t": 11256.0,
+          "end_t": 11268.0,
+          "points": 3,
+          "bytes": 56
+        }
+      ]
+    }
+  ]
+}

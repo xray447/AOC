@@ -1,0 +1,28 @@
+{
+  "probe": "V-07 MapLibre 1 万点增量回放（无头 Chrome / SwiftShader）",
+  "checks": {
+    "webgl_context_ok": true,
+    "fps_measured": true,
+    "full_10k_setdata_ok": true,
+    "no_page_error": true,
+    "fps_ge_15_software": true,
+    "seek_latency_lt_500ms": true
+  },
+  "facts": {
+    "webgl_ok": true,
+    "initial_text": "AOC 轨迹回放 · 10,000 点 | 60 FPS | 1 Hz 采样 · 回放倍速 120× · 轨迹 1200 NM | 暂停 | 00:04:01 / 02:46:39 | 倍速 | 10× | 60× | 120× | 240× | 已渲染 242 / 10000 点 · 单条 LineString 增量 setData",
+    "fps_5s": 60.1,
+    "frames_in_5s": 301,
+    "badge_text": "60 FPS",
+    "timeline_text": "已渲染 844 / 10000 点 · 单条 LineString 增量 setData",
+    "seek_full_10k_ms": 26.7,
+    "text_after_seek": "已渲染 10000 / 10000 点 · 单条 LineString 增量 setData",
+    "page_errors": []
+  },
+  "all_pass": true,
+  "notes": [
+    "无头 Chrome 使用 SwiftShader 软件光栅化，帧率为保守下限。",
+    "OSM 瓦片被拦截以避免外网依赖；线条与图层渲染不受影响。",
+    "seek 测试即一次性 setData 10,000 点，测到两帧后的耗时（含 React 状态更新）。"
+  ]
+}

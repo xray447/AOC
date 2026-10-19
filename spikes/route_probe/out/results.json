@@ -1,0 +1,294 @@
+{
+  "probe": "V-05/V-06 route provider chain",
+  "navdata": {
+    "loaded": true,
+    "airac": "2609",
+    "load_ms": 80.8,
+    "error": ""
+  },
+  "graph": {
+    "available": true,
+    "load_ms": 699.2,
+    "error": ""
+  },
+  "aip": {
+    "status": "offline_fixture",
+    "error": "",
+    "fixture": "C:\\Users\\xwj12\\Desktop\\MSFS\\AOC\\spikes\\route_probe\\data\\aip_routes_sample.csv"
+  },
+  "cases": [
+    {
+      "dep": "RJTT",
+      "arr": "RJAA",
+      "cruise_fl": 350,
+      "status": "ok",
+      "provider": "AIP",
+      "route": "RJTT VAMOS4.TATEY UTIBO Y803 EKIRA DCT BINKS BINKSA RJAA",
+      "tokens": [
+        "RJTT",
+        "VAMOS4.TATEY",
+        "UTIBO",
+        "Y803",
+        "EKIRA",
+        "DCT",
+        "BINKS",
+        "BINKSA",
+        "RJAA"
+      ],
+      "distance_nm": null,
+      "gcd_nm": 32.1,
+      "confidence": "high",
+      "requires_online": false,
+      "external_url": "https://dispatch.simbrief.com/options/custom?orig=RJTT&dest=RJAA&type=A320&fl=350&navlog=1",
+      "navdata_checked": true,
+      "airac": "2609",
+      "warnings": [
+        "coverage_route_too_short",
+        "altitude_unverified"
+      ],
+      "attempts": [
+        {
+          "provider": "AIP",
+          "status": "ok",
+          "reason": "",
+          "ms": 700.2
+        }
+      ],
+      "elapsed_ms": 781.1,
+      "source": "aip:fixture-jp-routes",
+      "coverage": {
+        "checked": false,
+        "reason": "route_too_short",
+        "gcd_nm": 32.1,
+        "pass": null
+      },
+      "altitude": {
+        "valid": null,
+        "violations": [],
+        "checked": 0,
+        "unknown": 1
+      },
+      "case": "AIP_RJTT_RJAA",
+      "expect": "AIP",
+      "strict": true
+    },
+    {
+      "dep": "ZBAA",
+      "arr": "ZSSS",
+      "cruise_fl": 350,
+      "status": "ok",
+      "provider": "GRAPH",
+      "route": "ZBAA ELKU2G ELKUR W40 DOXAB OVNUG PANKI ARENO YQG W142 DALIM A593 ABTUB OVTIT AVPEP UDINO DPX SAGIP OMUDI LAGAL ATVAD SUBKU NIXEM XUTGU PIMOL UBRUG VMB W161 SASAN SASANT ZSSS",
+      "tokens": [
+        "ZBAA",
+        "ELKU2G",
+        "ELKUR",
+        "W40",
+        "DOXAB",
+        "OVNUG",
+        "PANKI",
+        "ARENO",
+        "YQG",
+        "W142",
+        "DALIM",
+        "A593",
+        "ABTUB",
+        "OVTIT",
+        "AVPEP",
+        "UDINO",
+        "DPX",
+        "SAGIP",
+        "OMUDI",
+        "LAGAL",
+        "ATVAD",
+        "SUBKU",
+        "NIXEM",
+        "XUTGU",
+        "PIMOL",
+        "UBRUG",
+        "VMB",
+        "W161",
+        "SASAN",
+        "SASANT",
+        "ZSSS"
+      ],
+      "distance_nm": 621.9,
+      "gcd_nm": 580.7,
+      "confidence": "high",
+      "requires_online": false,
+      "external_url": "https://dispatch.simbrief.com/options/custom?orig=ZBAA&dest=ZSSS&type=A320&fl=350&navlog=1",
+      "navdata_checked": true,
+      "airac": "2609",
+      "warnings": [],
+      "attempts": [
+        {
+          "provider": "AIP",
+          "status": "failed",
+          "reason": "no_match",
+          "ms": 0.0
+        },
+        {
+          "provider": "GRAPH",
+          "status": "ok",
+          "reason": "",
+          "ms": 314.5
+        }
+      ],
+      "elapsed_ms": 314.6,
+      "source": "network.pkl",
+      "coverage": {
+        "checked": true,
+        "gcd_nm": 580.7,
+        "samples": 10,
+        "uncovered_samples": 0,
+        "max_gap_nm": 0.0,
+        "gap_pct": 0.0,
+        "gaps": [],
+        "pass": true
+      },
+      "altitude": {
+        "valid": true,
+        "violations": [],
+        "checked": 18,
+        "unknown": 1
+      },
+      "case": "GRAPH_ZBAA_ZSSS",
+      "expect": "GRAPH",
+      "strict": true
+    },
+    {
+      "dep": "LROP",
+      "arr": "LFPG",
+      "cruise_fl": 350,
+      "status": "deferred",
+      "provider": "SIMBRIEF",
+      "route": null,
+      "tokens": [],
+      "distance_nm": null,
+      "gcd_nm": null,
+      "confidence": "low",
+      "requires_online": true,
+      "external_url": "https://dispatch.simbrief.com/options/custom?orig=LROP&dest=LFPG&type=A320&fl=350&navlog=1",
+      "navdata_checked": false,
+      "airac": "2609",
+      "warnings": [
+        "requires_online",
+        "no_offline_candidate"
+      ],
+      "attempts": [
+        {
+          "provider": "SIMBRIEF",
+          "status": "deferred",
+          "reason": "外部在线源，不在本地编造航路",
+          "ms": 0.0
+        }
+      ],
+      "elapsed_ms": 0.0,
+      "case": "SIMBRIEF_LROP_LFPG",
+      "expect": "SIMBRIEF",
+      "strict": true
+    },
+    {
+      "dep": "EGLL",
+      "arr": "KJFK",
+      "cruise_fl": 350,
+      "status": "deferred",
+      "provider": "SIMBRIEF",
+      "route": null,
+      "tokens": [],
+      "distance_nm": null,
+      "gcd_nm": null,
+      "confidence": "low",
+      "requires_online": true,
+      "external_url": "https://dispatch.simbrief.com/options/custom?orig=EGLL&dest=KJFK&type=A320&fl=350&navlog=1",
+      "navdata_checked": false,
+      "airac": "2609",
+      "warnings": [
+        "requires_online",
+        "no_offline_candidate"
+      ],
+      "attempts": [
+        {
+          "provider": "AIP",
+          "status": "failed",
+          "reason": "no_match",
+          "ms": 0.0
+        },
+        {
+          "provider": "GRAPH",
+          "status": "failed",
+          "reason": "detour_too_large: 2.07x",
+          "ms": 9.0
+        },
+        {
+          "provider": "SIMBRIEF",
+          "status": "deferred",
+          "reason": "外部在线源，不在本地编造航路",
+          "ms": 0.0
+        }
+      ],
+      "elapsed_ms": 9.0,
+      "case": "CROSS_EGLL_KJFK",
+      "expect": "SIMBRIEF",
+      "strict": false
+    },
+    {
+      "dep": "RJTT",
+      "arr": "RJAA",
+      "cruise_fl": 350,
+      "status": "ok",
+      "provider": "AIP",
+      "route": "RJTT VAMOS4.TATEY UTIBO Y803 EKIRA DCT BINKS BINKSA RJAA",
+      "tokens": [
+        "RJTT",
+        "VAMOS4.TATEY",
+        "UTIBO",
+        "Y803",
+        "EKIRA",
+        "DCT",
+        "BINKS",
+        "BINKSA",
+        "RJAA"
+      ],
+      "distance_nm": null,
+      "gcd_nm": null,
+      "confidence": "medium",
+      "requires_online": false,
+      "external_url": "https://dispatch.simbrief.com/options/custom?orig=RJTT&dest=RJAA&type=A320&fl=350&navlog=1",
+      "navdata_checked": false,
+      "airac": null,
+      "warnings": [
+        "navdata_unavailable"
+      ],
+      "attempts": [
+        {
+          "provider": "AIP",
+          "status": "ok",
+          "reason": "",
+          "ms": 467.8
+        }
+      ],
+      "elapsed_ms": 467.8,
+      "source": "aip:fixture-jp-routes",
+      "coverage": {
+        "checked": false,
+        "reason": "navdata_disabled"
+      },
+      "altitude": {
+        "valid": null,
+        "violations": []
+      },
+      "case": "NO_NAVDATA_RJTT_RJAA",
+      "expect": "AIP",
+      "strict": true
+    }
+  ],
+  "errors": [],
+  "deviations": [],
+  "fidelity_notes": [
+    "M0 环境无外网，AIP 使用 fixture（source=fixture-jp-routes），仅验证管线与校验，不代表真实 AIP 数据。",
+    "network.pkl 的边没有 min/max FL，本探针改为按航路串还原航段、用 navdata 的 (航路, 两端 ident) 反查高度限制。",
+    "AIP 样本航路以 DCT 连接、Y803 只有一个端点，因此该用例高度校验记为未知，不代表校验失效。",
+    "navdata 的 airway 表存在 min>max 脏区间（如 Y803 为 250..245），已按未知处理，不用它做名字级校验。"
+  ]
+}

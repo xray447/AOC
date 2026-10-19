@@ -1,0 +1,16 @@
+[
+  {
+    "t": 70,
+    "lat": 35.5396996,
+    "lon": 139.8051453,
+    "vs_fpm": -180,
+    "g_force": 1.45,
+    "aoa_deg": 6,
+    "ias_kt": 142,
+    "hdg_deg": 330,
+    "airport": "RJTT",
+    "runway": "34R",
+    "runway_dist_nm": 0,
+    "runway_hdg_diff_deg": 0
+  }
+]

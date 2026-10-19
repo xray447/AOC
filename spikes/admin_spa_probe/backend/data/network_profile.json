@@ -1,0 +1,12 @@
+{
+  "min_fl": 290,
+  "max_fl": 410,
+  "route_provider_order": [
+    "AIP",
+    "GRAPH",
+    "SIMBRIEF"
+  ],
+  "coverage_ignore_below_nm": 200,
+  "updated_at": null,
+  "updated_by": null
+}

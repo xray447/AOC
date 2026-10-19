@@ -1,0 +1,28 @@
+{
+  "probe": "V-09 admin SPA",
+  "checks": {
+    "anonymous_401": true,
+    "bad_password_401": true,
+    "pilot_login_ok": true,
+    "session_cookie_httponly": true,
+    "pilot_can_read_profile": true,
+    "pilot_write_403": true,
+    "admin_login_ok": true,
+    "write_without_csrf_403": true,
+    "write_forged_csrf_403": true,
+    "admin_write_ok": true,
+    "write_persisted": true,
+    "invalid_range_422": true,
+    "reset_ok": true,
+    "reset_persisted": true,
+    "logout_invalidates": true,
+    "spa_index_ok": true
+  },
+  "login_ms": 31.04,
+  "all_pass": true,
+  "notes": [
+    "密码用 PBKDF2 演示存储，生产需换 Argon2 并接真实用户表。",
+    "Session 为服务端内存表，重启即失效；正式实现按架构文档走 SQLite。",
+    "CSRF 使用双提交 Cookie + 自定义头，写接口缺一即 403。"
+  ]
+}

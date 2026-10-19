@@ -1,0 +1,12 @@
+{
+  "source": "replay:final_approach_rjtt34r.jsonl",
+  "samples": 80,
+  "duration_s": 79,
+  "touchdowns": 1,
+  "events": 1,
+  "fps": null,
+  "frame_count": null,
+  "simconnect": "",
+  "warnings": [],
+  "aircraft": ""
+}

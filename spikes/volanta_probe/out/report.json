@@ -1,0 +1,23 @@
+{
+  "probe": "V-04 Volanta flown routes",
+  "diagnosis": "logged_out",
+  "diagnosis_message": "ℹ️ Volanta：尚未读到登录令牌，请在浏览器中登录 Volanta。若您刚登录，令牌约 1 分钟后才写入磁盘，请稍候。",
+  "network_api_called": false,
+  "api_fixture_counts": {
+    "RJTT|RJAA": 2,
+    "RJAA|RJCC": 1
+  },
+  "csv_fixture_counts": {
+    "RJTT|RJAA": 2,
+    "RJCC|RJTT": 1
+  },
+  "checks": {
+    "api_counts_ok": true,
+    "csv_counts_ok": true,
+    "diagnosis_is_known": true
+  },
+  "notes": [
+    "会话诊断只读浏览器 localStorage，token 既未打印也未用于联网。",
+    "真实 /api/v1/Flights 调用需要有效令牌 + 外网，M0 环境不具备，故未执行。"
+  ]
+}

@@ -1,0 +1,4 @@
+japan-flight-dispatcher/
+Pre-train/
+*.zip
+**/node_modules/**

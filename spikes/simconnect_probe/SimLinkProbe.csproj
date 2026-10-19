@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SimLinkProbe</RootNamespace>
+    <AssemblyName>SimLinkProbe</AssemblyName>
+    <!-- 有 MSFS SDK 时自动接入托管 SimConnect；没有也能编译并跑回放模式 -->
+    <SimConnectDll Condition="'$(SimConnectDll)' == ''">C:\MSFS SDK\SimConnect SDK\lib\managed\Microsoft.FlightSimulator.SimConnect.dll</SimConnectDll>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(SimConnectDll)')">
+    <Reference Include="Microsoft.FlightSimulator.SimConnect">
+      <HintPath>$(SimConnectDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <PropertyGroup Condition="Exists('$(SimConnectDll)')">
+    <DefineConstants>$(DefineConstants);HAVE_SIMCONNECT</DefineConstants>
+  </PropertyGroup>
+
+</Project>

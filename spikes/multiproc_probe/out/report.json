@@ -1,0 +1,114 @@
+{
+  "probe": "V-10 三进程握手与崩溃恢复",
+  "checks": {
+    "backend_health_ok": true,
+    "web_index_ok": true,
+    "web_same_origin_proxy_ok": true,
+    "frontend_sees_backend": true,
+    "partial_ingest_before_crash": true,
+    "collector_offline_detected": true,
+    "collector_restart_exit_ok": true,
+    "collector_resumed_from_ack": true,
+    "no_gap_after_restart": true,
+    "idempotent_no_double_count": true,
+    "duplicate_batch_deduped": true,
+    "collector_survives_backend_down": true,
+    "backend_down_confirmed": true,
+    "backend_restarted_ok": true,
+    "collector_completed_after_backend_restart": true,
+    "second_flight_complete": true,
+    "data_persisted_across_backend_restart": true,
+    "web_still_ok_after_backend_restart": true,
+    "sessions_tracked": true,
+    "ten_startups_ten_ok": true,
+    "no_port_conflict": true,
+    "final_backend_recover_ok": true
+  },
+  "facts": {
+    "batches_before_crash": 1,
+    "collector_state_after_crash": "offline",
+    "last_seen_age_s": 1.915,
+    "collector_restart_summary": {
+      "session_id": "afb76fd0139e",
+      "fid": "V10",
+      "resumed_from": 0,
+      "sent": 13,
+      "dup": 0,
+      "acked_seq": 13
+    },
+    "ack_before_restart": 0,
+    "flight_V10": {
+      "fid": "V10",
+      "batches": 14,
+      "points": 280,
+      "min_seq": 0,
+      "max_seq": 13,
+      "contiguous": true
+    },
+    "duplicate_replay": {
+      "ok": true,
+      "accepted": 0,
+      "dup": 1,
+      "total": 14
+    },
+    "restart_uptime_s": 0.133,
+    "flight_V10B": {
+      "fid": "V10B",
+      "batches": 14,
+      "points": 280,
+      "min_seq": 0,
+      "max_seq": 13,
+      "contiguous": true
+    },
+    "startups": [
+      {
+        "ok": true,
+        "ready_s": 0.511
+      },
+      {
+        "ok": true,
+        "ready_s": 0.523
+      },
+      {
+        "ok": true,
+        "ready_s": 0.513
+      },
+      {
+        "ok": true,
+        "ready_s": 0.511
+      },
+      {
+        "ok": true,
+        "ready_s": 0.511
+      },
+      {
+        "ok": true,
+        "ready_s": 0.526
+      },
+      {
+        "ok": true,
+        "ready_s": 0.512
+      },
+      {
+        "ok": true,
+        "ready_s": 0.523
+      },
+      {
+        "ok": true,
+        "ready_s": 0.514
+      },
+      {
+        "ok": true,
+        "ready_s": 0.528
+      }
+    ],
+    "startup_max_s": 0.528
+  },
+  "all_pass": true,
+  "notes": [
+    "后端为独立 uvicorn 进程，SQLite 落盘；杀进程后重启数据仍在。",
+    "采集器按 ack 文件续传，重复批次由主键 INSERT OR IGNORE 去重，不产生重复点数。",
+    "前端经同源反代访问 /health 与 /api，等价于 Tauri 生产形态（自定义协议/本地端口）。",
+    "心跳超时判定 online/offline（1s），生产应放宽到 3~5s 并加序列号单调性校验。"
+  ]
+}

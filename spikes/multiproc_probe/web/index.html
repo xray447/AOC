@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>AOC V-10 三进程探针</title>
+  <style>
+    body { font-family: ui-monospace, Consolas, monospace; background:#0d1117; color:#e6edf3; margin:0; padding:24px; }
+    h1 { font-size:16px; color:#7ee787; }
+    #status { padding:8px 12px; border:1px solid #30363d; border-radius:6px; }
+    .online { color:#7ee787; } .offline { color:#ff7b72; }
+  </style>
+</head>
+<body>
+  <h1>AOC V-10 三进程探针</h1>
+  <div id="root">booting…</div>
+  <script>
+    const root = document.getElementById('root');
+    async function tick() {
+      try {
+        const r = await fetch('/health', { cache: 'no-store' });
+        const h = await r.json();
+        root.className = h.collector.state === 'online' ? 'online' : 'offline';
+        root.textContent = `backend uptime=${h.uptime_s}s batches=${h.batches} points=${h.points} collector=${h.collector.state}`;
+      } catch (e) {
+        root.className = 'offline';
+        root.textContent = 'backend unreachable: ' + e;
+      }
+      setTimeout(tick, 500);
+    }
+    tick();
+  </script>
+</body>
+</html>

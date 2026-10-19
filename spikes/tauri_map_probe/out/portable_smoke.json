@@ -1,0 +1,15 @@
+{
+  "zip": "AOC-Map-Probe-portable-0.1.0.zip",
+  "zip_kb": 371.5,
+  "work": "C:\\Users\\xwj12\\AppData\\Local\\Temp\\aoc_portable_ejrmi01z",
+  "server_ok": true,
+  "fps_text": "60 FPS",
+  "canvas": 1,
+  "title": "AOC 轨迹回放探针",
+  "console_errors": [
+    "console:error:Error"
+  ],
+  "fatal_errors": [],
+  "fps": 60.0,
+  "ok": true
+}
