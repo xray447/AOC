@@ -2,3 +2,7 @@ japan-flight-dispatcher/
 Pre-train/
 *.zip
 **/node_modules/**
+**/__pycache__/**
+**/obj/**
+**/bin/**
+**/out/**
