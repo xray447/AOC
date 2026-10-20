@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AocSimLink</RootNamespace>
+    <AssemblyName>aoc-simlink</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <!-- SimConnect SDK：优先使用 spike 里已经验证过的托管 DLL，其次 MSFS SDK 默认路径。 -->
+  <PropertyGroup>
+    <SimConnectSdkDir Condition="'$(SimConnectSdkDir)' == '' and Exists('$(MSBuildProjectDirectory)\..\..\spikes\simconnect_probe\SimConnect SDK\lib\managed\Microsoft.FlightSimulator.SimConnect.dll')">$(MSBuildProjectDirectory)\..\..\spikes\simconnect_probe\SimConnect SDK</SimConnectSdkDir>
+    <SimConnectSdkDir Condition="'$(SimConnectSdkDir)' == ''">C:\MSFS SDK\SimConnect SDK</SimConnectSdkDir>
+    <SimConnectDll Condition="'$(SimConnectDll)' == ''">$(SimConnectSdkDir)\lib\managed\Microsoft.FlightSimulator.SimConnect.dll</SimConnectDll>
+    <SimConnectNativeDll Condition="'$(SimConnectNativeDll)' == ''">$(SimConnectSdkDir)\lib\SimConnect.dll</SimConnectNativeDll>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(SimConnectDll)')">
+    <Reference Include="Microsoft.FlightSimulator.SimConnect">
+      <HintPath>$(SimConnectDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(SimConnectNativeDll)')">
+    <None Include="$(SimConnectNativeDll)" Link="SimConnect.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="Exists('$(SimConnectDll)')">
+    <DefineConstants>$(DefineConstants);HAVE_SIMCONNECT</DefineConstants>
+  </PropertyGroup>
+
+</Project>

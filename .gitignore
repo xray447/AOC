@@ -42,3 +42,8 @@ Pre-train/
 .idea/
 .DS_Store
 Thumbs.db
+
+# AOC core
+.pytest_cache/
+apps/client/src-tauri/gen/
+

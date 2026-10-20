@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = [
+  "packages/aoc_protocol",
+  "packages/aoc_navdata",
+  "packages/aoc_route",
+  "packages/aoc_integrations",
+  "packages/aoc_core",
+  "apps/aoc-core",
+]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
