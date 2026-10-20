@@ -1,7 +1,52 @@
 [
   {
-    "t": 70,
+    "t": 111.5784418,
+    "type": "liftoff",
+    "detail": ""
+  },
+  {
+    "t": 111.5784418,
+    "type": "gear",
+    "detail": "up"
+  },
+  {
+    "t": 111.5784418,
+    "type": "flaps",
+    "detail": "0"
+  },
+  {
+    "t": 125.555866,
+    "type": "gear",
+    "detail": "down"
+  },
+  {
+    "t": 125.555866,
+    "type": "flaps",
+    "detail": "4"
+  },
+  {
+    "t": 126.2056914,
+    "type": "gear",
+    "detail": "up"
+  },
+  {
+    "t": 157.0858888,
+    "type": "gear",
+    "detail": "down"
+  },
+  {
+    "t": 157.1944091,
+    "type": "gear",
+    "detail": "up"
+  },
+  {
+    "t": 162.1382034,
+    "type": "gear",
+    "detail": "down"
+  },
+  {
+    "t": 419.4669007,
     "type": "touchdown",
-    "detail": "RJTT/34R"
+    "detail": "ZSSS/36R"
   }
 ]

@@ -21,6 +21,8 @@ public sealed class TrackSample
     [JsonPropertyName("ias_kt")] public double IasKt { get; set; }
     [JsonPropertyName("gear")] public int Gear { get; set; }
     [JsonPropertyName("flaps")] public int Flaps { get; set; }
+    /// <summary>坡度，右倾为正。</summary>
+    [JsonPropertyName("bank_deg")] public double BankDeg { get; set; }
 }
 
 public sealed class Runway
@@ -47,6 +49,18 @@ public sealed class Touchdown
     [JsonPropertyName("runway")] public string? RunwayName { get; set; }
     [JsonPropertyName("runway_dist_nm")] public double? RunwayDistNm { get; set; }
     [JsonPropertyName("runway_hdg_diff_deg")] public double? RunwayHdgDiffDeg { get; set; }
+    /// <summary>触地后 2s 窗口内的 G 峰值（帧级采样，用于与落地评分工具对齐）。</summary>
+    [JsonPropertyName("g_force_peak")] public double? GForcePeak { get; set; }
+    /// <summary>触地瞬间俯仰角，抬头为正。</summary>
+    [JsonPropertyName("pitch_deg")] public double? PitchDeg { get; set; }
+    /// <summary>触地瞬间坡度，右倾为正。</summary>
+    [JsonPropertyName("bank_deg")] public double? BankDeg { get; set; }
+    /// <summary>接地点距跑道入口的纵向距离（米）。</summary>
+    [JsonPropertyName("runway_along_m")] public double? RunwayAlongM { get; set; }
+    /// <summary>接地点相对跑道中心线的横向偏差（米），右偏为正。</summary>
+    [JsonPropertyName("runway_lateral_m")] public double? RunwayLateralM { get; set; }
+    /// <summary>跑道长度（米），由反向跑道记录推算，缺失为 null。</summary>
+    [JsonPropertyName("runway_length_m")] public double? RunwayLengthM { get; set; }
 }
 
 public sealed class FlightEvent

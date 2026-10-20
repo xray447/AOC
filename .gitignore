@@ -1,8 +1,44 @@
+# ═══════════ 依赖 / 运行环境 ═══════════
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# ═══════════ 构建产物 ═══════════
+**/bin/
+**/obj/
+**/target/
+**/dist/
+**/dist-ssr/
+.vite/
+*.tsbuildinfo
+
+# ═══════════ 探针 / 采集产物 ═══════════
+# out/、out2/、out_report/、out2_report/ 这类目录整体忽略
+# （用 /** 只忽略目录内容，父目录不被排除，下面的 ! 才生效）
+**/out*/**
+# 结论文件仍入库：文档把它们当验证证据引用
+!**/out*/*report*.md
+!**/out*/*report*.json
+!**/out*/results.json
+!**/out*/portable_smoke.json
+# 日志 / 数据库 / 逐样本数据 / 截图
+*.log
+*.db
+*.db-wal
+*.db-shm
+flight.jsonl
+
+# ═══════════ 本地工具链 / 外部数据 ═══════════
+# MSFS SimConnect SDK 为微软可分发包，按 README 自行放置，不入库
+spikes/simconnect_probe/SimConnect SDK/
 japan-flight-dispatcher/
 Pre-train/
 *.zip
-**/node_modules/**
-**/__pycache__/**
-**/obj/**
-**/bin/**
-**/out/**
+
+# ═══════════ 编辑器 / 系统 ═══════════
+.vs/
+.idea/
+.DS_Store
+Thumbs.db

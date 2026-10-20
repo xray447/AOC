@@ -10,14 +10,27 @@ public static class OutputWriter
         WriteIndented = true,
     };
 
-    public static void Save(string outDir, List<TrackSample> samples, List<Touchdown> touchdowns,
-        List<FlightEvent> events, SessionReport session)
+    public static string FlightPath(string outDir) => Path.Combine(outDir, "flight.jsonl");
+
+    /// <summary>逐行实时写 flight.jsonl，进程被强杀也不丢已采集样本。</summary>
+    public static StreamWriter OpenFlightWriter(string outDir)
     {
         Directory.CreateDirectory(outDir);
-        using (var w = new StreamWriter(Path.Combine(outDir, "flight.jsonl")))
+        return new StreamWriter(FlightPath(outDir), append: false) { AutoFlush = true };
+    }
+
+    public static void WriteSample(StreamWriter writer, TrackSample sample)
+        => writer.WriteLine(JsonSerializer.Serialize(sample));
+
+    public static void Save(string outDir, List<TrackSample> samples, List<Touchdown> touchdowns,
+        List<FlightEvent> events, SessionReport session, bool writeFlight = true)
+    {
+        Directory.CreateDirectory(outDir);
+        if (writeFlight)
         {
+            using var w = new StreamWriter(FlightPath(outDir));
             foreach (var s in samples)
-                w.WriteLine(JsonSerializer.Serialize(s));
+                WriteSample(w, s);
         }
         File.WriteAllText(Path.Combine(outDir, "touchdowns.json"),
             JsonSerializer.Serialize(touchdowns, Json));
@@ -25,5 +38,6 @@ public static class OutputWriter
             JsonSerializer.Serialize(events, Json));
         File.WriteAllText(Path.Combine(outDir, "session.json"),
             JsonSerializer.Serialize(session, Json));
+        Report.WriteHtml(outDir, samples, touchdowns, session);
     }
 }

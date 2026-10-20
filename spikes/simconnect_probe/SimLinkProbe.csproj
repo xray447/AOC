@@ -7,14 +7,29 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>SimLinkProbe</RootNamespace>
     <AssemblyName>SimLinkProbe</AssemblyName>
-    <!-- 有 MSFS SDK 时自动接入托管 SimConnect；没有也能编译并跑回放模式 -->
-    <SimConnectDll Condition="'$(SimConnectDll)' == ''">C:\MSFS SDK\SimConnect SDK\lib\managed\Microsoft.FlightSimulator.SimConnect.dll</SimConnectDll>
+  </PropertyGroup>
+
+  <!--
+    MSFS SDK 位置：优先用仓库内自带的拷贝（SimConnect SDK/），其次回退到默认安装路径。
+    也可显式覆盖：dotnet run -p:SimConnectSdkDir=<SDK 根> 或 -p:SimConnectDll=<托管 DLL 全路径>。
+  -->
+  <PropertyGroup>
+    <_BundledSimConnectSdk>$(MSBuildProjectDirectory)\SimConnect SDK</_BundledSimConnectSdk>
+    <SimConnectSdkDir Condition="'$(SimConnectSdkDir)' == '' and Exists('$(_BundledSimConnectSdk)\lib\managed\Microsoft.FlightSimulator.SimConnect.dll')">$(_BundledSimConnectSdk)</SimConnectSdkDir>
+    <SimConnectSdkDir Condition="'$(SimConnectSdkDir)' == ''">C:\MSFS SDK\SimConnect SDK</SimConnectSdkDir>
+    <SimConnectDll Condition="'$(SimConnectDll)' == ''">$(SimConnectSdkDir)\lib\managed\Microsoft.FlightSimulator.SimConnect.dll</SimConnectDll>
+    <SimConnectNativeDll Condition="'$(SimConnectNativeDll)' == ''">$(SimConnectSdkDir)\lib\SimConnect.dll</SimConnectNativeDll>
   </PropertyGroup>
 
   <ItemGroup Condition="Exists('$(SimConnectDll)')">
     <Reference Include="Microsoft.FlightSimulator.SimConnect">
       <HintPath>$(SimConnectDll)</HintPath>
     </Reference>
+  </ItemGroup>
+
+  <!-- 原生 SimConnect.dll 也复制到输出目录，运行时不再依赖模拟器安装路径 -->
+  <ItemGroup Condition="Exists('$(SimConnectNativeDll)')">
+    <None Include="$(SimConnectNativeDll)" Link="SimConnect.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
   <PropertyGroup Condition="Exists('$(SimConnectDll)')">

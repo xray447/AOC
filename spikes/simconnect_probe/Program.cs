@@ -18,13 +18,18 @@ internal static class Program
         {
             int seconds = int.Parse(opts.GetValueOrDefault("seconds", "120"), CultureInfo.InvariantCulture);
             int hz = int.Parse(opts.GetValueOrDefault("hz", "1"), CultureInfo.InvariantCulture);
-            return SimConnectSource.Run(outDir, seconds, hz, runways, airport);
+            // 长时段采集时不方便回到终端按 Ctrl+C：touch 一个文件即可正常收尾落盘
+            string stopFile = opts.GetValueOrDefault("stop-file", Path.Combine(outDir, "stop"));
+            if (File.Exists(stopFile)) File.Delete(stopFile);
+            return SimConnectSource.Run(outDir, seconds, hz, runways, airport, stopFile);
         }
 
         if (!opts.TryGetValue("replay", out var path))
         {
-            Console.Error.WriteLine("用法: SimLinkProbe --replay <track.jsonl> [--out out] [--airport RJTT]");
-            Console.Error.WriteLine("      SimLinkProbe --sim [--seconds 120] [--hz 1] [--airport RJTT]");
+            Console.Error.WriteLine("用法: SimLinkProbe --replay <track.jsonl> [--out out] [--airport RJTT] [--aircraft A321]");
+            Console.Error.WriteLine("      SimLinkProbe --sim [--seconds 120|0=直到 Ctrl+C] [--hz 1] [--airport RJTT] [--out out]");
+            Console.Error.WriteLine("--sim 期间 flight.jsonl 逐行实时落盘，落地瞬间刷新 touchdowns.json / events.json；");
+            Console.Error.WriteLine("Ctrl+C 正常收尾落盘；也可在另一终端新建 <out>\\stop 文件让它提前收尾（--stop-file 可改路径）。");
             Console.Error.WriteLine("未编译 SimConnect 时 --sim 会返回 3（需 MSFS SDK + 模拟器）。");
             return 2;
         }
@@ -50,6 +55,7 @@ internal static class Program
             DurationS = Math.Round(samples[^1].T - samples[0].T, 1),
             Touchdowns = touchdowns.Count,
             Events = events.Count,
+            Aircraft = opts.GetValueOrDefault("aircraft", ""),
             Warnings = new List<string>(),
         };
         if (runways.Count == 0)
@@ -60,7 +66,8 @@ internal static class Program
                           $"touchdowns={session.Touchdowns} events={session.Events} out={outDir}");
         foreach (var td in touchdowns)
             Console.WriteLine($"  TD t={td.T}s vs={td.VsFpm}fpm g={td.GForce} " +
-                              $"rwy={td.Airport}/{td.RunwayName} dist={td.RunwayDistNm}nm");
+                              $"rwy={td.Airport}/{td.RunwayName} along={td.RunwayAlongM}m " +
+                              $"dev={td.RunwayLateralM}m len={td.RunwayLengthM}m");
         return 0;
     }
 
