@@ -37,8 +37,16 @@ body {
   display: flex;
   flex-direction: column;
 }
-.app-sider .ant-layout-sider-children { display: flex; flex-direction: column; }
-.app-sider .ant-menu { background: transparent; border-inline-end: 0 !important; padding: 8px; }
+.app-sider .ant-layout-sider-children { display: flex; flex-direction: column; overflow: hidden; }
+.app-sider .ant-menu {
+  background: transparent; border-inline-end: 0 !important; padding: 8px;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+.app-sider .ant-menu-item-group-title {
+  color: rgba(148, 163, 184, .75) !important;
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  padding: 10px 12px 4px !important;
+}
 .app-sider .ant-menu-item { margin-inline: 0; width: 100%; }
 .brand {
   display: flex; align-items: center; gap: 10px; padding: 18px 16px 14px;
@@ -54,7 +62,7 @@ body {
 .brand-text { display: flex; flex-direction: column; min-width: 0; }
 .brand-text strong { font-size: 13px; color: #e6edf8; white-space: nowrap; }
 .brand-text span { font-size: 10.5px; color: #7c8ba4; white-space: nowrap; }
-.sider-footer { margin-top: auto; padding-bottom: 12px; opacity: .8; }
+.sider-footer { padding: 10px 16px 14px; opacity: .8; border-top: 1px solid rgba(148, 163, 184, .12); }
 
 .app-header {
   height: 60px !important; line-height: 60px !important;
@@ -68,6 +76,8 @@ body {
 .app-content { padding: 18px 22px 40px; overflow: auto; }
 
 .page { max-width: 1440px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+/* 合并页（Tab 内嵌）的子页面：保留页面间距，不再重复标题区 */
+.ops-embedded { display: flex; flex-direction: column; gap: 14px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .page-head h2 { margin: 0; font-size: 20px; font-weight: 700; }
 .page-head p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }

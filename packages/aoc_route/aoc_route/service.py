@@ -51,6 +51,8 @@ class RouteService:
                  aip_path: str | Path | None = None,
                  pre_train_dir: str | Path | None = None,
                  network_pkl: str | Path | None = None,
+                 cache_dir: str | Path | None = None,
+                 aip_source: str | None = None,
                  graph: GraphProvider | None = None,
                  aip: AipProvider | None = None):
         self._navdata_path = str(navdata_path) if navdata_path else None
@@ -58,8 +60,9 @@ class RouteService:
         self._nav_tried = navdata is not None
         self.nav_error = ""
         self.nav_load_ms: float | None = None
-        self.graph = graph or GraphProvider(pre_train_dir, network_pkl)
-        self.aip = aip or AipProvider(aip_path)
+        self.cache_dir = str(cache_dir) if cache_dir else None
+        self.graph = graph or GraphProvider(pre_train_dir, network_pkl, cache_dir)
+        self.aip = aip or AipProvider(aip_path, default_source=aip_source)
         self._cache: dict[tuple, RouteResult] = {}
 
     # -- navdata ---------------------------------------------------------
@@ -79,7 +82,8 @@ class RouteService:
         return self._nav
 
     def set_paths(self, navdata_path: str | None = None, aip_path: str | None = None,
-                  network_pkl: str | None = None, pre_train_dir: str | None = None) -> None:
+                  network_pkl: str | None = None, pre_train_dir: str | None = None,
+                  aip_source: str | None = None) -> None:
         if navdata_path != self._navdata_path:
             old = self._nav
             self._nav = None
@@ -87,10 +91,18 @@ class RouteService:
             self._navdata_path = navdata_path
             if old is not None:
                 old.close()
-        self.aip = AipProvider(aip_path) if aip_path else AipProvider()
+        self.aip = AipProvider(aip_path, default_source=aip_source) if aip_path else AipProvider()
         if network_pkl or pre_train_dir:
-            self.graph = GraphProvider(pre_train_dir, network_pkl)
+            self.graph = GraphProvider(pre_train_dir, network_pkl, self.cache_dir)
         self._cache.clear()
+
+    def ensure_graph(self) -> bool:
+        """用当前 navdata 建图（命中缓存则直接切换）；失败只记录原因，不抛异常。"""
+        nav = self.nav
+        if nav is None:
+            return False
+        path = self._navdata_path or str(nav.path)
+        return self.graph.ensure(path, nav.airac)
 
     def _cache_key(self, dep: str, arr: str, cruise_fl: int, aircraft: str | None) -> tuple:
         return (dep, arr, cruise_fl, aircraft, self.nav.airac if self.nav else None,
@@ -103,7 +115,7 @@ class RouteService:
         t0 = time.perf_counter()
         result = RouteResult(
             dep=dep, arr=arr, cruise_fl=cruise_fl,
-            simbrief_url=build_url(dep, arr, cruise_fl, aircraft),
+            simbrief_url=build_url(dep, arr, aircraft),
             requires_simbrief=True,
         )
         if not ICAO_RE.match(dep) or not ICAO_RE.match(arr):
@@ -187,9 +199,12 @@ class RouteService:
         return result
 
     def simbrief(self, dep: str, arr: str, cruise_fl: int = 350,
-                 aircraft: str | None = None, route: str | None = None) -> str:
+                 aircraft: str | None = None, route: str | None = None,
+                 callsign: str | None = None, payload_kg: float | None = None,
+                 registration: str | None = None) -> str:
+        """cruise_fl 仅为兼容旧调用保留，链接里不再预填高度。"""
         return build_url((dep or "").strip().upper(), (arr or "").strip().upper(),
-                         cruise_fl, aircraft, route)
+                         aircraft, route, callsign, payload_kg, registration)
 
     def coverage(self, dep: str, arr: str, cruise_fl: int = 350) -> CoverageResult:
         dep, arr = dep.upper().strip(), arr.upper().strip()
@@ -304,7 +319,7 @@ class RouteService:
         result.aip_version = self.aip.version
         result.coverage_gaps = self._gaps(coverage)
         result.warnings = warnings
-        result.simbrief_url = build_url(dep, arr, cruise_fl, None, cand["route"])
+        result.simbrief_url = build_url(dep, arr, None, cand["route"])
         return result
 
     def _try_graph(self, dep: str, arr: str, cruise_fl: int, gcd: float,
@@ -356,8 +371,9 @@ class RouteService:
             result.altitude_valid = altitude["valid"]
             result.requires_simbrief = False
             result.route = plan["route"]
-            result.tokens = plan["tokens"]
-            result.tokens_full = plan["tokens"]
+            # tokens = 折叠写法（显示/SimBrief），tokens_full = 逐点写法（导出 .pln）
+            result.tokens = plan.get("tokens") or plan["tokens_full"]
+            result.tokens_full = plan.get("tokens_full") or plan["tokens"]
             result.distance_nm = plan.get("distance_nm")
             result.gcd_nm = plan.get("gcd_nm") or result.gcd_nm
             result.valid = True
@@ -368,7 +384,7 @@ class RouteService:
                 result.sid_options = [ProcedureOption(name=sid, source="graph")]
             if star:
                 result.star_options = [ProcedureOption(name=star, source="graph")]
-            result.simbrief_url = build_url(dep, arr, cruise_fl, None, plan["route"])
+            result.simbrief_url = build_url(dep, arr, None, plan["route"])
             return result
         attempt.ms = round((time.perf_counter() - t0) * 1000, 1)
         if attempt.reason.startswith("detour_too_large"):
@@ -383,10 +399,9 @@ class RouteService:
     def _finish(result: RouteResult, t0: float) -> None:
         result.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         if result.route_source != "NONE" and result.route:
-            result.simbrief_url = build_url(result.dep, result.arr, result.cruise_fl,
-                                            None, result.route)
+            result.simbrief_url = build_url(result.dep, result.arr, None, result.route)
         elif not result.simbrief_url:
-            result.simbrief_url = build_url(result.dep, result.arr, result.cruise_fl)
+            result.simbrief_url = build_url(result.dep, result.arr)
 
     def _remember(self, key: tuple, result: RouteResult) -> None:
         if len(self._cache) > 512:
@@ -476,7 +491,8 @@ def build_pln(result: RouteResult, nav: NavData | None) -> str:
     arr_info = nav.airport(arr) if nav else None
     if dep_info is None or arr_info is None:
         raise ValueError("导出 .pln 需要 navdata 中的机场坐标")
-    tokens = [t for t in (result.tokens or []) if t.upper() not in ("DCT",)]
+    # 导出用逐点写法，保证模拟器里每个航路点都在航路上（折叠写法会少中间点）
+    tokens = [t for t in (result.tokens_full or result.tokens or []) if t.upper() not in ("DCT",)]
     coords = nav.waypoint_coords(tokens) if nav else {}
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',

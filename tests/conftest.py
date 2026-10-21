@@ -8,6 +8,13 @@ from fastapi.testclient import TestClient
 
 from aoc_navdata import NavData
 
+@pytest.fixture(autouse=True)
+def _offline_side_effects(monkeypatch: pytest.MonkeyPatch):
+    """单测不联网、不建图：AIP 同步与本地建图的开关都在环境变量里。"""
+    monkeypatch.setenv("AOC_NO_NET", "1")
+    monkeypatch.setenv("AOC_NO_GRAPH_BUILD", "1")
+
+
 AIRPORTS = [
     # ident, lat, lon, elev, country, name
     ("ZBAA", 40.0801, 116.5846, 116, "CN", "Beijing Capital"),

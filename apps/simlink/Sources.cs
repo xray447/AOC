@@ -42,7 +42,7 @@ public sealed class DemoSource : ISimSource
                 if (t - last >= 0.1)
                 {
                     last = t;
-                    try { Frame?.Invoke(MakeSample(t)); }
+                    try { Frame?.Invoke(MakeSample(t, _speed)); }
                     catch { /* 演示源不影响服务 */ }
                 }
                 await Task.Delay(100, _cts.Token).ContinueWith(_ => { });
@@ -50,7 +50,7 @@ public sealed class DemoSource : ISimSource
         });
     }
 
-    private static Sample MakeSample(double t)
+    private static Sample MakeSample(double t, double speed)
     {
         const double depLat = 40.0801, depLon = 116.5846, arrLat = 31.1979, arrLon = 121.3363;
         const double takeoff = 30, touchdown = 232;
@@ -100,7 +100,7 @@ public sealed class DemoSource : ISimSource
             BankDeg = 0, OnGround = onGround, FuelKg = Math.Max(1200, 8000 - (t / 255.0) * 6200),
             G = g, Gear = t < 20 || t > 215 ? 1 : 0,
             Flaps = t < 15 ? 0 : (t < takeoff ? 1 : (t > 205 ? 3 : 0)),
-            Paused = false, SimRate = 1.0,
+            Paused = false, SimRate = speed,
         };
     }
 

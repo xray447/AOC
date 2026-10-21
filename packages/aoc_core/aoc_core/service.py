@@ -8,8 +8,10 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import os
 import shutil
+import threading
 import time as _time
 import tempfile
 import zipfile
@@ -32,10 +34,13 @@ from aoc_protocol.schemas import (
     VolantaSyncResult,
 )
 from aoc_route import RouteService, build_pln
+from aoc_route.aip import JP_ROUTES_TTL_DAYS, JP_ROUTES_URL, AipProvider, sync_jp_routes
+from aoc_route.graph import GraphProvider
 
 from .aircraft import AircraftCatalog
 from .db import Database, utcnow
 from .flights import FlightService
+from .ops import OpsService
 from .paths import AppPaths
 from .recommend import recommend as build_recommend
 from .simlink import SimLinkClient
@@ -43,6 +48,7 @@ from .stats import compute_stats
 from .track import decode_chunks
 
 ROOT = Path(__file__).resolve().parents[3]
+log = logging.getLogger("aoc-core")
 
 
 class PersonalService:
@@ -66,6 +72,10 @@ class PersonalService:
         self._poller_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_status: dict[str, Any] = {}
+        self._aip_thread: threading.Thread | None = None
+        self._graph_thread: threading.Thread | None = None
+        # 图对象在 RouteService 重建之间共享，避免后台建完图又被换掉
+        self._graph_provider = self._make_graph_provider()
         self.flights = FlightService(
             self.db, self.paths, lambda: self.nav, lambda: self.settings,
             aircraft_type=lambda: self.settings.get("aircraft_type", "A320"),
@@ -73,6 +83,15 @@ class PersonalService:
         )
         self.flights.resume()
         self._build_route()
+        # M2 单机运营模式（无服务端）：本地 SQLite 内完成机队/班表/结算/账本
+        self.ops = OpsService(self.db, lambda: self.nav, self.catalog)
+        self._wire_ops_hooks()
+        # 后台补齐航路数据：日本 AIP 缓存 + 用用户 navdata 建图（失败不影响启动）
+        self._start_data_tasks()
+
+    def _wire_ops_hooks(self) -> None:
+        self.flights.ops_context = self.ops.context_for_recording
+        self.flights.on_finalized = self.ops.on_flight_finalized
 
     # -- settings --------------------------------------------------------
     @property
@@ -92,11 +111,15 @@ class PersonalService:
         merged = _deep_merge(self._settings, patch)
         validated = Settings(**merged).model_dump()
         old_nav = self._settings.get("navdata_path")
+        old_graph = (self._settings.get("pre_train_dir"), self._settings.get("network_pkl"))
         self._settings = validated
         self.db.setting_set("settings", validated)
         if validated.get("navdata_path") != old_nav:
             self._close_nav()
+        if (validated.get("pre_train_dir"), validated.get("network_pkl")) != old_graph:
+            self._graph_provider = self._make_graph_provider()
         self._build_route()
+        self._start_data_tasks()
         return validated
 
     # -- navdata ---------------------------------------------------------
@@ -165,13 +188,123 @@ class PersonalService:
         return self.navdata_status()
 
     # -- route -----------------------------------------------------------
+    def _aip_cache_path(self) -> Path:
+        return self.paths.cache / "aip_routes_jp.csv"
+
+    def _aip_settings(self) -> tuple[str | None, bool]:
+        """(url, 是否自动同步)。`aip_url` 为空字符串表示关闭自动拉取。"""
+        url = self._settings.get("aip_url")
+        url = JP_ROUTES_URL if url is None else str(url).strip()
+        return (url or None), bool(self._settings.get("aip_auto_sync", True))
+
+    def _make_graph_provider(self) -> GraphProvider:
+        return GraphProvider(self._settings.get("pre_train_dir") or None,
+                             self._settings.get("network_pkl") or None,
+                             self.paths.cache)
+
     def _build_route(self) -> None:
+        aip_path = self._settings.get("aip_path") or None
+        aip_source = "aip-file" if aip_path else None
+        if not aip_path:
+            cache = self._aip_cache_path()
+            if cache.exists():
+                aip_path = str(cache)
+                aip_source = "jp-routes"
         self._route = RouteService(
             navdata=self.nav,
-            aip_path=self._settings.get("aip_path") or None,
-            pre_train_dir=self._settings.get("pre_train_dir") or None,
-            network_pkl=self._settings.get("network_pkl") or None,
+            aip=AipProvider(aip_path, default_source=aip_source),
+            cache_dir=self.paths.cache,
+            graph=self._graph_provider,
         )
+
+    # 后台任务：都不阻塞启动，失败只写日志 ---------------------------------
+    def _start_data_tasks(self) -> None:
+        self._start_aip_sync()
+        self._start_graph_build()
+
+    def sync_aip(self, force: bool = False) -> dict[str, Any]:
+        """同步日本 AIP 航路到本地缓存（网络优先，失败保留旧缓存）。"""
+        cache = self._aip_cache_path()
+        url, auto = self._aip_settings()
+        if not url or (not auto and not force):
+            return {"ok": False, "reason": "disabled", "refreshed": False,
+                    "path": str(cache) if cache.exists() else None}
+        if os.environ.get("AOC_NO_NET"):
+            return {"ok": cache.exists(), "reason": "offline", "refreshed": False,
+                    "path": str(cache) if cache.exists() else None}
+        before = cache.stat().st_mtime_ns if cache.exists() else 0
+        path = sync_jp_routes(cache, url=url, ttl_days=0 if force else JP_ROUTES_TTL_DAYS)
+        refreshed = bool(path and path.exists() and path.stat().st_mtime_ns != before)
+        if refreshed:
+            # 重建 RouteService 后重新挂上已建好的图（命中缓存时是毫秒级）
+            self._build_route()
+            self._start_graph_build()
+        return {"ok": path is not None, "reason": "", "refreshed": refreshed,
+                "path": str(path) if path else None}
+
+    def _start_aip_sync(self, force: bool = False) -> None:
+        if os.environ.get("AOC_NO_NET"):
+            return
+        if self._aip_thread is not None and self._aip_thread.is_alive():
+            return
+        self._aip_thread = threading.Thread(target=self._aip_worker, args=(force,),
+                                            name="aoc-aip-sync", daemon=True)
+        self._aip_thread.start()
+
+    def _aip_worker(self, force: bool) -> None:
+        try:
+            info = self.sync_aip(force)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("AIP 同步失败：%s: %s", type(exc).__name__, exc)
+            return
+        if info.get("refreshed"):
+            log.info("日本 AIP 已同步：%s", info.get("path"))
+        elif not info.get("ok"):
+            log.info("日本 AIP 未同步（%s）", info.get("reason") or "unknown")
+
+    def _start_graph_build(self) -> None:
+        if os.environ.get("AOC_NO_GRAPH_BUILD"):
+            return
+        if self._graph_thread is not None and self._graph_thread.is_alive():
+            return
+        self._graph_thread = threading.Thread(target=self._graph_worker,
+                                              name="aoc-graph-build", daemon=True)
+        self._graph_thread.start()
+
+    def _graph_worker(self) -> None:
+        nav = self.nav
+        if nav is None:
+            log.info("未配置 navdata，跳过本地建图")
+            return
+        graph = self._graph_provider
+        t0 = _time.perf_counter()
+        try:
+            ok = graph.ensure(nav.path, nav.airac)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("本地建图失败：%s: %s", type(exc).__name__, exc)
+            return
+        if ok:
+            log.info("航路图就绪：%s（%.1f s）", graph.pkl, _time.perf_counter() - t0)
+        else:
+            log.info("航路图不可用：%s", graph.error or "unknown")
+
+    def route_engine_status(self) -> dict[str, Any]:
+        route = self.route
+        graph, aip = self._graph_provider, route.aip
+        rows = aip.load()
+        return {
+            "graph_available": graph.available,
+            "graph_pkl": str(graph.pkl),
+            "graph_error": graph.error,
+            "graph_build_ms": graph.load_ms,
+            "graph_building": bool(self._graph_thread and self._graph_thread.is_alive()),
+            "aip_path": str(aip.path),
+            "aip_status": aip.status,
+            "aip_rows": len(rows),
+            "aip_version": aip.version,
+            "aip_cache": str(self._aip_cache_path()),
+            "aip_syncing": bool(self._aip_thread and self._aip_thread.is_alive()),
+        }
 
     @property
     def route(self) -> RouteService:
@@ -328,6 +461,61 @@ class PersonalService:
         st = self.flights.status().model_dump()
         st["simlink_last"] = self._last_status
         return st
+
+    # -- 当前状态（顶部状态条：空闲 / 地面等待 / 飞行中） ------------------
+    AIRBORNE_PHASES = {"TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "APPROACH", "LANDING"}
+
+    def ops_status(self) -> dict:
+        task = self.ops.active_task()
+        roster = self.ops.current_roster() or {}
+        free = self.ops.current_free_flight() or {}
+        rec = self.flights.status()
+        phase = (rec.phase or "").upper()
+        legs = roster.get("legs") or []
+        dep = (task or {}).get("dep_icao") or (legs[0].get("dep_icao") if legs else None) \
+            or free.get("dep_icao")
+        arr = (task or {}).get("arr_icao") or (legs[-1].get("arr_icao") if legs else None) \
+            or free.get("arr_icao")
+        airborne = bool(rec.active and phase in self.AIRBORNE_PHASES)
+        waiting = bool(task) or rec.active or roster.get("status") == "LOCKED" \
+            or free.get("status") == "LOCKED"
+        next_leg = next((l for l in legs if l.get("status") == "PLANNED"), None)
+        return {
+            "state": "FLIGHT" if airborne else ("GROUND" if waiting else "IDLE"),
+            "phase": phase,
+            "recording": bool(rec.active),
+            "callsign": (task or {}).get("callsign") or free.get("callsign")
+            or (next_leg or {}).get("callsign"),
+            "dep_icao": dep,
+            "arr_icao": arr,
+            "task_kind": (task or {}).get("kind"),
+            "roster_status": roster.get("status"),
+            "free_flight_status": free.get("status"),
+        }
+
+    # -- 航班运营：SimBrief 预填与放弃任务 --------------------------------
+    def simbrief_for_leg(self, *, roster_id: str | None = None, sequence: int | None = None,
+                         free_id: str | None = None,
+                         flight_record_id: str | None = None) -> dict:
+        ctx = self.ops.simbrief_context(roster_id=roster_id, sequence=sequence,
+                                        free_id=free_id, flight_record_id=flight_record_id)
+        url = self.route.simbrief(
+            ctx.get("dep") or "", ctx.get("arr") or "", aircraft=ctx.get("aircraft_type"),
+            callsign=ctx.get("callsign"), payload_kg=ctx.get("payload_kg"),
+            registration=ctx.get("registration"))
+        return {"simbrief_url": url, "payload": ctx}
+
+    async def abort_task(self, reason: str | None = None) -> dict:
+        """放弃当前航班：录制中先停止录制，再取消航段、释放飞机。"""
+        task = self.ops.active_task()
+        if not task:
+            return {"ok": True, "aborted": False}
+        rec = self.flights.status()
+        if rec.active and rec.flight_id == task.get("flight_record_id"):
+            await self.stop_recording(abort=True)
+            if not self.ops.active_task():
+                return {"ok": True, "aborted": True, "task": task}
+        return self.ops.abort_task(reason, task=task)
 
     async def start_recording(self) -> dict:
         if not self._simlink_client:
@@ -585,6 +773,8 @@ class PersonalService:
             callsign=lambda: self.settings.get("callsign", "AOC001"))
         self.flights.resume()
         self._build_route()
+        self.ops = OpsService(self.db, lambda: self.nav, self.catalog)
+        self._wire_ops_hooks()
         return {"ok": True, "settings": self._settings}
 
 

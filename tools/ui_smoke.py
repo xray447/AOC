@@ -83,6 +83,10 @@ def main() -> int:
         req = Request(f"{base}/local/settings", method="GET", headers={"X-AOC-Token": token})
         assert json.loads(urlopen(req, timeout=5).read())["settings"]["onboarded"] is True
 
+        seed_req = Request(f"{base}/local/ops/seed", method="POST", data=b"{}",
+                           headers={"X-AOC-Token": token, "Content-Type": "application/json"})
+        print("ops seed:", urlopen(seed_req, timeout=30).read().decode()[:200])
+
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as pw:
@@ -240,6 +244,109 @@ def main() -> int:
 
             page.goto(f"{base}/settings", wait_until="networkidle")
             page.wait_for_selector("text=数据源")
+
+            # ---- M2 单机运营模式 ----
+            page.goto(f"{base}/ops", wait_until="networkidle")
+            page.wait_for_selector("text=运营中心", timeout=15000)
+            # 本机档案在顶部（快捷入口已去掉），设置里的示例跟随输入联动
+            assert page.locator("text=快捷入口").count() == 0
+            assert page.locator("text=本机档案").count() > 0
+            page.click("button:has-text('设置')")
+            page.wait_for_selector("#callsign_prefix", timeout=10000)
+            assert page.locator("text=AUV → AUV123").count() > 0
+            assert page.locator("text=AOC → AOC101").count() > 0
+            page.fill("#callsign_prefix", "abc")
+            page.wait_for_selector("text=ABC → ABC123", timeout=5000)
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_home.png"), full_page=True)
+            page.click(".ant-modal-close")
+
+            page.goto(f"{base}/ops/fleet", wait_until="networkidle")
+            page.wait_for_selector("text=逐机档案", timeout=15000)
+            assert page.locator("text=B-1671").count() > 0
+
+            page.goto(f"{base}/ops/network", wait_until="networkidle")
+            page.wait_for_selector("text=航线与班期", timeout=15000)
+            page.get_by_role("tab", name="班期").click()
+            assert page.locator("text=AOC101").count() > 0
+
+            page.goto(f"{base}/ops/roster", wait_until="networkidle")
+            page.wait_for_selector("text=抽班条件", timeout=15000)
+            page.click("button:has-text('抽班')")
+            page.wait_for_selector("text=确认这个班", timeout=20000)
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_roster.png"), full_page=True)
+            page.locator("button:has-text('确认这个班')").first.click()
+            page.wait_for_selector("text=当前班表", timeout=15000)
+            # 开始前有 SimBrief 入口（航班号 + 起降机场预填）
+            assert page.locator("button:has-text('SimBrief')").count() > 0
+
+            # SimBrief 走系统默认浏览器：拦截 open-external 请求，避免真的弹浏览器
+            posted: list[str] = []
+
+            def _stub_external(route):
+                posted.append(route.request.post_data or "")
+                route.fulfill(json={"ok": True, "url": "stubbed"})
+
+            page.route("**/local/system/open-external", _stub_external)
+            page.locator("button:has-text('SimBrief')").first.click()
+            page.wait_for_timeout(800)
+            assert posted, "SimBrief 未请求 open-external"
+            assert "dispatch.simbrief.com" in posted[0]
+            assert "orig=ZBAA" in posted[0]
+            # 配载只带 kg 的 payload，且不预填高度
+            assert "payload=" in posted[0]
+            assert "reg=" in posted[0]
+            for key in ("pax=", "cargo=", "fuel=", "fl="):
+                assert key not in posted[0], key
+            page.unroute("**/local/system/open-external")
+
+            # 合并页：抽班 / 自由飞行 / 配载与执行 在同一页的三个页签
+            page.goto(f"{base}/ops/fly", wait_until="networkidle")
+            page.wait_for_selector("text=飞行执行", timeout=15000)
+            for name in ("自由飞行", "配载与执行", "抽班"):
+                assert page.get_by_role("tab", name=name).count() > 0, name
+
+            # 顶部状态条：锁定班表 = 地面等待，点击回到对应页面
+            page.wait_for_selector(".app-header button:has-text('地面等待')", timeout=15000)
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_status.png"), full_page=True)
+            page.locator(".app-header button:has-text('地面等待')").first.click()
+            page.wait_for_selector("text=抽班条件", timeout=15000)
+
+            page.goto(f"{base}/ops/execute", wait_until="networkidle")
+            page.wait_for_selector("text=配载与执行", timeout=15000)
+            assert page.get_by_role("tab", name="配载与执行").count() > 0
+
+            page.goto(f"{base}/ops/settlements", wait_until="networkidle")
+            page.wait_for_selector("text=结算", timeout=15000)
+
+            page.goto(f"{base}/ops/finance", wait_until="networkidle")
+            page.wait_for_selector("text=总计利润", timeout=15000)
+            page.wait_for_selector("text=周期统计", timeout=15000)
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_finance.png"), full_page=True)
+
+            page.goto(f"{base}/ops/ledger", wait_until="networkidle")
+            page.wait_for_selector("text=按类型汇总", timeout=15000)
+            assert page.locator("text=账户余额").count() == 0
+
+            page.goto(f"{base}/ops/rules", wait_until="networkidle")
+            page.wait_for_selector("text=运营规则", timeout=15000)
+            assert page.locator("text=经济参数").count() > 0
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_rules.png"), full_page=True)
+
+            page.goto(f"{base}/ops/review", wait_until="networkidle")
+            page.wait_for_selector("text=复核队列", timeout=15000)
+
+            page.goto(f"{base}/ops/free", wait_until="networkidle")
+            page.wait_for_selector("text=自由飞行", timeout=15000)
+
+            # 已开始的航班可以一键取消：开始本段 → 取消本次航班 → 回到空状态
+            page.goto(f"{base}/ops/roster", wait_until="networkidle")
+            page.wait_for_selector("text=当前班表", timeout=15000)
+            page.locator("button:has-text('开始本段')").first.click()
+            page.wait_for_selector("text=当前任务", timeout=20000)
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_cancel.png"), full_page=True)
+            page.locator("button:has-text('取消本次航班')").first.click()
+            page.locator(".ant-popconfirm button:has-text('取消航班')").first.click()
+            page.wait_for_selector("text=没有正在执行的任务", timeout=20000)
 
             browser.close()
 

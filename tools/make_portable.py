@@ -52,13 +52,14 @@ README = """AOC 模拟飞行运行中心 · M1 个人模式便携版
    然后刷新首页，演示会合成一次 ZBAA→ZSSS 并自动记录。
 3. 首页「开始记录」需要 SimLink 在线；SimLink 也会在起飞 5 秒后自动开始。
 
-航路：AIP（内置样例 fixture）→ 覆盖检查 → Pre-train 图；任何失败都会给 SimBrief 链接。
+航路：日本 AIP（jp-routes，启动时自动同步）→ 覆盖检查 → 本地航路图（用你的 navdata 现场建图）；任何失败都会给 SimBrief 链接。
 navdata 不随包分发（许可与体积），请使用自己的 Little Navmap / Navigraph 数据。
+首次启动会用 navdata 建一次图（约 15 秒，后台进行），缓存在 %LOCALAPPDATA%\\AOC\\cache。
 
 已知限制（M1）：
 - 不是 Tauri 安装包，是浏览器 + 本地 Python 服务；Tauri 外壳源码在 apps/client/src-tauri。
-- AIP 数据是 fixture，只用于验证优先级；真实 AIP 需替换 data/aip_routes.csv。
-- Pre-train network.pkl 未随包分发，图航路需用户自行提供。
+- 无网络时 AIP 回退到本地缓存；从未联网过则只有内置样例（fixture）。
+- 建图需要 scipy（requirements.txt 已包含）。
 - Volanta 使用非官方接口，可能失效；CSV 导入与手动补录可用。
 """
 
@@ -104,6 +105,9 @@ def main() -> int:
     shutil.copytree(ROOT / "apps" / "aoc-core", STAGE / "apps" / "aoc-core",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copytree(ROOT / "data", STAGE / "data")
+    # 建图脚本（只读导航库，不需要模型权重）；首次运行会用用户 navdata 现场建图并缓存
+    shutil.copytree(ROOT / "Pre-train" / "src", STAGE / "Pre-train" / "src",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (STAGE / "start.bat").write_text(START_BAT, encoding="ascii", newline="\r\n")
     shutil.copy2(ROOT / "tools" / "portable_launcher.py", STAGE / "start.py")
     (STAGE / "README.txt").write_text(README, encoding="utf-8")

@@ -58,6 +58,9 @@ class Settings(Model):
     turn_threshold_dps: float = Field(default=4.0, ge=1.0, le=12.0)
     navdata_path: str | None = None
     aip_path: str | None = None
+    # None = 用内置 jp-routes 地址自动同步；"" = 关闭
+    aip_url: str | None = None
+    aip_auto_sync: bool = True
     network_pkl: str | None = None
     pre_train_dir: str | None = None
     volanta_enabled: bool = False

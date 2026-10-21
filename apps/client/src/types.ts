@@ -305,3 +305,429 @@ export interface AircraftType {
   range_nm: number;
   category?: string;
 }
+
+// ---------------------------------------------------------------- 运营模式（M2）
+export interface OpsProfile {
+  id: string;
+  name: string;
+  icao_code: string | null;
+  callsign_prefix: string | null;
+  flight_prefix: string | null;
+  base_airport_icao: string | null;
+  currency: string;
+  balance: number;
+  no_show_count: number;
+}
+
+export interface CabinConfig {
+  first: number;
+  business: number;
+  premium_economy: number;
+  economy: number;
+}
+
+export interface OpsAircraftType {
+  id: string;
+  icao: string;
+  variant: string;
+  name: string | null;
+  manufacturer: string | null;
+  role: string;
+  demand_profile: string;
+  cabin_config_json: CabinConfig;
+  pax_capacity: number;
+  cargo_capacity_kg: number;
+  mtow_kg: number;
+  mzfw_kg: number;
+  mlw_kg: number;
+  oew_kg: number;
+  fuel_capacity_kg: number;
+  cruise_speed_kt: number;
+  cruise_fl: number;
+  fuel_burn_kg_h: number;
+  min_runway_m: number;
+  range_nm: number;
+  allow_scheduled: boolean;
+  allow_charter: boolean;
+  charter_rate_per_hour: number;
+  fare_multiplier: number;
+  lease_per_hour: number;
+}
+
+export interface OpsLock {
+  id: string;
+  lock_type: string;
+  status: string;
+  roster_id: string | null;
+  free_flight_id: string | null;
+  expires_at: string | null;
+}
+
+export interface OpsAircraft {
+  id: string;
+  type_id: string;
+  registration: string;
+  tail_number: string | null;
+  livery: string | null;
+  base_airport_icao: string | null;
+  current_airport_icao: string | null;
+  status: string;
+  fuel_kg: number | null;
+  total_hours: number;
+  total_cycles: number;
+  condition_pct: number;
+  acquisition_type: string;
+  lease_per_hour: number | null;
+  version: number;
+  type_icao?: string | null;
+  type_variant?: string | null;
+  type_name?: string | null;
+  type_role?: string | null;
+  pax_capacity?: number | null;
+  range_nm?: number | null;
+  min_runway_m?: number | null;
+  mtow_kg?: number | null;
+  locked?: boolean;
+  lock?: OpsLock | null;
+}
+
+export interface OpsRoute {
+  id: string;
+  dep_icao: string;
+  arr_icao: string;
+  distance_nm: number | null;
+  block_minutes: number | null;
+  default_route_string: string | null;
+  default_sid: string | null;
+  default_star: string | null;
+  cruise_fl: number | null;
+  min_aircraft_category: string | null;
+  enabled: boolean;
+}
+
+export interface OpsSchedule {
+  id: string;
+  route_id: string;
+  flight_number: string;
+  dep_local_time: string;
+  days_of_week: number;
+  valid_from: string | null;
+  valid_to: string | null;
+  aircraft_type_id: string | null;
+  turnaround_min: number;
+  enabled: boolean;
+  dep_icao?: string | null;
+  arr_icao?: string | null;
+  distance_nm?: number | null;
+  block_minutes?: number | null;
+  type_icao?: string | null;
+  type_variant?: string | null;
+}
+
+export interface OpsInstance {
+  id: string;
+  flight_number: string;
+  dep_icao: string;
+  arr_icao: string;
+  scheduled_dep_utc: string;
+  scheduled_arr_utc: string;
+  status: string;
+  mission_type: string;
+  aircraft_type_id: string | null;
+  route_id: string | null;
+}
+
+export interface OpsLeg {
+  id: string;
+  roster_id: string;
+  sequence: number;
+  flight_instance_id: string | null;
+  status: string;
+  planned_dep_utc: string | null;
+  planned_arr_utc: string | null;
+  actual_dep_utc: string | null;
+  actual_arr_utc: string | null;
+  dep_icao: string | null;
+  arr_icao: string | null;
+  flight_record_id: string | null;
+  flight_number?: string | null;
+  callsign?: string | null;
+  mission_type?: string | null;
+}
+
+export interface OpsCandidateLeg {
+  flight_instance_id: string;
+  flight_number: string;
+  callsign?: string | null;
+  dep: string;
+  arr: string;
+  scheduled_dep_utc: string;
+  scheduled_arr_utc: string;
+  block_minutes: number;
+  distance_nm: number;
+  estimated_revenue: number;
+}
+
+export interface OpsCandidate {
+  aircraft: {
+    id: string;
+    registration: string;
+    type_id: string;
+    type: string;
+    variant: string;
+    current_airport_icao: string | null;
+  };
+  legs: OpsCandidateLeg[];
+  total_block_minutes: number;
+  total_distance_nm: number;
+  estimated_revenue: number;
+  estimated_cost: number;
+  estimated_profit: number;
+  score: number;
+  reasons: string[];
+  candidate_token: string;
+}
+
+export interface OpsDrawResult {
+  candidates: OpsCandidate[];
+  constraints: Record<string, number | string | boolean | null>;
+  expires_at: string;
+  considered: number;
+}
+
+export interface OpsRoster {
+  id: string;
+  kind: string;
+  aircraft_id: string;
+  status: string;
+  base_airport_icao: string | null;
+  window_start_utc: string;
+  window_end_utc: string;
+  constraints: Record<string, unknown>;
+  redraw_count: number;
+  locked_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  expires_at: string | null;
+  created_at: string;
+  aircraft: {
+    id: string;
+    registration: string;
+    type: string;
+    variant: string;
+    current_airport_icao: string | null;
+    status: string;
+  };
+  legs: OpsLeg[];
+  settlements: { id: string; flight_record_id: string; profit: number; status: string; policy_action: string }[];
+}
+
+export interface OpsTask {
+  kind: string;
+  roster_id?: string;
+  roster_leg_id?: string;
+  free_flight_id?: string;
+  flight_record_id: string;
+  aircraft_id: string;
+  dep_icao: string;
+  arr_icao: string;
+  aircraft_type: string;
+  callsign: string;
+  scheduled_dep_utc?: string | null;
+  started_at: string;
+}
+
+export interface OpsLoadSheet {
+  id: string;
+  flight_record_id: string;
+  aircraft_id: string;
+  dep_icao: string | null;
+  arr_icao: string | null;
+  distance_nm: number | null;
+  block_minutes: number | null;
+  pax_total: number;
+  pax_economy: number;
+  pax_business: number;
+  pax_first: number;
+  cargo_kg: number;
+  mail_kg: number;
+  oew_kg: number | null;
+  zfw_kg: number | null;
+  tow_kg: number | null;
+  fuel_kg: number | null;
+  estimated_revenue: number;
+  estimated_cost: number;
+}
+
+export interface OpsLedgerEntry {
+  id: string;
+  flight_record_id: string | null;
+  settlement_id: string | null;
+  entry_type: string;
+  amount: number;
+  balance_after: number;
+  currency: string;
+  description: string | null;
+  created_at: string;
+}
+
+export interface OpsSettlement {
+  id: string;
+  flight_record_id: string;
+  task_kind: string | null;
+  roster_id: string | null;
+  aircraft_id: string | null;
+  revenue_gross: number;
+  revenue_total: number;
+  cost_total: number;
+  profit: number;
+  payout_factor: number;
+  advance_amount: number;
+  policy_action: string;
+  status: string;
+  review_status: string;
+  review_note: string | null;
+  computed_at: string;
+  callsign?: string | null;
+  dep_icao?: string | null;
+  arr_icao?: string | null;
+  block_off_utc?: string | null;
+  block_minutes?: number | null;
+  touchdown_vs_fpm?: number | null;
+  landing_rating?: string | null;
+  breakdown?: {
+    inputs?: Record<string, unknown>;
+    revenue?: { type: string; amount: number; note?: string }[];
+    costs?: { type: string; amount: number; note?: string }[];
+    gross_revenue?: number;
+    payout_factor?: number;
+    policy_action?: string;
+    policy?: OpsPolicyResult;
+    profit?: number;
+  };
+  policy_breakdown?: OpsPolicyResult;
+  policy_snapshot?: Record<string, unknown>;
+  ledger?: OpsLedgerEntry[];
+  flight?: FlightRecord | null;
+}
+
+export interface OpsPolicyResult {
+  payout_factor: number;
+  action: string;
+  review_required: boolean;
+  breakdown: { kind: string; action: string; penalty: number; detail: string; value?: number }[];
+}
+
+export interface OpsFreeFlight {
+  id: string;
+  aircraft_id: string;
+  flight_instance_id: string | null;
+  dep_icao: string;
+  arr_icao: string;
+  dep_time_utc: string;
+  status: string;
+  lock_expires_at: string | null;
+  callsign?: string | null;
+  aircraft?: OpsAircraft;
+}
+
+export interface OpsFinanceBucket {
+  flights: number;
+  revenue: number;
+  cost: number;
+  profit: number;
+}
+
+export interface OpsFinancePeriod extends OpsFinanceBucket {
+  key: "WEEK" | "MONTH" | "YEAR";
+  start: string;
+}
+
+export interface OpsFinanceMonth extends OpsFinanceBucket {
+  month: string;
+}
+
+/** 财务统计：总计 + 本周/本月/今年 + 近 6 个月（不含账户余额）。 */
+export interface OpsFinanceSummary {
+  currency: string;
+  totals: OpsFinanceBucket;
+  held: number;
+  periods: OpsFinancePeriod[];
+  monthly: OpsFinanceMonth[];
+}
+
+/** 顶部状态条：当前是空闲 / 地面等待 / 飞行中。 */
+export interface OpsStatus {
+  state: "IDLE" | "GROUND" | "FLIGHT";
+  phase: string;
+  recording: boolean;
+  callsign?: string | null;
+  dep_icao?: string | null;
+  arr_icao?: string | null;
+  task_kind?: string | null;
+  roster_status?: string | null;
+  free_flight_status?: string | null;
+}
+
+export interface OpsDashboard {
+  profile: OpsProfile;
+  fleet: { total: number; active: number; held: number; in_flight: number; maintenance: number };
+  active_roster: OpsRoster | null;
+  active_free_flight: OpsFreeFlight | null;
+  active_task: OpsTask | null;
+  today: { settlements: number; revenue: number; cost: number; profit: number };
+  review_count: number;
+  scheduled_instances: number;
+  no_show_count: number;
+  config_version: number;
+}
+
+export interface OpsParamSchema {
+  key: string;
+  group: string;
+  label: string;
+  unit: string;
+  min: number;
+  max: number;
+  step: number;
+}
+
+export interface OpsPolicy {
+  scope_mode: string;
+  default_action: string;
+  reject_cost_mode: string;
+  review_advance_ratio: number;
+  review_sla_hours: number;
+  min_payout_factor: number;
+  rules: Record<string, Record<string, unknown>>;
+  overrides: Record<string, unknown>[];
+}
+
+export interface OpsConfig {
+  economy: Record<string, number | string>;
+  policy: OpsPolicy;
+  version: number;
+  versions: { id: string; version: number; status: string; note: string | null; created_at: string }[];
+  param_schema: OpsParamSchema[];
+}
+
+export interface OpsLedger {
+  balance: number;
+  currency: string;
+  items: OpsLedgerEntry[];
+  totals: Record<string, number>;
+  ledger_sum: number;
+  reconciled: boolean;
+}
+
+export interface OpsAudit {
+  id: string;
+  action: string;
+  entity_type: string;
+  entity_id: string | null;
+  before: unknown;
+  after: unknown;
+  reason: string | null;
+  actor: string | null;
+  created_at: string;
+}

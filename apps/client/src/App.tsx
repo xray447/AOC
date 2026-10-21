@@ -1,7 +1,11 @@
 import {
   ApiOutlined,
   AppstoreOutlined,
-  CloudServerOutlined,
+  AuditOutlined,
+  BankOutlined,
+  CarOutlined,
+  CheckSquareOutlined,
+  ClockCircleOutlined,
   CompassOutlined,
   DashboardOutlined,
   GlobalOutlined,
@@ -11,8 +15,13 @@ import {
   ReloadOutlined,
   RocketOutlined,
   SettingOutlined,
+  ShopOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
-import { Badge, Button, ConfigProvider, Layout, Menu, Space, Spin, Tag, Tooltip, theme as antdTheme } from "antd";
+import {
+  Badge, Button, ConfigProvider, Layout, Menu, Space, Spin, Tag, Tooltip,
+  theme as antdTheme, type MenuProps,
+} from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { api, initApi } from "./api";
@@ -20,6 +29,13 @@ import type { AppContextValue } from "./context";
 import { I18nProvider, useI18n } from "./i18n";
 import { Onboarding } from "./pages/Onboarding";
 import { Dashboard } from "./pages/Dashboard";
+import { OpsFinance } from "./pages/ops/OpsFinance";
+import { OpsFleet } from "./pages/ops/OpsFleet";
+import { OpsFly } from "./pages/ops/OpsFly";
+import { OpsHome } from "./pages/ops/OpsHome";
+import { OpsNetwork } from "./pages/ops/OpsNetwork";
+import { OpsReview } from "./pages/ops/OpsReview";
+import { OpsRules } from "./pages/ops/OpsRules";
 import { Recommend } from "./pages/Recommend";
 import { RoutePlanner } from "./pages/RoutePlanner";
 import { Logs } from "./pages/Logs";
@@ -27,7 +43,8 @@ import { LogDetail } from "./pages/LogDetail";
 import { MapPage } from "./pages/MapPage";
 import { Stats } from "./pages/Stats";
 import { SettingsPage } from "./pages/Settings";
-import type { Bootstrap, NavdataStatus, RecordingStatus, Settings } from "./types";
+import { opsStateMeta } from "./ops";
+import type { Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings } from "./types";
 
 const { Header, Sider, Content } = Layout;
 
@@ -45,18 +62,24 @@ function useDarkMode(settings: Settings | null): boolean {
   return systemDark;
 }
 
-function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings, dark }: AppContextValue) {
+function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, saveSettings, dark }: AppContextValue) {
   const { tr } = useI18n();
   const location = useLocation();
   const navigate = useNavigate();
   const [collapsed, setCollapsed] = useState(false);
   const selected = useMemo(() => {
     if (location.pathname.startsWith("/logs")) return "/logs";
-    if (location.pathname.startsWith("/admin")) return "/admin";
+    if (location.pathname.startsWith("/ops")) {
+      const path = "/" + location.pathname.split("/").slice(1, 3).join("/");
+      // 合并页：子页签路由仍高亮同一个菜单项
+      if (["/ops/roster", "/ops/free", "/ops/execute"].includes(path)) return "/ops/fly";
+      if (["/ops/settlements", "/ops/ledger"].includes(path)) return "/ops/finance";
+      return path;
+    }
     return location.pathname;
   }, [location.pathname]);
 
-  const items = [
+  const personalItems = [
     { key: "/", icon: <DashboardOutlined />, label: tr("首页", "Home") },
     { key: "/recommend", icon: <CompassOutlined />, label: tr("推荐", "Discover") },
     { key: "/route", icon: <RocketOutlined />, label: tr("航路", "Routes") },
@@ -65,6 +88,25 @@ function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings,
     { key: "/stats", icon: <LineChartOutlined />, label: tr("统计", "Stats") },
     { key: "/settings", icon: <SettingOutlined />, label: tr("设置", "Settings") },
   ];
+  const opsItems = [
+    { key: "/ops", icon: <ShopOutlined />, label: tr("运营概览", "Overview") },
+    { key: "/ops/fleet", icon: <CarOutlined />, label: tr("机队", "Fleet") },
+    { key: "/ops/network", icon: <ThunderboltOutlined />, label: tr("航线与班期", "Network") },
+    { key: "/ops/fly", icon: <RocketOutlined />, label: tr("飞行执行", "Fly") },
+    { key: "/ops/finance", icon: <BankOutlined />, label: tr("财务", "Finance") },
+    { key: "/ops/rules", icon: <AuditOutlined />, label: tr("运营规则", "Rules") },
+    { key: "/ops/review", icon: <CheckSquareOutlined />, label: tr("复核队列", "Review") },
+  ];
+  const items: MenuProps["items"] = [
+    { type: "group", key: "g-personal", label: tr("个人模式", "Personal"), children: personalItems },
+    { type: "group", key: "g-ops", label: tr("运营模式", "Operations"), children: opsItems },
+  ];
+  const flatItems = [...personalItems, ...opsItems];
+  const statusMeta = opsStateMeta(opsStatus);
+  const statusDetail = [
+    opsStatus?.callsign,
+    opsStatus?.dep_icao && opsStatus?.arr_icao ? `${opsStatus.dep_icao}→${opsStatus.arr_icao}` : null,
+  ].filter(Boolean).join(" · ");
 
   return (
     <Layout className="app-shell">
@@ -86,14 +128,12 @@ function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings,
           onClick={({ key }) => navigate(key)}
         />
         <div className="sider-footer">
-          <Tooltip title={tr("公司模式（M2）", "Company mode (M2)")}>
-            <Menu
-              mode="inline"
-              theme="dark"
-              selectable={false}
-              items={[{ key: "company", icon: <CloudServerOutlined />, label: tr("公司模式（未开放）", "Company (soon)"), disabled: true }]}
-            />
-          </Tooltip>
+          {!collapsed ? (
+            <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
+              {tr("单机运营（M2）：无账号、无服务端，数据与规则都在本机。",
+                "Single-player ops (M2): no account, no server — data and rules stay local.")}
+            </div>
+          ) : null}
         </div>
       </Sider>
       <Layout>
@@ -104,7 +144,7 @@ function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings,
               icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
               onClick={() => setCollapsed((v) => !v)}
             />
-            <div className="page-title">{items.find((i) => i.key === selected)?.label}</div>
+            <div className="page-title">{flatItems.find((i) => i.key === selected)?.label}</div>
           </Space>
           <Space size={8} wrap>
             <Tooltip title={navdata.available ? `${navdata.airports} ${tr("个机场", "airports")} · AIRAC ${navdata.airac}` : navdata.error}>
@@ -115,6 +155,18 @@ function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings,
             <Tag color={recording.simlink_connected ? "green" : "default"}>
               {recording.simlink_connected ? tr("SimLink 已连接", "SimLink online") : tr("SimLink 离线", "SimLink offline")}
             </Tag>
+            <Tooltip title={`${tr("当前状态，点击进入对应页面", "Current state — click to open")}${statusDetail ? `（${statusDetail}）` : ""}`}>
+              <Button
+                size="small"
+                type={statusMeta.state === "FLIGHT" ? "primary" : "default"}
+                icon={statusMeta.state === "FLIGHT" ? <RocketOutlined />
+                  : statusMeta.state === "GROUND" ? <CarOutlined /> : <ClockCircleOutlined />}
+                onClick={() => navigate(statusMeta.path)}
+              >
+                {tr(statusMeta.zh, statusMeta.en)}
+                {statusDetail ? ` · ${statusDetail}` : ""}
+              </Button>
+            </Tooltip>
             {recording.active ? (
               <Link to="/">
                 <Badge status="processing" text={`${tr("记录中", "Recording")} · ${recording.samples} pts · ${recording.phase}`} />
@@ -126,7 +178,7 @@ function Shell({ bootstrap, settings, navdata, recording, refresh, saveSettings,
           </Space>
         </Header>
         <Content className="app-content">
-          <Outlet context={{ bootstrap, settings, navdata, recording, dark, refresh, saveSettings } satisfies AppContextValue} />
+          <Outlet context={{ bootstrap, settings, navdata, recording, opsStatus, dark, refresh, saveSettings } satisfies AppContextValue} />
         </Content>
       </Layout>
     </Layout>
@@ -138,20 +190,23 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [navdata, setNavdata] = useState<NavdataStatus | null>(null);
   const [recording, setRecording] = useState<RecordingStatus | null>(null);
+  const [opsStatus, setOpsStatus] = useState<OpsStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showWizard, setShowWizard] = useState(false);
 
   const load = useCallback(async () => {
     const boot = await initApi();
-    const [settingsRes, navRes, recRes] = await Promise.all([
+    const [settingsRes, navRes, recRes, statusRes] = await Promise.all([
       api<{ settings: Settings }>("/local/settings"),
       api<NavdataStatus>("/local/navdata/status"),
       api<RecordingStatus>("/local/recording/status"),
+      api<OpsStatus>("/local/ops/status").catch(() => null),
     ]);
     setBootstrap(boot);
     setSettings(settingsRes.settings);
     setNavdata(navRes);
     setRecording(recRes);
+    setOpsStatus(statusRes);
     if (!settingsRes.settings.onboarded) setShowWizard(true);
   }, []);
 
@@ -163,8 +218,12 @@ export default function App() {
     if (!bootstrap) return;
     const timer = window.setInterval(async () => {
       try {
-        const rec = await api<RecordingStatus>("/local/recording/status");
+        const [rec, status] = await Promise.all([
+          api<RecordingStatus>("/local/recording/status"),
+          api<OpsStatus>("/local/ops/status").catch(() => null),
+        ]);
         setRecording(rec);
+        setOpsStatus(status);
       } catch {
         /* core may be restarting */
       }
@@ -173,14 +232,16 @@ export default function App() {
   }, [bootstrap]);
 
   const refresh = useCallback(async () => {
-    const [settingsRes, navRes, recRes] = await Promise.all([
+    const [settingsRes, navRes, recRes, statusRes] = await Promise.all([
       api<{ settings: Settings }>("/local/settings"),
       api<NavdataStatus>("/local/navdata/status"),
       api<RecordingStatus>("/local/recording/status"),
+      api<OpsStatus>("/local/ops/status").catch(() => null),
     ]);
     setSettings(settingsRes.settings);
     setNavdata(navRes);
     setRecording(recRes);
+    setOpsStatus(statusRes);
   }, []);
 
   const saveSettings = useCallback(async (patch: Partial<Settings>) => {
@@ -250,6 +311,7 @@ export default function App() {
                 settings={settings}
                 navdata={navdata}
                 recording={recording}
+                opsStatus={opsStatus}
                 dark={dark}
                 refresh={refresh}
                 saveSettings={saveSettings}
@@ -264,6 +326,18 @@ export default function App() {
             <Route path="map" element={<MapPage />} />
             <Route path="stats" element={<Stats />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="ops" element={<OpsHome />} />
+            <Route path="ops/fleet" element={<OpsFleet />} />
+            <Route path="ops/network" element={<OpsNetwork />} />
+            <Route path="ops/fly" element={<OpsFly />} />
+            <Route path="ops/roster" element={<OpsFly />} />
+            <Route path="ops/execute" element={<OpsFly />} />
+            <Route path="ops/free" element={<OpsFly />} />
+            <Route path="ops/finance" element={<OpsFinance />} />
+            <Route path="ops/settlements" element={<OpsFinance />} />
+            <Route path="ops/ledger" element={<OpsFinance />} />
+            <Route path="ops/rules" element={<OpsRules />} />
+            <Route path="ops/review" element={<OpsReview />} />
           </Route>
         </Routes>
         <Onboarding

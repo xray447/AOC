@@ -53,6 +53,10 @@ class AppPaths:
     def runtime(self) -> Path:
         return self.home / "runtime.json"
 
+    @property
+    def lock(self) -> Path:
+        return self.home / "aoc.lock"
+
     def resolve(self, relative: str | Path) -> Path:
         p = Path(relative)
         return p if p.is_absolute() else self.home / p

@@ -197,6 +197,9 @@ class FlightService:
         self._aircraft_type = aircraft_type or (lambda: "A320")
         self._callsign = callsign or (lambda: "AOC001")
         self.recorder: FlightRecorder | None = None
+        # M2 运营模式钩子：开始录制时读取任务上下文（班表航段/自由飞），落地后交给结算
+        self.ops_context: Callable[[], dict[str, Any] | None] | None = None
+        self.on_finalized: Callable[[dict[str, Any]], Any] | None = None
         self.simlink_connected = False
         self.sim_connected = False
         self.simlink_version: str | None = None
@@ -258,7 +261,8 @@ class FlightService:
               manual: bool = True) -> RecordingStatus:
         if self.recorder is not None:
             return self.status()
-        fid = flight_id or str(uuid.uuid4())
+        ctx = self.ops_context() if self.ops_context else None
+        fid = (ctx or {}).get("flight_record_id") or flight_id or str(uuid.uuid4())
         started = started_at or utcnow()
         existing = self.db.get_flight(fid)
         if existing is not None and existing.get("status") != "RECORDING":
@@ -267,12 +271,25 @@ class FlightService:
         self.recorder = FlightRecorder(fid, started, self.paths)
         self.recorder.add_event(0.0, "recording_started", {"manual": manual})
         if existing is None:
-            self.db.insert_flight({
+            record: dict[str, Any] = {
                 "id": fid, "mode": "PERSONAL", "status": "RECORDING",
                 "callsign": self._callsign(), "aircraft_type": self._aircraft_type(),
                 "aircraft_title": self.aircraft_title, "block_off_utc": started,
                 "created_at": started,
-            })
+            }
+            if ctx:
+                record.update({
+                    "mode": "ROSTER" if ctx.get("kind") == "ROSTER" else "FREE",
+                    "roster_leg_id": ctx.get("roster_leg_id"),
+                    "flight_instance_id": ctx.get("flight_instance_id"),
+                    "aircraft_id": ctx.get("aircraft_id"),
+                    "callsign": ctx.get("callsign") or record["callsign"],
+                    "aircraft_type": ctx.get("aircraft_type") or record["aircraft_type"],
+                    "dep_icao": ctx.get("dep_icao"), "arr_icao": ctx.get("arr_icao"),
+                    "mission_type": ctx.get("mission_type") or "SCHEDULED",
+                    "scheduled_dep_utc": ctx.get("scheduled_dep_utc"),
+                })
+            self.db.insert_flight(record)
         self._save_persisted()
         return self.status()
 
@@ -284,7 +301,13 @@ class FlightService:
         rec.close()
         flight = None if abort else self._finalize(rec)
         if flight is None:
-            self.db.update_flight(rec.flight_id, {"status": "ABORTED"})
+            record = self.db.update_flight(rec.flight_id, {"status": "ABORTED"})
+            # 中止也要走运营钩子，否则任务/飞机锁会一直挂着无法取消
+            if record and self.on_finalized is not None:
+                try:
+                    self.on_finalized(record)
+                except Exception as exc:  # noqa: BLE001
+                    self.last_error = f"运营中止失败: {type(exc).__name__}: {exc}"
         self.recorder = None
         self.db.setting_set(ACTIVE_KEY, None)
         raw = rec._raw
@@ -333,14 +356,18 @@ class FlightService:
             flags.append("SIM_RATE")
         if sum(1 for s in samples if s.get("paused")) / max(1, len(samples)) > 0.2:
             flags.append("PAUSE")
-        for a, b in zip(samples, samples[1:]):
-            dt = b["t"] - a["t"]
-            if dt <= 0:
-                continue
-            dist = math.hypot((b["lat"] - a["lat"]) * 60, (b["lon"] - a["lon"]) * 60 * math.cos(math.radians(a["lat"])))
-            if dist / (dt / 3600.0) > 900:
-                flags.append("TELEPORT")
-                break
+        # 时间加速下「位移/时间」无法区分加速与瞬移；加速由 SIM_RATE 策略单独处理
+        accelerated = any(float(s.get("sim_rate") or 1) > 1.5 for s in samples)
+        if not accelerated:
+            for a, b in zip(samples, samples[1:]):
+                dt = b["t"] - a["t"]
+                if dt <= 0:
+                    continue
+                dist = math.hypot((b["lat"] - a["lat"]) * 60,
+                                  (b["lon"] - a["lon"]) * 60 * math.cos(math.radians(a["lat"])))
+                if dist / (dt / 3600.0) > 900:
+                    flags.append("TELEPORT")
+                    break
         return flags
 
     def _finalize(self, rec: FlightRecorder) -> dict[str, Any] | None:
@@ -438,6 +465,11 @@ class FlightService:
                 "landing_rate_fpm": metrics.get("touchdown_vs_fpm"),
                 "source": "AOC", "external_id": rec.flight_id,
             })
+        if flight and self.on_finalized is not None:
+            try:
+                self.on_finalized(flight)
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"运营结算失败: {type(exc).__name__}: {exc}"
         return flight
 
     # -- 状态 -------------------------------------------------------------

@@ -45,6 +45,7 @@
       "../dist": "client",
       "../../../packages": "packages",
       "../../../data": "data",
+      "../../../Pre-train/src": "Pre-train/src",
       "../../../apps/aoc-core": "aoc-core",
       "../../../apps/simlink/bin/Release/net8.0/win-x64": "simlink"
     },

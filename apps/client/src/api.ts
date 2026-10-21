@@ -41,6 +41,25 @@ export function apiUrl(path: string): string {
   return `${coreBase}${path}`;
 }
 
+/**
+ * 用系统默认浏览器打开外链（SimBrief 等）。
+ * Tauri webview 里的 window.open 会新开应用内窗口，因此交给 aoc-core 调 webbrowser；
+ * 后端不可用时退回 window.open。
+ */
+export async function openExternal(url: string): Promise<void> {
+  if (!url) return;
+  try {
+    const res = await api<{ ok: boolean }>("/local/system/open-external", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+    if (res.ok) return;
+  } catch {
+    /* aoc-core 未就绪：退回 webview 打开 */
+  }
+  window.open(url, "_blank", "noopener");
+}
+
 export async function download(path: string, filename: string, init: RequestInit = {}): Promise<void> {
   const headers = new Headers(init.headers);
   headers.set("X-AOC-Token", token);

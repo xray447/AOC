@@ -45,6 +45,8 @@ for pkg in (ROOT / "packages" / "aoc_protocol", ROOT / "packages" / "aoc_core",
         sys.path.insert(0, str(pkg))
 
 from aoc_core import __version__  # noqa: E402
+from aoc_core.lock import InstanceLocked, SingleInstance  # noqa: E402
+from aoc_core.ops import OpsError  # noqa: E402
 from aoc_core.paths import AppPaths  # noqa: E402
 from aoc_core.service import PersonalService  # noqa: E402
 from aoc_protocol.schemas import (  # noqa: E402
@@ -86,6 +88,9 @@ def _read_json(path: Path) -> dict | None:
 
 def create_app(config: CoreConfig) -> FastAPI:
     paths = AppPaths.create(config.home)
+    # 单实例锁：同一份本机库只允许一个 AOC 进程写（M2 §4.1）
+    instance_lock = SingleInstance(paths.lock)
+    instance_lock.acquire()
     service = PersonalService(paths)
     if config.simlink_url and config.simlink_token:
         service.set_simlink(config.simlink_url, config.simlink_token)
@@ -115,6 +120,7 @@ def create_app(config: CoreConfig) -> FastAPI:
         finally:
             watcher.cancel()
             await service.close()
+            instance_lock.release()
 
     app = FastAPI(title="AOC Core", version=__version__, lifespan=lifespan)
     app.state.service = service
@@ -153,6 +159,17 @@ def create_app(config: CoreConfig) -> FastAPI:
     async def value_error_handler(request: Request, exc: ValueError):
         return JSONResponse(status_code=422, content={
             "code": "PARAM_OUT_OF_RANGE", "message": str(exc),
+            "request_id": request.headers.get("X-Request-ID", "")})
+
+    OPS_CONFLICT = {"AIRCRAFT_LOCKED", "INVALID_STATE", "TASK_IN_PROGRESS", "INSTANCE_UNAVAILABLE",
+                    "CANDIDATE_EXPIRED", "LOCK_EXPIRED", "DUPLICATE_REGISTRATION", "DUPLICATE_ROUTE",
+                    "CONFIG_VERSION_CONFLICT", "VERSION_CONFLICT", "INVALID_TOKEN"}
+
+    @app.exception_handler(OpsError)
+    async def ops_error_handler(request: Request, exc: OpsError):
+        status = 409 if exc.code in OPS_CONFLICT else (404 if exc.code == "NOT_FOUND" else 422)
+        return JSONResponse(status_code=status, content={
+            "code": exc.code, "message": exc.message, "details": exc.details,
             "request_id": request.headers.get("X-Request-ID", "")})
 
     # ---------------- 基础 ----------------
@@ -197,6 +214,20 @@ def create_app(config: CoreConfig) -> FastAPI:
     @app.get("/local/runtime")
     def runtime():
         return _read_json(paths.runtime) or {}
+
+    # ---------------- 系统 ----------------
+    @app.post("/local/system/open-external")
+    def open_external(body: dict[str, Any]):
+        """用系统默认浏览器打开外链（SimBrief 等），只接受 http/https。"""
+        url = str(body.get("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="只支持 http/https 链接")
+        try:
+            opened = bool(webbrowser.open(url))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("open-external failed: %s", exc)
+            opened = False
+        return {"ok": opened, "url": url}
 
     # ---------------- 设置 ----------------
     @app.get("/local/settings")
@@ -244,8 +275,20 @@ def create_app(config: CoreConfig) -> FastAPI:
 
     @app.get("/local/routes/simbrief")
     def route_simbrief(dep: str, arr: str, aircraft_type: str | None = None,
-                       cruise_fl: int = 350, route: str | None = None):
-        return {"simbrief_url": service.route.simbrief(dep, arr, cruise_fl, aircraft_type, route)}
+                       route: str | None = None, callsign: str | None = None,
+                       payload_kg: float | None = None, registration: str | None = None):
+        return {"simbrief_url": service.route.simbrief(
+            dep, arr, aircraft=aircraft_type, route=route, callsign=callsign,
+            payload_kg=payload_kg, registration=registration)}
+
+    @app.get("/local/routes/engine")
+    def route_engine():
+        """诊断用：图是否就绪、AIP 数据来源与条数、后台任务状态。"""
+        return service.route_engine_status()
+
+    @app.post("/local/routes/aip/sync")
+    def route_aip_sync(body: dict[str, Any] | None = None):
+        return service.sync_aip(force=bool((body or {}).get("force")))
 
     @app.post("/local/routes/coverage")
     def route_coverage(request: CoverageRequest):
@@ -403,6 +446,258 @@ def create_app(config: CoreConfig) -> FastAPI:
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=422, detail={"code": "IMPORT_FAILED", "message": str(exc)}) from exc
 
+    # ---------------- 单机运营模式（M2） ----------------
+    @app.get("/local/ops/dashboard")
+    def ops_dashboard():
+        return service.ops.dashboard()
+
+    @app.get("/local/ops/profile")
+    def ops_profile():
+        return service.ops.profile() or {}
+
+    @app.put("/local/ops/profile")
+    def ops_profile_update(body: dict[str, Any]):
+        return service.ops.update_profile(body)
+
+    @app.post("/local/ops/seed")
+    def ops_seed():
+        return service.ops.seed_demo()
+
+    @app.post("/local/ops/reset")
+    def ops_reset():
+        return service.ops.reset()
+
+    @app.get("/local/ops/aircraft-types")
+    def ops_aircraft_types():
+        return {"items": service.ops.list_types()}
+
+    @app.get("/local/ops/fleet")
+    def ops_fleet():
+        return {"items": service.ops.list_fleet()}
+
+    @app.post("/local/ops/fleet")
+    def ops_fleet_add(body: dict[str, Any]):
+        return service.ops.add_aircraft(body)
+
+    @app.get("/local/ops/fleet/{aircraft_id}")
+    def ops_fleet_item(aircraft_id: str):
+        item = service.ops.get_aircraft(aircraft_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "飞机不存在"})
+        return item
+
+    @app.patch("/local/ops/fleet/{aircraft_id}")
+    def ops_fleet_update(aircraft_id: str, body: dict[str, Any]):
+        return service.ops.update_aircraft(aircraft_id, body)
+
+    @app.post("/local/ops/fleet/{aircraft_id}/release")
+    def ops_fleet_release(aircraft_id: str, body: dict[str, Any] | None = None):
+        return service.ops.release_aircraft(aircraft_id, (body or {}).get("reason"))
+
+    @app.get("/local/ops/routes")
+    def ops_routes():
+        return {"items": service.ops.list_routes()}
+
+    @app.post("/local/ops/routes")
+    def ops_route_add(body: dict[str, Any]):
+        return service.ops.add_route(body)
+
+    @app.patch("/local/ops/routes/{route_id}")
+    def ops_route_update(route_id: str, body: dict[str, Any]):
+        return service.ops.update_route(route_id, body)
+
+    @app.delete("/local/ops/routes/{route_id}")
+    def ops_route_delete(route_id: str):
+        return {"ok": service.ops.delete_route(route_id)}
+
+    @app.get("/local/ops/schedules")
+    def ops_schedules():
+        return {"items": service.ops.list_schedules()}
+
+    @app.post("/local/ops/schedules")
+    def ops_schedule_add(body: dict[str, Any]):
+        return service.ops.add_schedule(body)
+
+    @app.patch("/local/ops/schedules/{schedule_id}")
+    def ops_schedule_update(schedule_id: str, body: dict[str, Any]):
+        return service.ops.update_schedule(schedule_id, body)
+
+    @app.delete("/local/ops/schedules/{schedule_id}")
+    def ops_schedule_delete(schedule_id: str):
+        return {"ok": service.ops.delete_schedule(schedule_id)}
+
+    @app.post("/local/ops/schedules/generate")
+    def ops_generate(days: int = Query(default=7, ge=1, le=31)):
+        return {"created": service.ops.generate_instances(days)}
+
+    @app.get("/local/ops/instances")
+    def ops_instances(status: str | None = None, dep: str | None = None,
+                      arr: str | None = None, days: int = Query(default=7, ge=1, le=31)):
+        return {"items": service.ops.list_instances(status=status, dep=dep, arr=arr, days=days)}
+
+    @app.post("/local/ops/instances/{instance_id}/cancel")
+    def ops_instance_cancel(instance_id: str):
+        return service.ops.cancel_instance(instance_id)
+
+    @app.post("/local/ops/rosters/draw")
+    def ops_roster_draw(body: dict[str, Any] | None = None):
+        return service.ops.draw(body or {})
+
+    @app.post("/local/ops/rosters/confirm")
+    def ops_roster_confirm(body: dict[str, Any]):
+        return service.ops.confirm_roster(body.get("candidate_token", ""),
+                                          int(body.get("candidate_index") or 0))
+
+    @app.get("/local/ops/rosters")
+    def ops_rosters():
+        return {"items": service.ops.list_rosters()}
+
+    @app.get("/local/ops/rosters/current")
+    def ops_roster_current():
+        return service.ops.current_roster() or {}
+
+    @app.get("/local/ops/rosters/{roster_id}")
+    def ops_roster_item(roster_id: str):
+        item = service.ops.roster(roster_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "班表不存在"})
+        return item
+
+    @app.post("/local/ops/rosters/{roster_id}/redraw")
+    def ops_roster_redraw(roster_id: str):
+        return service.ops.redraw(roster_id)
+
+    @app.post("/local/ops/rosters/{roster_id}/cancel")
+    def ops_roster_cancel(roster_id: str, body: dict[str, Any] | None = None):
+        return service.ops.cancel_roster(roster_id, (body or {}).get("reason"))
+
+    @app.post("/local/ops/rosters/{roster_id}/expire")
+    def ops_roster_expire(roster_id: str):
+        return service.ops.expire_roster(roster_id)
+
+    @app.post("/local/ops/rosters/{roster_id}/legs/{sequence}/start")
+    def ops_leg_start(roster_id: str, sequence: int):
+        return service.ops.start_leg(roster_id, sequence)
+
+    @app.get("/local/ops/free-flights/aircraft")
+    def ops_free_aircraft(dep: str | None = None, type_id: str | None = None):
+        return {"items": service.ops.free_aircraft(dep, type_id)}
+
+    @app.post("/local/ops/free-flights")
+    def ops_free_create(body: dict[str, Any]):
+        return service.ops.create_free_flight(body)
+
+    @app.get("/local/ops/free-flights/current")
+    def ops_free_current():
+        return service.ops.current_free_flight() or {}
+
+    @app.post("/local/ops/free-flights/{free_id}/heartbeat")
+    def ops_free_heartbeat(free_id: str):
+        return service.ops.heartbeat_free(free_id)
+
+    @app.post("/local/ops/free-flights/{free_id}/start")
+    def ops_free_start(free_id: str):
+        return service.ops.start_free_flight(free_id)
+
+    @app.post("/local/ops/free-flights/{free_id}/cancel")
+    def ops_free_cancel(free_id: str):
+        return service.ops.cancel_free(free_id)
+
+    @app.get("/local/ops/active")
+    def ops_active():
+        return {"task": service.ops.active_task(),
+                "roster": service.ops.current_roster(),
+                "free_flight": service.ops.current_free_flight()}
+
+    @app.get("/local/ops/status")
+    def ops_status():
+        return service.ops_status()
+
+    @app.get("/local/ops/load-sheets/{flight_id}")
+    def ops_load_sheet(flight_id: str):
+        item = service.ops.load_sheet(flight_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "配载单不存在"})
+        return item
+
+    @app.get("/local/ops/legs/simbrief")
+    def ops_leg_simbrief(roster_id: str | None = None, sequence: int | None = None,
+                         free_id: str | None = None, flight_record_id: str | None = None):
+        """SimBrief 预填（含 kg 配载，不含高度）：班表航段 / 自由飞 / 已开始的航班记录。"""
+        return service.simbrief_for_leg(roster_id=roster_id, sequence=sequence, free_id=free_id,
+                                        flight_record_id=flight_record_id)
+
+    @app.post("/local/ops/tasks/abort")
+    async def ops_task_abort(body: dict[str, Any] | None = None):
+        """放弃当前航班：停止录制、取消航段与剩余班表、释放飞机（不结算）。"""
+        reason = (body or {}).get("reason")
+        return await service.abort_task(reason)
+
+    @app.get("/local/ops/finance/summary")
+    def ops_finance_summary():
+        return service.ops.finance_summary()
+
+    @app.get("/local/ops/settlements")
+    def ops_settlements(limit: int = Query(default=100, ge=1, le=500), status: str | None = None):
+        return {"items": service.ops.settlements(limit, status)}
+
+    @app.get("/local/ops/settlements/{settlement_id}")
+    def ops_settlement(settlement_id: str):
+        item = service.ops.settlement(settlement_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "结算不存在"})
+        return item
+
+    @app.get("/local/ops/flights/{flight_id}/settlement")
+    def ops_flight_settlement(flight_id: str):
+        item = service.ops.settlement_for_flight(flight_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "该航班尚未结算"})
+        return item
+
+    @app.get("/local/ops/review")
+    def ops_review():
+        return {"items": service.ops.review_queue()}
+
+    @app.post("/local/ops/review/{settlement_id}")
+    def ops_review_resolve(settlement_id: str, body: dict[str, Any]):
+        return service.ops.resolve_review(settlement_id, body.get("action", ""),
+                                          body.get("note"), body.get("payout_factor"))
+
+    @app.get("/local/ops/ledger")
+    def ops_ledger(limit: int = Query(default=200, ge=1, le=1000)):
+        return service.ops.ledger(limit)
+
+    @app.get("/local/ops/config")
+    def ops_config():
+        return service.ops.config()
+
+    @app.post("/local/ops/config/preview")
+    def ops_config_preview(body: dict[str, Any]):
+        return service.ops.preview_config(body.get("economy"), body.get("policy"),
+                                          body.get("anomalies"))
+
+    @app.post("/local/ops/config/publish")
+    def ops_config_publish(body: dict[str, Any]):
+        return service.ops.publish_config(body.get("economy"), body.get("policy"),
+                                          body.get("note", ""), body.get("expected_version"))
+
+    @app.post("/local/ops/config/rollback")
+    def ops_config_rollback(body: dict[str, Any]):
+        return service.ops.rollback_config(int(body.get("version") or 0), body.get("note"))
+
+    @app.get("/local/ops/config/history")
+    def ops_config_history(limit: int = Query(default=50, ge=1, le=200)):
+        return {"items": service.ops.config_history(limit)}
+
+    @app.get("/local/ops/config/resolve")
+    def ops_config_resolve(aircraft_id: str | None = None):
+        return service.ops.resolve_effective_policy(aircraft_id)
+
+    @app.get("/local/ops/audit")
+    def ops_audit(limit: int = Query(default=100, ge=1, le=500)):
+        return {"items": service.ops.audit_log(limit)}
+
     # ---------------- 静态 SPA ----------------
     assets = static_dir / "assets"
     if assets.exists():
@@ -475,7 +770,12 @@ def main() -> int:
                         static_dir=Path(args.static_dir) if args.static_dir else None,
                         open_browser=args.open and not os.environ.get("AOC_NO_BROWSER"),
                         simlink_url=args.simlink_url, simlink_token=args.simlink_token)
-    app = create_app(config)
+    try:
+        app = create_app(config)
+    except InstanceLocked as exc:
+        log.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        return 2
     log.info("AOC core %s listening on http://127.0.0.1:%s (home=%s)", __version__, port, paths.home)
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
     return 0

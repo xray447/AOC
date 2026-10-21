@@ -10,7 +10,7 @@ import { Alert, Button, Card, Col, Descriptions, Empty, Form, InputNumber, Row, 
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { aircraftGroups, categoryLabel } from "../aircraft";
-import { api, download } from "../api";
+import { api, download, openExternal } from "../api";
 import { AirportSelect } from "../components/AirportSelect";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
@@ -168,7 +168,7 @@ export function RoutePlanner() {
                     {tr("生成航路", "Generate")}
                   </Button>
                   <Tooltip title={tr("选定机场即可生成，不依赖航路结果", "Generated as soon as both airports are set")}>
-                    <Button icon={<ExportOutlined />} disabled={!simbrief} onClick={() => window.open(simbrief, "_blank")}>
+                    <Button icon={<ExportOutlined />} disabled={!simbrief} onClick={() => void openExternal(simbrief)}>
                       SimBrief
                     </Button>
                   </Tooltip>
@@ -219,7 +219,7 @@ export function RoutePlanner() {
                 </Space>
               }
             >
-              <div className="route-box">{result.tokens_full.join(" ") || result.route}</div>
+              <div className="route-box">{result.route || result.tokens_full.join(" ")}</div>
               <Descriptions size="small" column={{ xs: 1, sm: 2, md: 4 }} style={{ marginTop: 12 }}>
                 <Descriptions.Item label={tr("距离", "Distance")}>{result.distance_nm ? `${result.distance_nm} NM` : "—"}</Descriptions.Item>
                 <Descriptions.Item label={tr("大圆距离", "GCD")}>{result.gcd_nm ? `${result.gcd_nm} NM` : "—"}</Descriptions.Item>
@@ -233,7 +233,7 @@ export function RoutePlanner() {
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
                 description={tr("本地没有可用航路，请使用 SimBrief 生成并导入模拟器", "No local route available. Use SimBrief and load it into the simulator.")}
               >
-                <Button type="primary" icon={<ExportOutlined />} disabled={!simbrief} onClick={() => window.open(simbrief, "_blank")}>
+                <Button type="primary" icon={<ExportOutlined />} disabled={!simbrief} onClick={() => void openExternal(simbrief)}>
                   {tr("打开 SimBrief", "Open SimBrief")}
                 </Button>
               </Empty>
@@ -304,7 +304,7 @@ export function RoutePlanner() {
                 </Text>
                 <Space>
                   <Button icon={<CopyOutlined />} onClick={() => void copy(simbrief)}>{tr("复制链接", "Copy link")}</Button>
-                  <Button type="primary" icon={<AimOutlined />} onClick={() => window.open(simbrief, "_blank")}>{tr("打开 SimBrief", "Open SimBrief")}</Button>
+                  <Button type="primary" icon={<AimOutlined />} onClick={() => void openExternal(simbrief)}>{tr("打开 SimBrief", "Open SimBrief")}</Button>
                 </Space>
               </Space>
             </Card>
