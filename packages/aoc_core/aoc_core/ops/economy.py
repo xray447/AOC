@@ -118,8 +118,8 @@ def airport_meta(nav: Any, icao: str | None) -> dict[str, Any]:
         return {"icao": (icao or "").upper(), "size_class": "medium", "known": False,
                 **SIZE_CLASS["medium"], "lat": None, "lon": None, "runway_m": None,
                 "name": None, "country": None}
-    runway_ft = info.get("longest_runway_ft")
-    runway_m = round(float(runway_ft) / 3.280839895) if runway_ft else None
+    longest = info.get("longest_runway_m")
+    runway_m = round(float(longest)) if longest else None
     if runway_m is None:
         size = "medium"
     elif runway_m >= 3000:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import statistics
 import threading
 from pathlib import Path
 from typing import Iterable
@@ -129,6 +130,7 @@ class NavData:
         self._runways: dict[str, list[dict]] = {}
         self._runway_cache: dict[str, int] = {}
         self._load_runways()
+        self._resolve_runway_units()
         self.airac, self.navdata_version = self._load_meta()
         self._coverage: CoverageIndex | None = None
         self._limits: dict[str, tuple[float, float] | None] = {}
@@ -171,7 +173,10 @@ class NavData:
                 "lon": row["lonx"],
                 "elev_ft": row.get("altitude"),
                 "transition_alt_ft": row.get("transition_altitude"),
-                "longest_runway_ft": row.get("longest_runway_length"),
+                # 原始值单位随数据源变化，载入跑道表后由 _resolve_runway_units 统一成米/英尺
+                "longest_runway_raw": row.get("longest_runway_length"),
+                "longest_runway_m": None,
+                "longest_runway_ft": None,
                 "has_procedures": bool(row.get("has_procedures")) if "has_procedures" in row else None,
             }
 
@@ -204,23 +209,72 @@ class NavData:
                 "ils": bool(row["ils"]) if row["ils"] is not None else None,
             })
         # 跑道长度：优先 runway.length，否则由反向跑道端反推
-        for ident, ends in self._runways.items():
+        for ends in self._runways.values():
             for end in ends:
-                end["length_m"] = self._runway_length_m(ident, end, ends)
+                end["length_m"] = self._runway_length_m(end, ends)
 
-    def _runway_length_m(self, airport: str, end: dict, ends: list[dict]) -> float | None:
+    def _runway_length_m(self, end: dict, ends: list[dict]) -> float | None:
+        geo = self._runway_geo_length_m(end, ends)
         raw = end.get("length_raw")
         if raw:
             value = float(raw)
-            # 常见 navdata 以英尺存储；大于 5000 视为英尺
+            # runway.length 的单位因数据源而异（Little Navmap/Navigraph 用英尺）。
+            # 用两端坐标反推的几何长度做比例校准，避免按绝对值猜单位：
+            # 短跑道（如 1200 m = 3937 ft）会被"大于 5000 才当英尺"的阈值误判成 3937 m。
+            if geo and 300.0 < geo < 20000.0:
+                ratio = value / geo
+                if 2.5 <= ratio <= 4.5:
+                    return round(value / FT_PER_M, 1)
+                if 0.8 <= ratio <= 1.25:
+                    return round(value, 1)
+            # 没有可用几何参照时的兜底：米制跑道极少超过 6000 m
             return round(value / FT_PER_M, 1) if value > 5000 else round(value, 1)
+        return round(geo, 1) if geo else None
+
+    def _runway_geo_length_m(self, end: dict, ends: list[dict]) -> float | None:
         recip = reciprocal_name(end["name"])
         if not recip:
             return None
         other = next((e for e in ends if e["name"] == recip), None)
         if not other or end["lat"] is None or other["lat"] is None:
             return None
-        return round(haversine_nm(end["lat"], end["lon"], other["lat"], other["lon"]) * 1852, 1)
+        if end["lon"] is None or other["lon"] is None:
+            return None
+        return haversine_nm(end["lat"], end["lon"], other["lat"], other["lon"]) * 1852
+
+    def _resolve_runway_units(self) -> None:
+        """统一每座机场的"最长跑道"长度口径（米）。
+
+        ``airport.longest_runway_length`` 的单位随数据源变化（Little Navmap / Navigraph
+        用英尺，自建库可能用米）。这里用 runway 表反推出的米制长度做全库比例校准，
+        再把 ``longest_runway_m`` / ``longest_runway_ft`` 回填到机场字典。
+        """
+        derived: dict[str, float] = {}
+        for ident, ends in self._runways.items():
+            lengths = [e["length_m"] for e in ends if e.get("length_m")]
+            if lengths:
+                derived[ident] = max(lengths)
+        ratios = []
+        for ident, meters in derived.items():
+            raw = (self.airports.get(ident) or {}).get("longest_runway_raw")
+            if raw and float(raw) > 0 and meters > 300:
+                ratios.append(float(raw) / meters)
+        scale = statistics.median(ratios) if ratios else None
+        # 比例 ≈3.28 说明库里存的是英尺，≈1 说明就是米；都不像则退回按数值量级判断
+        use_feet: bool | None = None
+        if scale is not None:
+            if 2.5 <= scale <= 4.5:
+                use_feet = True
+            elif 0.8 <= scale <= 1.25:
+                use_feet = False
+        for ident, a in self.airports.items():
+            meters = derived.get(ident)
+            raw = a.get("longest_runway_raw")
+            if meters is None and raw and float(raw) > 0:
+                feet = use_feet if use_feet is not None else float(raw) > 5000
+                meters = float(raw) / FT_PER_M if feet else float(raw)
+            a["longest_runway_m"] = round(meters, 1) if meters else None
+            a["longest_runway_ft"] = round(meters * FT_PER_M, 1) if meters else None
 
     def _load_meta(self) -> tuple[str, str]:
         try:

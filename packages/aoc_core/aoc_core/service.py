@@ -327,8 +327,7 @@ class PersonalService:
         return [AirportOut(
             icao=a["ident"], iata=a.get("iata"), name=a.get("name"), city=a.get("city"),
             country=a.get("country"), lat=a["lat"], lon=a["lon"], elev_ft=a.get("elev_ft"),
-            longest_runway_m=(round(a["longest_runway_ft"] / 3.280839895, 0)
-                              if a.get("longest_runway_ft") else None),
+            longest_runway_m=a.get("longest_runway_m"),
             visited=a["ident"] in visited,
         ) for a in nav.search_airports(query, limit)]
 
