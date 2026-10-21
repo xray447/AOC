@@ -43,7 +43,16 @@ Pre-train/
 .DS_Store
 Thumbs.db
 
+# ═══════════ 本地配置 / 数据库 ═══════════
+# deploy/.env 含数据库与 AOC_SECRET，只入库 .env.example
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+
 # AOC core
 .pytest_cache/
+.ruff_cache/
 apps/client/src-tauri/gen/
 
