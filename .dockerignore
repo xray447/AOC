@@ -1,0 +1,11 @@
+.git
+out
+spikes
+apps/client/node_modules
+apps/client/dist
+apps/admin-web/node_modules
+apps/admin-web/dist
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests

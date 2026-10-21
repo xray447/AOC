@@ -6,6 +6,7 @@ import {
   CarOutlined,
   CheckSquareOutlined,
   ClockCircleOutlined,
+  CloudServerOutlined,
   CompassOutlined,
   DashboardOutlined,
   GlobalOutlined,
@@ -36,6 +37,7 @@ import { OpsHome } from "./pages/ops/OpsHome";
 import { OpsNetwork } from "./pages/ops/OpsNetwork";
 import { OpsReview } from "./pages/ops/OpsReview";
 import { OpsRules } from "./pages/ops/OpsRules";
+import { Online } from "./pages/Online";
 import { Recommend } from "./pages/Recommend";
 import { RoutePlanner } from "./pages/RoutePlanner";
 import { Logs } from "./pages/Logs";
@@ -96,6 +98,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
     { key: "/ops/finance", icon: <BankOutlined />, label: tr("财务", "Finance") },
     { key: "/ops/rules", icon: <AuditOutlined />, label: tr("运营规则", "Rules") },
     { key: "/ops/review", icon: <CheckSquareOutlined />, label: tr("复核队列", "Review") },
+    { key: "/ops/online", icon: <CloudServerOutlined />, label: tr("联机模式", "Online") },
   ];
   const items: MenuProps["items"] = [
     { type: "group", key: "g-personal", label: tr("个人模式", "Personal"), children: personalItems },
@@ -130,8 +133,8 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
         <div className="sider-footer">
           {!collapsed ? (
             <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
-              {tr("单机运营（M2）：无账号、无服务端，数据与规则都在本机。",
-                "Single-player ops (M2): no account, no server — data and rules stay local.")}
+              {tr("单机运营（M2）数据在本机；「联机模式」可登录公司服务端抽班与同步（M3）。",
+                "Single-player data stays local; Online mode connects to a company server (M3).")}
             </div>
           ) : null}
         </div>
@@ -338,6 +341,7 @@ export default function App() {
             <Route path="ops/ledger" element={<OpsFinance />} />
             <Route path="ops/rules" element={<OpsRules />} />
             <Route path="ops/review" element={<OpsReview />} />
+            <Route path="ops/online" element={<Online />} />
           </Route>
         </Routes>
         <Onboarding

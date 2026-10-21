@@ -8,6 +8,7 @@ pythonpath = [
   "packages/aoc_integrations",
   "packages/aoc_core",
   "apps/aoc-core",
+  "apps/server",
 ]
 addopts = "-q"
 

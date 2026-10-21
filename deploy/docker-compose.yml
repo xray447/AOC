@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aoc}
+      POSTGRES_USER: ${POSTGRES_USER:-aoc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aoc} -d ${POSTGRES_DB:-aoc}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      AOC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aoc}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-aoc}
+      AOC_SECRET: ${AOC_SECRET:?set AOC_SECRET in deploy/.env}
+      AOC_BOOTSTRAP_COMPANY: ${AOC_BOOTSTRAP_COMPANY:-AOC Virtual}
+      AOC_BOOTSTRAP_ICAO: ${AOC_BOOTSTRAP_ICAO:-AOC}
+      AOC_BOOTSTRAP_BASE: ${AOC_BOOTSTRAP_BASE:-ZBAA}
+      AOC_BOOTSTRAP_ADMIN: ${AOC_BOOTSTRAP_ADMIN:-admin}
+      AOC_BOOTSTRAP_PASSWORD: ${AOC_BOOTSTRAP_PASSWORD:?set AOC_BOOTSTRAP_PASSWORD in deploy/.env}
+      AOC_SEED_TYPES: "1"
+      AOC_SEED_DEMO: ${AOC_SEED_DEMO:-0}
+      # 本机 http 快速验证用 0；公网 HTTPS 必须改 1
+      AOC_COOKIE_SECURE: ${AOC_COOKIE_SECURE:-0}
+      AOC_CORS_ORIGINS: ${AOC_CORS_ORIGINS:-https://aoc.example.com,tauri://localhost,https://tauri.localhost}
+    ports:
+      - "${AOC_PORT:-8080}:8080"
+
+volumes:
+  pgdata:
