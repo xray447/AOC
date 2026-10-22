@@ -6,7 +6,7 @@
 
 ## 构建状态
 
-[![build](https://github.com/OWNER/REPO/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/build.yml)
+[![build](https://github.com/xray447/AOC/actions/workflows/build.yml/badge.svg)](https://github.com/xray447/AOC/actions/workflows/build.yml)
 
 CI（`.github/workflows/build.yml`，windows-latest）跑 `ruff` + `pytest` + 前端 `tsc --noEmit` + `dotnet build`，
 并产出 `aoc-core-win64`、`aoc-simlink-win64`、Tauri NSIS/MSI（`aoc-installers`）与便携 ZIP（`aoc-portable-win64`）；
