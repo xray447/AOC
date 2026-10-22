@@ -26,6 +26,9 @@ AUTO_TAKEOFF_GS_KT = 40.0
 AUTO_STOP_GS_KT = 5.0
 AUTO_STOP_HOLD_S = 30.0
 FRAME_GAP_S = 3.0
+# 内存里最多保留的原始采样条数（1Hz ≈ 30 分钟）。采样逐条写进 raw.jsonl.gz，
+# 到量就丢掉内存里的列表，落地评估时再从文件读回来，避免长航线越飞越占内存。
+TRIM_AFTER_SAMPLES = 1800
 
 
 def _iso_add(iso: str, seconds: float) -> str:
@@ -79,6 +82,8 @@ class FlightRecorder:
         self.started_at = started_at
         self.paths = paths
         self.samples: list[dict[str, Any]] = []
+        self.sample_count = 0          # 本次录制累计采样数（裁剪后仍准确）
+        self.trimmed = False           # 内存采样被裁剪过 → 完整数据只在 raw.jsonl.gz 里
         self.events: list[dict[str, Any]] = []
         self.last_seq = -1
         self.last_t = -1.0
@@ -108,10 +113,38 @@ class FlightRecorder:
             return
         self._update_events(sample)
         self.samples.append(sample)
+        self.sample_count += 1
         self.last_t = sample["t"]
         self._raw_writer.write(json.dumps(sample, ensure_ascii=False) + "\n")
         self._raw_writer.flush()
         self._last_state = sample
+        if len(self.samples) >= TRIM_AFTER_SAMPLES:
+            self.trim_samples()
+
+    def trim_samples(self) -> None:
+        """把内存里的采样清空（数据已经在 raw.jsonl.gz 里，逐条 flush 过）。"""
+        self.samples.clear()
+        self.trimmed = True
+
+    def all_samples(self) -> list[dict[str, Any]]:
+        """完整采样序列：内存没被裁剪就直接给，裁剪过则从 raw.jsonl.gz 读回来。"""
+        if not self.trimmed:
+            return list(self.samples)
+        out: list[dict[str, Any]] = []
+        try:
+            with gzip.open(self._raw, "rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except (OSError, EOFError):
+            # gz 流被截断（进程被强杀）时保留已解析出的部分
+            pass
+        return out or list(self.samples)
 
     def _update_events(self, s: dict[str, Any]) -> None:
         t = float(s["t"])
@@ -175,7 +208,7 @@ class FlightRecorder:
 
     @property
     def raw_points(self) -> int:
-        return len(self.samples)
+        return self.sample_count
 
     def close(self) -> None:
         try:
@@ -244,12 +277,18 @@ class FlightService:
                         sample = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    rec.samples.append(sample)
+                    rec.sample_count += 1
+                    if len(rec.samples) < TRIM_AFTER_SAMPLES:
+                        rec.samples.append(sample)
+                    else:
+                        rec.trimmed = True       # 超出阈值：完整数据留在 raw.jsonl.gz
                     rec.last_t = max(rec.last_t, float(sample.get("t", 0)))
                     rec._last_state = sample
-        except OSError:
-            rec.close()
-            return
+        except (OSError, EOFError):
+            # 被强杀时 gz 流可能截断：已解析出来的部分继续用，一条都没有才放弃
+            if rec.sample_count == 0:
+                rec.close()
+                return
         rec.last_seq = int(data.get("last_seq", -1))
         rec.add_event(rec.last_t, "resumed", {"flight_id": rec.flight_id})
         self.recorder = rec
@@ -351,7 +390,7 @@ class FlightService:
             self.recorder.add_event(float(ev.get("t", 0)), ev.get("type", "event"), payload)
         for raw in raw_samples:
             self.recorder.ingest(raw)
-        if self.recorder.samples:
+        if self.recorder.sample_count:
             settings = self._settings()
             if self.recorder.should_auto_stop(bool(settings.get("auto_stop", True))):
                 self.auto_stop()
@@ -383,7 +422,8 @@ class FlightService:
         return flags
 
     def _finalize(self, rec: FlightRecorder) -> dict[str, Any] | None:
-        points = rec.samples
+        # 内存里的采样可能被定期裁剪，完整轨迹以 raw.jsonl.gz 为准（评估/落地需要全量）
+        points = rec.all_samples()
         if not points:
             return None
         settings = self._settings()
@@ -493,7 +533,7 @@ class FlightService:
             active=rec is not None,
             flight_id=rec.flight_id if rec else None,
             started_at=rec.started_at if rec else None,
-            samples=len(rec.samples) if rec else 0,
+            samples=rec.sample_count if rec else 0,
             phase=rec.phase if rec else Phase.PREFLIGHT,
             engine_seconds=self.engine_seconds if rec else 0,
             flight_seconds=self.flight_seconds if rec else 0,

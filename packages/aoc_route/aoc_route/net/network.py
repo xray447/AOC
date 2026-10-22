@@ -22,6 +22,7 @@
 """
 
 import pickle
+from pathlib import Path
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -103,7 +104,11 @@ class Network:
         self._s_pos = {}
         self._t_flat = np.zeros(0, dtype=np.int64)
         self._t_pos = {}
-        self.out_edges = {}         # 节点下标 -> [(航路名, 后继节点下标), ...]
+        self.out_edges = None
+        # 邻接表（节点下标 -> [(航路名, 后继节点下标), ...]）不再常驻：校验时用
+        # ``_out()`` 直接从 CSR 的 ``_indptr/_indices/_name_data`` 现算。旧 pkl 里存过
+        # 这份 Python 对象（几十万个 list + tuple），加载后占内存是边数组的十几倍，
+        # 见 ``load()`` 里的丢弃逻辑。
 
     # ==================================================================
     # 构建
@@ -557,21 +562,20 @@ class Network:
             for node, _ in links:
                 m.setdefault(self.node_ident[node - NODE_OFFSET], []).append(node)
             self.link_ident_nodes[ident] = m
-        for i in range(len(self._edge_u)):
-            u = int(self._edge_u[i])
-            v = int(self._edge_v[i])
-            nm = self.airway_names[int(self._edge_name[i])]
-            self.out_edges.setdefault(u, []).append((nm, v))
+        self.out_edges = None       # 邻接表按需从 CSR 现算，见 _out()
 
     # ==================================================================
     # 持久化
     # ==================================================================
     def save(self, path=None):
-        path = path or config.NETWORK_PKL
+        path = Path(path or config.NETWORK_PKL)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._mat.data = self._base_data.copy()      # 存盘前还原成未惩罚的权重
+        # out_edges 不进 pkl：它是可从 CSR 现算的派生数据，存进去会让 pkl 变大、
+        # 加载后又常驻几百 MB Python 对象（一个 list/tuple 都是一份独立对象头）。
+        state = {k: v for k, v in self.__dict__.items() if k != "out_edges"}
         with open(path, "wb") as f:
-            pickle.dump(self.__dict__, f, protocol=4)
+            pickle.dump(state, f, protocol=4)
 
     @classmethod
     def load(cls, path=None):
@@ -579,6 +583,7 @@ class Network:
         with open(path, "rb") as f:
             state = _CompatUnpickler(f).load()
         net = cls()
+        state.pop("out_edges", None)     # 旧版 pkl 存过邻接表，读出来只会白占内存
         net.__dict__.update(state)
         net._mat.data = net._base_data.copy()
         return net
@@ -595,6 +600,17 @@ class Network:
         if i < cols.shape[0] and int(cols[i]) == v:
             return s + i
         return -1
+
+    def _out(self, u: int):
+        """``u`` 的后继 ``[(航路名, 节点下标), ...]``（从 CSR 现算，不常驻邻接表）。"""
+        s = int(self._indptr[u])
+        e = int(self._indptr[u + 1])
+        indices, names = self._indices, self._name_data
+        for k in range(s, e):
+            nm = int(names[k])
+            if nm < 0:                  # S/T 虚拟边没有航路名
+                continue
+            yield self.airway_names[nm], int(indices[k])
 
     def airport(self, ident):
         return self.airports.get(ident)
@@ -921,7 +937,7 @@ class Network:
     def _successors(self, nodes, airway):
         res = set()
         for u in nodes:
-            for name, v in self.out_edges.get(u, ()):
+            for name, v in self._out(u):
                 if name == airway:
                     res.add(v)
         return res
@@ -940,7 +956,7 @@ class Network:
         seen = set(visited)
         frontier = []
         for u in nodes:
-            for name, v in self.out_edges.get(u, ()):
+            for name, v in self._out(u):
                 if name != airway or v in seen:
                     continue
                 seen.add(v)
@@ -953,7 +969,7 @@ class Network:
                 if self.node_ident[v - NODE_OFFSET] == target_ident:
                     hits.append((v, trail))
                     continue                      # 命中就不再往后走
-                for name, w in self.out_edges.get(v, ()):
+                for name, w in self._out(v):
                     if name != airway or w in seen:
                         continue
                     seen.add(w)

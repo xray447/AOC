@@ -211,9 +211,11 @@ class PersonalService:
         return (url or None), bool(self._settings.get("aip_auto_sync", True))
 
     def _make_graph_provider(self) -> GraphProvider:
+        # 默认"用完即卸"（算完航路把图还回去）；AOC_GRAPH_EAGER=1 时恢复常驻
         return GraphProvider(self._settings.get("pre_train_dir") or None,
                              self._settings.get("network_pkl") or None,
-                             self.paths.cache)
+                             self.paths.cache,
+                             keep_loaded=True if self._graph_eager() else None)
 
     def _build_route(self) -> None:
         aip_path = self._settings.get("aip_path") or None
@@ -233,7 +235,29 @@ class PersonalService:
     # 后台任务：都不阻塞启动，失败只写日志 ---------------------------------
     def _start_data_tasks(self) -> None:
         self._start_aip_sync()
-        self._start_graph_build()
+        self._prime_graph()
+
+    @staticmethod
+    def _graph_eager() -> bool:
+        """``AOC_GRAPH_EAGER=1`` 恢复"启动即加载航路图"的旧行为（排障用）。"""
+        return bool(os.environ.get("AOC_GRAPH_EAGER"))
+
+    def _prime_graph(self) -> None:
+        """图懒加载：只定位缓存文件，不反序列化。
+
+        航路图 pkl 读进内存要几百 MB（邻接表 + CSR + 标识符列表），而绝大多数会话
+        根本不生成航路，所以把它推迟到第一次真正用到图时（见 ``generate_route``）。
+        """
+        if self._graph_eager():
+            self._start_graph_build()
+            return
+        nav = self.nav
+        if nav is None:
+            return
+        try:
+            self._graph_provider.locate(nav.path, nav.airac)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("航路图定位失败：%s: %s", type(exc).__name__, exc)
 
     def sync_aip(self, force: bool = False) -> dict[str, Any]:
         """同步日本 AIP 航路到本地缓存（网络优先，失败保留旧缓存）。"""
@@ -249,9 +273,9 @@ class PersonalService:
         path = sync_jp_routes(cache, url=url, ttl_days=0 if force else JP_ROUTES_TTL_DAYS)
         refreshed = bool(path and path.exists() and path.stat().st_mtime_ns != before)
         if refreshed:
-            # 重建 RouteService 后重新挂上已建好的图（命中缓存时是毫秒级）
+            # 重建 RouteService 后重新定位图缓存（懒加载：只定位，不反序列化）
             self._build_route()
-            self._start_graph_build()
+            self._prime_graph()
         return {"ok": path is not None, "reason": "", "refreshed": refreshed,
                 "path": str(path) if path else None}
 
@@ -300,13 +324,20 @@ class PersonalService:
             log.info("航路图就绪：%s（%.1f s）", graph.pkl, _time.perf_counter() - t0)
         else:
             log.info("航路图不可用：%s", graph.error or "unknown")
+        if not self._graph_eager():
+            graph.release()          # 建完就落盘了，不必把图常驻在内存里
 
     def route_engine_status(self) -> dict[str, Any]:
         route = self.route
         graph, aip = self._graph_provider, route.aip
+        route.prime_graph()          # 诊断接口不该把图读进内存，只定位缓存
         rows = aip.load()
         return {
             "graph_available": graph.available,
+            "graph_loaded": graph.loaded,
+            "graph_lazy": not self._graph_eager(),
+            "graph_keep": graph.keep_loaded,
+            "graph_idle_unload_s": graph.idle_unload_s,
             "graph_pkl": str(graph.pkl),
             "graph_error": graph.error,
             "graph_build_ms": graph.load_ms,
@@ -329,7 +360,11 @@ class PersonalService:
     def generate_route(self, dep: str, arr: str, cruise_fl: int = 350,
                        aircraft: str | None = None, force_graph: bool = False) -> RouteResult:
         ac = aircraft or self._settings.get("aircraft_type") or "A320"
-        return self.route.generate(dep, arr, cruise_fl, ac, force_graph)
+        result = self.route.generate(dep, arr, cruise_fl, ac, force_graph)
+        if not self._graph_provider.available:
+            # 缓存还没有：第一次只能走 SimBrief，顺手在后台建好，下一次就有图航路
+            self._start_graph_build()
+        return result
 
     # -- airports --------------------------------------------------------
     def search_airports(self, query: str, limit: int = 20) -> list[AirportOut]:

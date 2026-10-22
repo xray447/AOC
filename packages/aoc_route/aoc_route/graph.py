@@ -12,11 +12,13 @@
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -46,6 +48,20 @@ def find_pre_train_dir() -> Path | None:
     return None
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def cache_tag(navdata_path: str | Path, airac: str | None) -> str:
     """缓存文件名里的指纹：AIRAC + 库路径/时间/大小，任一变化就重建。"""
     path = Path(navdata_path)
@@ -61,7 +77,9 @@ def cache_tag(navdata_path: str | Path, airac: str | None) -> str:
 class GraphProvider:
     def __init__(self, pre_train_dir: str | Path | None = None,
                  pkl: str | Path | None = None,
-                 cache_dir: str | Path | None = None):
+                 cache_dir: str | Path | None = None,
+                 idle_unload_s: float | None = None,
+                 keep_loaded: bool | None = None):
         self.pre_train = Path(pre_train_dir) if pre_train_dir else find_pre_train_dir()
         if self.pre_train is not None and not (self.pre_train / "src" / "network.py").exists():
             self.pre_train = None                      # 没有 src/network.py 就不是 Pre-train
@@ -70,7 +88,14 @@ class GraphProvider:
         )
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._net = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        # 用完即卸：图读进内存要几百 MB，算完航路就还回去；磁盘 pkl 保留，下次再加载。
+        # AOC_GRAPH_KEEP=1 常驻（旧行为）；AOC_GRAPH_IDLE_UNLOAD_S=N 延迟 N 秒卸载。
+        self.keep_loaded = (_env_flag("AOC_GRAPH_KEEP") if keep_loaded is None else bool(keep_loaded))
+        self.idle_unload_s = (_env_float("AOC_GRAPH_IDLE_UNLOAD_S", 0.0)
+                              if idle_unload_s is None else float(idle_unload_s))
+        self._active = 0                               # 正在用图的调用数（并发保护）
+        self._timer: threading.Timer | None = None
         self.error = ""
         self.load_ms: float | None = None
         self.built_dir: Path | None = None
@@ -92,6 +117,11 @@ class GraphProvider:
     @property
     def available(self) -> bool:
         return self.pkl.exists()
+
+    @property
+    def loaded(self) -> bool:
+        """图是否已经反序列化进内存（懒加载下启动后通常还是 False）。"""
+        return self._net is not None
 
     def _network_class(self):
         """优先外部 Pre-train（显式配置时），否则用内置的运行时副本。"""
@@ -119,6 +149,80 @@ class GraphProvider:
             return None
         self.load_ms = round((time.perf_counter() - t0) * 1000, 1)
         return self._net
+
+    # -- 借用 / 卸载 -------------------------------------------------------
+    @contextmanager
+    def use(self):
+        """借用图：进入时按需反序列化，退出后按策略卸载（默认用完即卸）。
+
+        图读进内存约 400MB，算航路才是唯一需要它的场景。卸载后磁盘 pkl 还在，
+        下次用到再加载（现状约 1~1.5 s），所以内存占用是"峰值"而不是"常驻"。
+        """
+        with self._lock:
+            self._active += 1
+            net = self.load()
+        try:
+            yield net
+        finally:
+            with self._lock:
+                self._active = max(0, self._active - 1)
+                idle = self._active == 0 and net is not None
+            if idle:
+                self._schedule_release()
+
+    def _schedule_release(self) -> None:
+        if self.keep_loaded:
+            return
+        if self.idle_unload_s <= 0:
+            self.release()
+            return
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = threading.Timer(self.idle_unload_s, self.release)
+            timer.daemon = True
+            self._timer = timer
+        timer.start()
+
+    def release(self) -> bool:
+        """卸载内存里的图（磁盘 pkl 不动，下次用到再加载），返回是否真的卸了。"""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if self._net is None:
+                return False
+            self._net = None
+        gc.collect()
+        return True
+
+    def target(self, navdata_path: str | Path | None, airac: str | None = None) -> Path | None:
+        """当前 navdata 对应的缓存文件路径（不判断存在、不加载）。"""
+        if not navdata_path or self.cache_dir is None:
+            return None
+        return self.cache_dir / f"network-{cache_tag(navdata_path, airac)}.pkl"
+
+    def locate(self, navdata_path: str | Path | None, airac: str | None = None) -> bool:
+        """懒加载入口：只把 ``pkl`` 指到当前 navdata 的缓存文件，**不反序列化**。
+
+        返回缓存是否存在。第一次 ``plan()``（或显式 ``load()``）才会把图读进内存，
+        所以"启动后没做航路"的场景不用付那几百 MB。缓存不存在时把旧图摘掉，
+        避免拿上一份 navdata 建的图去求解。
+        """
+        target = self.target(navdata_path, airac)
+        if target is None:
+            return False
+        with self._lock:
+            if target.exists():
+                if self.pkl != target:
+                    self.pkl = target
+                    self._net = None
+                self.error = ""
+                return True
+            if self.cache_dir is not None and self.pkl.parent == Path(self.cache_dir):
+                self.pkl = DEFAULT_PKL if DEFAULT_PKL.exists() else self._external_pkl()
+                self._net = None
+            return False
 
     # -- 本地建图 ---------------------------------------------------------
     def ensure(self, navdata_path: str | Path | None, airac: str | None = None,
@@ -173,47 +277,48 @@ class GraphProvider:
         * `tokens` 是**折叠写法**（同一条航路上只写离开点），`tokens_full` 是逐点写法；
         * 候选按里程升序，调用方取第一条通过校验的即可。
         """
-        net = self.load()
-        if net is None:
-            return []
-        want = max(3, int(n_variants or 1))
-        try:
-            plans = net.plan(dep.upper(), arr.upper(), n_variants=want, cruise_fl=cruise_fl)
-        except TypeError:
-            # 旧版 Network.plan 没有 cruise_fl 参数
-            plans = net.plan(dep.upper(), arr.upper(), n_variants=want)
-        out = []
-        for p in plans:
-            full = list(p["tokens"])
-            info, reason = net.resolve(full)
-            folded = net.fold_tokens(full) if info is not None else None
-            tokens = folded or full
-            segments = []
-            if info is not None:
-                # info["path"] 是**矩阵下标**（0/1 被虚拟源汇点占用），转 ident 要减偏移
-                from .net.network import NODE_OFFSET
+        out: list[dict] = []
+        with self.use() as net:
+            if net is None:
+                return []
+            want = max(3, int(n_variants or 1))
+            try:
+                plans = net.plan(dep.upper(), arr.upper(), n_variants=want, cruise_fl=cruise_fl)
+            except TypeError:
+                # 旧版 Network.plan 没有 cruise_fl 参数
+                plans = net.plan(dep.upper(), arr.upper(), n_variants=want)
+            for p in plans:
+                full = list(p["tokens"])
+                info, reason = net.resolve(full)
+                folded = net.fold_tokens(full) if info is not None else None
+                tokens = folded or full
+                segments = []
+                if info is not None:
+                    # info["path"] 是**矩阵下标**（0/1 被虚拟源汇点占用），转 ident 要减偏移
+                    from .net.network import NODE_OFFSET
 
-                path = info["path"]
-                for i in range(len(path) - 1):
-                    aw = net.edge_airway(path[i], path[i + 1])
-                    if aw and aw != "DCT":
-                        segments.append((
-                            aw,
-                            net.node_ident[path[i] - NODE_OFFSET],
-                            net.node_ident[path[i + 1] - NODE_OFFSET],
-                        ))
-            out.append({
-                "tokens": tokens,
-                "tokens_full": full,
-                "route": " ".join(tokens),
-                "distance_nm": round(float(p["distance_nm"]), 1),
-                "gcd_nm": round(float(p["gcd_nm"]), 1),
-                "resolve_ok": info is not None,
-                "resolve_error": reason or "",
-                "airways": [a for a in (net.route_airways(full) or []) if a != "DCT"],
-                "segments": segments,
-                "sid": p.get("sid"),
-                "star": p.get("star"),
-            })
+                    path = info["path"]
+                    for i in range(len(path) - 1):
+                        aw = net.edge_airway(path[i], path[i + 1])
+                        if aw and aw != "DCT":
+                            segments.append((
+                                aw,
+                                net.node_ident[path[i] - NODE_OFFSET],
+                                net.node_ident[path[i + 1] - NODE_OFFSET],
+                            ))
+                out.append({
+                    "tokens": tokens,
+                    "tokens_full": full,
+                    "route": " ".join(tokens),
+                    "distance_nm": round(float(p["distance_nm"]), 1),
+                    "gcd_nm": round(float(p["gcd_nm"]), 1),
+                    "resolve_ok": info is not None,
+                    "resolve_error": reason or "",
+                    "airways": [a for a in (net.route_airways(full) or []) if a != "DCT"],
+                    "segments": segments,
+                    "sid": p.get("sid"),
+                    "star": p.get("star"),
+                })
+        # 图在 use() 退出时就卸掉了，这里只剩纯数据
         out.sort(key=lambda r: r["distance_nm"])
         return out

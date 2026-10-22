@@ -102,7 +102,21 @@ class RouteService:
         if nav is None:
             return False
         path = self._navdata_path or str(nav.path)
-        return self.graph.ensure(path, nav.airac)
+        ok = self.graph.ensure(path, nav.airac)
+        if ok and not self.graph.keep_loaded:
+            self.graph.release()         # 建/读一次就够，别把图常驻在内存里
+        return ok
+
+    def prime_graph(self) -> bool:
+        """懒加载：只把图缓存定位到当前 navdata（不反序列化），返回缓存是否就绪。
+
+        启动阶段不再无条件图加载；只有真的走到"图航路"这一步才付内存代价。
+        """
+        nav = self.nav
+        if nav is None:
+            return False
+        path = self._navdata_path or str(nav.path)
+        return self.graph.locate(path, nav.airac)
 
     def _cache_key(self, dep: str, arr: str, cruise_fl: int, aircraft: str | None) -> tuple:
         return (dep, arr, cruise_fl, aircraft, self.nav.airac if self.nav else None,
@@ -125,6 +139,8 @@ class RouteService:
         if not 0 < cruise_fl <= 450:
             raise ValueError("巡航高度必须在 FL010–FL450")
 
+        # 图懒加载：这里只定位缓存文件（一次 stat），AIP / 覆盖阶段不需要图。
+        self.prime_graph()
         key = self._cache_key(dep, arr, cruise_fl, aircraft)
         cached = self._cache.get(key)
         if cached is not None:

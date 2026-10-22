@@ -127,10 +127,15 @@ class NavData:
         except sqlite3.Error as exc:
             raise NavDataError(f"navdata 无法读取: {exc}") from exc
         self._lock = threading.RLock()
+        # 跑道按机场懒加载：全库 1.7 万座机场的跑道端一次性塞进 dict 要几十 MB，
+        # 而启动阶段真正用到的只有"最长跑道"（筛选/推荐）。这里先做单位校准 +
+        # 最长跑道回填，具体跑道端等查询时再按机场取（见 runways()）。
         self._runways: dict[str, list[dict]] = {}
         self._runway_cache: dict[str, int] = {}
-        self._load_runways()
-        self._resolve_runway_units()
+        self._runway_sql: str | None = None
+        self._runway_sql_checked = False
+        self._runway_count_cache: int | None = None
+        self._prime_runway_units()
         self.airac, self.navdata_version = self._load_meta()
         self._coverage: CoverageIndex | None = None
         self._limits: dict[str, tuple[float, float] | None] = {}
@@ -173,50 +178,74 @@ class NavData:
                 "lon": row["lonx"],
                 "elev_ft": row.get("altitude"),
                 "transition_alt_ft": row.get("transition_altitude"),
-                # 原始值单位随数据源变化，载入跑道表后由 _resolve_runway_units 统一成米/英尺
+                # 原始值单位随数据源变化，由 _prime_runway_units 统一成米/英尺
                 "longest_runway_raw": row.get("longest_runway_length"),
                 "longest_runway_m": None,
                 "longest_runway_ft": None,
                 "has_procedures": bool(row.get("has_procedures")) if "has_procedures" in row else None,
             }
 
-    def _load_runways(self) -> None:
+    def _runway_query(self) -> str | None:
+        """按机场取跑道端的 SQL（列名随数据源变化，只探测一次）。"""
+        if self._runway_sql_checked:
+            return self._runway_sql
+        self._runway_sql_checked = True
         rcols = self._columns("runway")
         ecols = self._columns("runway_end")
         if not {"airport_id", "primary_end_id", "secondary_end_id"} <= rcols or not {"runway_end_id"} <= ecols:
-            return
+            return None
         length_expr = "r.length" if "length" in rcols else "null"
         ils_expr = "r.has_ils" if "has_ils" in rcols else ("r.ils" if "ils" in rcols else "null")
         # 内移入口（displaced threshold）：Little Navmap 的 runway_end.offset_threshold（英尺）
         offset_expr = "re.offset_threshold" if "offset_threshold" in ecols else "null"
-        sql = (
+        self._runway_sql = (
             "select a.ident as airport, re.name as name, re.heading as heading, re.laty as lat, "
             f"re.lonx as lon, re.altitude as elev, {length_expr} as length, {ils_expr} as ils, "
             f"{offset_expr} as offset_threshold "
             "from runway r join runway_end re "
             "on re.runway_end_id in (r.primary_end_id, r.secondary_end_id) "
-            "join airport a on a.airport_id = r.airport_id where a.ident is not null"
+            "join airport a on a.airport_id = r.airport_id where a.ident = ?"
         )
-        try:
-            rows = self._con.execute(sql).fetchall()
-        except sqlite3.Error:
-            return
-        for row in rows:
-            self._runways.setdefault((row["airport"] or "").upper(), []).append({
-                "name": (row["name"] or "").upper(),
-                "hdg": row["heading"],
-                "lat": row["lat"],
-                "lon": row["lon"],
-                "elev_ft": row["elev"],
-                "length_raw": row["length"],
-                "offset_threshold_raw": row["offset_threshold"],
-                "ils": bool(row["ils"]) if row["ils"] is not None else None,
-            })
-        # 跑道长度：优先 runway.length，否则由反向跑道端反推；内移入口按同一单位口径换算
-        for ends in self._runways.values():
-            for end in ends:
-                end["length_m"] = self._runway_length_m(end, ends)
-                end["displaced_threshold_m"] = self._displaced_threshold_m(end, ends)
+        return self._runway_sql
+
+    def _load_runways_for(self, ident: str) -> list[dict]:
+        """单机场跑道端（懒加载 + 缓存），顺带把该机场最长跑道精确化。"""
+        key = (ident or "").strip().upper()
+        if not key:
+            return []
+        with self._lock:
+            cached = self._runways.get(key)
+            if cached is not None:
+                return cached
+            ends: list[dict] = []
+            sql = self._runway_query()
+            if sql:
+                try:
+                    rows = self._con.execute(sql, (key,)).fetchall()
+                except sqlite3.Error:
+                    rows = []
+                for row in rows:
+                    ends.append({
+                        "name": (row["name"] or "").upper(),
+                        "hdg": row["heading"],
+                        "lat": row["lat"],
+                        "lon": row["lon"],
+                        "elev_ft": row["elev"],
+                        "length_raw": row["length"],
+                        "offset_threshold_raw": row["offset_threshold"],
+                        "ils": bool(row["ils"]) if row["ils"] is not None else None,
+                    })
+                # 跑道长度：优先 runway.length，否则由反向跑道端反推；内移入口按同一单位口径换算
+                for end in ends:
+                    end["length_m"] = self._runway_length_m(end, ends)
+                    end["displaced_threshold_m"] = self._displaced_threshold_m(end, ends)
+            self._runways[key] = ends
+            derived = max((e["length_m"] for e in ends if e.get("length_m")), default=None)
+            info = self.airports.get(key)
+            if info is not None and derived:
+                info["longest_runway_m"] = round(derived, 1)
+                info["longest_runway_ft"] = round(derived * FT_PER_M, 1)
+            return ends
 
     def _raw_length_is_feet(self, end: dict, ends: list[dict]) -> bool | None:
         """用两端坐标反推的几何长度判断该库的长度类字段是英尺还是米。"""
@@ -273,37 +302,54 @@ class NavData:
             return None
         return haversine_nm(end["lat"], end["lon"], other["lat"], other["lon"]) * 1852
 
-    def _resolve_runway_units(self) -> None:
-        """统一每座机场的"最长跑道"长度口径（米）。
+    def _sample_length_scale(self, sample: int = 200) -> float | None:
+        """抽样估算 ``longest_runway_length`` 与几何长度的比例（≈3.28=英尺，≈1=米）。
+
+        只读 ``sample`` 座机场的跑道端，代替原来"全库跑道表一次读完再算"的做法。
+        """
+        idents = [i for i, a in self.airports.items() if a.get("longest_runway_raw")]
+        if not idents:
+            return None
+        step = max(1, len(idents) // max(1, sample))
+        ratios: list[float] = []
+        for ident in idents[::step][:sample]:
+            ends = self._load_runways_for(ident)
+            lengths = [e["length_m"] for e in ends if e.get("length_m")]
+            if not lengths:
+                continue
+            try:
+                raw = float((self.airports.get(ident) or {}).get("longest_runway_raw") or 0)
+            except (TypeError, ValueError):
+                continue
+            meters = max(lengths)
+            if raw > 0 and meters > 300:
+                ratios.append(raw / meters)
+        return statistics.median(ratios) if ratios else None
+
+    def _prime_runway_units(self) -> None:
+        """校准长度单位并回填每座机场的最长跑道（米/英尺）。
 
         ``airport.longest_runway_length`` 的单位随数据源变化（Little Navmap / Navigraph
-        用英尺，自建库可能用米）。这里用 runway 表反推出的米制长度做全库比例校准，
-        再把 ``longest_runway_m`` / ``longest_runway_ft`` 回填到机场字典。
+        用英尺，自建库可能用米）。用抽样机场的比例判断单位；具体机场被查询时，
+        ``_load_runways_for()`` 会用真实跑道端把最长跑道改精确。
         """
-        derived: dict[str, float] = {}
-        for ident, ends in self._runways.items():
-            lengths = [e["length_m"] for e in ends if e.get("length_m")]
-            if lengths:
-                derived[ident] = max(lengths)
-        ratios = []
-        for ident, meters in derived.items():
-            raw = (self.airports.get(ident) or {}).get("longest_runway_raw")
-            if raw and float(raw) > 0 and meters > 300:
-                ratios.append(float(raw) / meters)
-        scale = statistics.median(ratios) if ratios else None
-        # 比例 ≈3.28 说明库里存的是英尺，≈1 说明就是米；都不像则退回按数值量级判断
+        scale = self._sample_length_scale()
         use_feet: bool | None = None
         if scale is not None:
             if 2.5 <= scale <= 4.5:
                 use_feet = True
             elif 0.8 <= scale <= 1.25:
                 use_feet = False
-        for ident, a in self.airports.items():
-            meters = derived.get(ident)
+        for a in self.airports.values():
             raw = a.get("longest_runway_raw")
-            if meters is None and raw and float(raw) > 0:
-                feet = use_feet if use_feet is not None else float(raw) > 5000
-                meters = float(raw) / FT_PER_M if feet else float(raw)
+            meters = None
+            try:
+                value = float(raw or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                feet = use_feet if use_feet is not None else value > 5000
+                meters = value / FT_PER_M if feet else value
             a["longest_runway_m"] = round(meters, 1) if meters else None
             a["longest_runway_ft"] = round(meters * FT_PER_M, 1) if meters else None
 
@@ -341,7 +387,7 @@ class NavData:
         return self.airports.get((ident or "").upper())
 
     def runways(self, ident: str | None) -> list[dict]:
-        return self._runways.get((ident or "").upper(), [])
+        return self._load_runways_for((ident or "").upper())
 
     def search_airports(self, query: str, limit: int = 20) -> list[dict]:
         q = (query or "").strip().upper()
@@ -400,7 +446,7 @@ class NavData:
         """找附近且航向对齐的跑道，返回投影结果（含距入口/中线偏差）。"""
         best = None
         for a, _ in self.near_airports(lat, lon, max_nm):
-            for rwy in self._runways.get(a["ident"], []):
+            for rwy in self.runways(a["ident"]):
                 if rwy["lat"] is None or rwy["lon"] is None or rwy["hdg"] is None:
                     continue
                 dist = haversine_nm(lat, lon, rwy["lat"], rwy["lon"])
@@ -560,9 +606,27 @@ class NavData:
                 return 0
         return {
             "airports": len(self.airports),
-            "runways": sum(len(v) for v in self._runways.values()),
+            "runways": self._runway_count(),
             "airways": one("select count(*) from airway"),
         }
+
+    def _runway_count(self) -> int:
+        """跑道端总数（懒加载后不能再数内存里的 dict，用 SQL 数一次并缓存）。"""
+        if self._runway_count_cache is not None:
+            return self._runway_count_cache
+        sql = self._runway_query()
+        count = 0
+        if sql:
+            try:
+                count = int(self._con.execute(
+                    "select count(*) from runway r join runway_end re "
+                    "on re.runway_end_id in (r.primary_end_id, r.secondary_end_id) "
+                    "join airport a on a.airport_id = r.airport_id where a.ident is not null"
+                ).fetchone()[0] or 0)
+            except sqlite3.Error:
+                count = 0
+        self._runway_count_cache = count
+        return count
 
 
 def reciprocal_name(name: str) -> str | None:
