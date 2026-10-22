@@ -33,6 +33,16 @@ public sealed class Engine : IDisposable
     private double _hz = 1.0;
     private double _lastErrorT = -100;
 
+    // 计时（P-04）：模拟时间累计，按 sim_rate 折算；暂停不计
+    private double _simClock;
+    private double _takeoffSim;
+    private double? _landingSim;
+    private bool _landed;
+    private double _engineSeconds;
+    private bool _engineRunning;
+    private double? _engineOffSince;
+    private bool _engineEstimated;
+
     public bool AutoStart { get; set; } = true;
     public double AutoStopHoldS { get; set; } = 30.0;
     public string? LastFinishedId { get; private set; }
@@ -60,6 +70,9 @@ public sealed class Engine : IDisposable
                 Samples = _samples.Count,
                 Events = _events.Count,
                 Phase = _phase,
+                EngineSeconds = (int)Math.Round(Math.Max(0, _engineSeconds)),
+                FlightSeconds = (int)Math.Round(FlightSecondsNow()),
+                EngineEstimated = _recording && _engineEstimated,
                 SimConnected = _source.Connected,
                 AircraftTitle = _source.AircraftTitle,
                 SimVersion = _source.SimVersion,
@@ -67,6 +80,20 @@ public sealed class Engine : IDisposable
                 AutoStart = AutoStart,
             };
         }
+    }
+
+    /// <summary>最新一帧（未开始记录时也能取到），供实时状态与推出前 ZFW 校验。</summary>
+    public Sample? LatestSample()
+    {
+        lock (_lock) return _prevFrame;
+    }
+
+    /// <summary>已飞行时间（秒）：takeoff 起算，landing 冻结；未起飞为 0。</summary>
+    private double FlightSecondsNow()
+    {
+        if (!_recording || !_hasTakeoff) return 0;
+        var end = _landed ? (_landingSim ?? _simClock) : _simClock;
+        return Math.Max(0, end - _takeoffSim);
     }
 
     public (List<Sample> samples, long lastSeq) Samples(long since, int limit)
@@ -103,6 +130,18 @@ public sealed class Engine : IDisposable
             _recStartT = _prevFrame?.T ?? 0;
             _nextSampleT = 0;
             _recording = true;
+            // 计时归零：记录开始时发动机已在转 → 从此刻起算并标 estimated=true
+            _engineSeconds = 0;
+            _engineOffSince = null;
+            _engineEstimated = _engineRunning;
+            if (_landed)
+            {
+                // 上一次飞行已落地：不要把旧航班的起飞时刻算进新的记录
+                _landed = false;
+                _hasTakeoff = false;
+                _takeoffSim = 0;
+                _landingSim = null;
+            }
             // 自动开始时把起飞前 20s 的预录帧补进来，保留起飞机场与起飞时刻；
             // 同时避免把 _hasTakeoff 重置成 false（否则落地后不会自动收尾）。
             var pre = new List<Sample>();
@@ -173,6 +212,15 @@ public sealed class Engine : IDisposable
             {
                 _preRoll.Enqueue(s);
                 while (_preRoll.Count > 0 && s.T - _preRoll.Peek().T > 20) _preRoll.Dequeue();
+                var dt = _prevFrame == null ? 0 : s.T - _prevFrame.T;
+                var simDt = dt > 0 && dt <= 3.0
+                    ? dt * (_source.ClockIsSimTime ? 1.0 : (s.SimRate <= 0 ? 1.0 : s.SimRate))
+                    : 0;
+                if (!s.Paused)
+                {
+                    _simClock += simDt;
+                    UpdateEngine(s, simDt);
+                }
                 UpdateStateMachine(s);
                 if (!_recording && AutoStart && _airborneSince != null && s.T - _airborneSince >= 5.0)
                     StartRecording(manual: false);
@@ -200,6 +248,7 @@ public sealed class Engine : IDisposable
             if (fresh && _prevFrame!.OnGround)
             {
                 _hasTakeoff = true;
+                _takeoffSim = _simClock;   // 已飞行时间从此刻起算
                 if (_recording) AddEvent(s.T - _recStartT, "takeoff", new());
                 _phase = "TAKEOFF";
             }
@@ -217,6 +266,8 @@ public sealed class Engine : IDisposable
             _groundSince ??= s.T;
             if (fresh && !_prevFrame!.OnGround)
             {
+                _landed = true;
+                _landingSim = _simClock;   // 已飞行时间冻结
                 if (_recording) AddEvent(s.T - _recStartT, "landing", new()
                 {
                     ["vs_fpm"] = s.VsFpm, ["g"] = s.G, ["lat"] = s.Lat, ["lon"] = s.Lon,
@@ -227,6 +278,47 @@ public sealed class Engine : IDisposable
             if (_recording && _hasTakeoff && s.GsKt < 5 && s.T - _groundSince >= AutoStopHoldS)
                 StopLocked();
         }
+    }
+
+    /// <summary>
+    /// 发动机运转判定（P-04）：任一 RPM &gt; 200 视为已启动并开始累计；
+    /// 四台全部 &lt; 200 持续 5s 视为全部关车、停止累计，再启动继续累加（不清零）。
+    /// 部分涡扇 RPM 恒为 0：退回 N1 &gt; 20% 或 ENG COMBUSTION 判定并标 estimated。
+    /// </summary>
+    private void UpdateEngine(Sample s, double simDt)
+    {
+        var rpmRunning = AnyAbove(s.EngRpm, 200);
+        var fallbackRunning = AnyAbove(s.EngN1, 20) || AnyAbove(s.EngCombustion, 0.5);
+        var running = rpmRunning || fallbackRunning;
+        if (fallbackRunning && !rpmRunning) _engineEstimated = true;
+
+        if (running)
+        {
+            if (!_engineRunning)
+            {
+                _engineRunning = true;
+                if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_start", new());
+            }
+            _engineOffSince = null;
+            if (_recording) _engineSeconds += simDt;
+            return;
+        }
+        if (!_engineRunning) return;
+        _engineOffSince ??= s.T;
+        if (s.T - _engineOffSince < 5.0) return;
+        _engineRunning = false;
+        _engineOffSince = null;
+        if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_stop", new());
+    }
+
+    private static bool AnyAbove(double[]? values, double threshold)
+    {
+        if (values == null) return false;
+        foreach (var value in values)
+        {
+            if (value > threshold) return true;
+        }
+        return false;
     }
 
     private void SaveSample(Sample s)
@@ -240,6 +332,8 @@ public sealed class Engine : IDisposable
             Seq = _seq++, T = t, Lat = s.Lat, Lon = s.Lon, AltFt = s.AltFt, AglFt = s.AglFt,
             GsKt = s.GsKt, IasKt = s.IasKt, VsFpm = s.VsFpm, HdgTrue = s.HdgTrue,
             PitchDeg = s.PitchDeg, BankDeg = s.BankDeg, OnGround = s.OnGround, FuelKg = s.FuelKg,
+            TotalWeightKg = s.TotalWeightKg, FuelWeightKg = s.FuelWeightKg,
+            EngRpm = s.EngRpm, EngN1 = s.EngN1, EngCombustion = s.EngCombustion,
             G = s.G, Gear = s.Gear, Flaps = s.Flaps, Paused = s.Paused, SimRate = s.SimRate,
         };
         _sampler.Update(saved);

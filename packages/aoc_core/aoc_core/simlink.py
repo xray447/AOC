@@ -32,6 +32,24 @@ class SimLinkClient:
             r.raise_for_status()
             return r.json()
 
+    async def latest_sample(self) -> dict[str, Any] | None:
+        """最新一帧采样：优先 `/latest`（未开始记录时也能拿到实时值），退化到 `/samples` 末尾。"""
+        async with self._client() as c:
+            try:
+                r = await c.get("/latest")
+                if r.status_code == 200:
+                    data = r.json()
+                    sample = data.get("sample") if isinstance(data, dict) else None
+                    if sample:
+                        return sample
+            except Exception:  # noqa: BLE001 - 老版本 SimLink 没有 /latest
+                pass
+            r = await c.get("/samples", params={"since": -1, "limit": 3000})
+            r.raise_for_status()
+            data = r.json()
+            samples = data.get("samples", data) if isinstance(data, dict) else data
+            return samples[-1] if samples else None
+
     async def samples(self, since: int = -1, limit: int = 3000) -> list[dict[str, Any]]:
         async with self._client() as c:
             r = await c.get("/samples", params={"since": since, "limit": limit})

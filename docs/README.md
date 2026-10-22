@@ -63,6 +63,9 @@ AOC 是面向模拟飞行玩家的桌面软件，提供以下运行形态：
 | D-25 | 客户端采用 Tauri + React；Python `aoc-core` 以本地 HTTP sidecar 提供领域/航路能力；C# SimLink 独占 SimConnect | 已定 |
 | D-26 | 新增 **CPDLC 上行报文**：DISPATCHER / ADMIN 可在网页管理端向**在飞机组**发送文本报文（如高度/航路/油量/延误/返航指令），机组在客户端收到并可回执（ACK / 拒绝 / 自由回复）；报文与回执落库并进飞行事件流，用于审计与后续争议判定。投递通道见 D-27 | 建议 |
 | D-27 | CPDLC 报文**通道自动降级**：机组填写并在线的 Hoppie（Hoppie ACARS）→ 走 Hoppie 报文，与模拟器内 CDU/ACARS 界面一致；机组未登录 Hoppie → 直接推送到 AOC 客户端通知（应用内消息中心 + 系统通知），点击可回执。同一报文只走一条通道，不双发（Hoppie 投递超时/失败则降级到客户端通知并标注原因）；通道选择与投递结果（已投递/已读/超时）记录在报文上 | 已定 |
+| D-28 | SimBrief 只用公开预填 URL（`dispatch.simbrief.com/options/custom`）：呼号拆成 `airline` + `fltnum`（如 `AOC101` → `airline=AOC`、`fltnum=101`；**不接受 `callsign`**），配载用 `manualzfw`（千磅、保留 3 位，由 ZFW kg 换算）；**不使用不存在的 `payload` 参数**，也不传 `pax`/`cargo`；不预填高度 `fl` | 已定 |
+| D-29 | 启动形态：**不弹控制台窗口**；sidecar 以 `pythonw`/`CREATE_NO_WINDOW`/WinExe 隐藏启动并写日志文件；常驻系统托盘图标（打开/日志/退出）。完整安装双击直接打开 Tauri 客户端；便携版双击启动器用默认浏览器打开 | 已定 |
+| D-30 | 交付**自包含**：`aoc-core` 用 PyInstaller 打成 `aoc-core.exe`（含 fastapi/uvicorn/pydantic/numpy/scipy/tzdata 等依赖），`aoc-simlink.exe` 以 `--self-contained true` 发布；用户机器**不需要安装 Python 或 .NET**。仅安装版需要 WebView2（通常自带，包内 bootstrapper 兜底）；开发/打包机仍用系统 Python | 已定 |
 
 ## 4. 术语
 

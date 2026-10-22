@@ -100,7 +100,8 @@ def main() -> int:
         while time.time() < deadline:
             rec = get(f"{base}/local/recording/status", token)
             if rec.get("active"):
-                print(f"recording: phase={rec['phase']} samples={rec['samples']}")
+                print(f"recording: phase={rec['phase']} engine_s={rec.get('engine_seconds')} "
+                      f"flight_s={rec.get('flight_seconds')}")
             flights = get(f"{base}/local/flights?limit=5", token)
             completed = [f for f in flights["items"] if f["status"] != "RECORDING"]
             if completed:

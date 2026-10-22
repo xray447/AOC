@@ -15,7 +15,7 @@ import { MetricCard } from "../components/MetricCard";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
 import type { FlightList, FlightRecord, Stats } from "../types";
-import { flightTitle, fmtDate, fmtDistance, fmtMinutes, ratingLabels, statusLabels } from "../utils";
+import { flightTitle, fmtDate, fmtDistance, fmtHms, fmtMinutes, ratingLabels, statusLabels } from "../utils";
 
 const { Text } = Typography;
 
@@ -139,7 +139,9 @@ export function Dashboard() {
               <div className="hero-title mono">{clock(elapsed)}</div>
               <div className="hero-sub">
                 {tr("阶段", "Phase")} <Tag color="processing">{recording.phase}</Tag>
-                {recording.samples.toLocaleString()} {tr("采样点", "samples")} · {recording.aircraft_title || settings.aircraft_type}
+                {tr("发动机", "Engine")} {fmtHms(recording.engine_seconds)} · {tr("已飞", "Airborne")} {fmtHms(recording.flight_seconds)}
+                {recording.engine_estimated ? ` (${tr("估算", "estimated")})` : ""}
+                {" · "}{recording.aircraft_title || settings.aircraft_type}
               </div>
               <Space>
                 <Button danger type="primary" icon={<PoweroffOutlined />} loading={busy} onClick={() => void stop()}>

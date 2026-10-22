@@ -47,6 +47,7 @@ import { Stats } from "./pages/Stats";
 import { SettingsPage } from "./pages/Settings";
 import { opsStateMeta } from "./ops";
 import type { Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings } from "./types";
+import { fmtHms } from "./utils";
 
 const { Header, Sider, Content } = Layout;
 
@@ -172,7 +173,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
             </Tooltip>
             {recording.active ? (
               <Link to="/">
-                <Badge status="processing" text={`${tr("记录中", "Recording")} · ${recording.samples} pts · ${recording.phase}`} />
+                <Badge status="processing" text={`${tr("记录中", "Recording")} · ${tr("发动机", "Engine")} ${fmtHms(recording.engine_seconds)} · ${tr("已飞", "Airborne")} ${fmtHms(recording.flight_seconds)} · ${recording.phase}`} />
               </Link>
             ) : null}
             <Button icon={<ReloadOutlined />} size="small" onClick={() => void refresh()}>

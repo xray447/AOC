@@ -2,7 +2,7 @@ import {
   PlayCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined,
 } from "@ant-design/icons";
 import {
-  Alert, Button, Card, Col, Descriptions, Empty, Popconfirm, Row, Space, Statistic, Table, Tag, Typography, message,
+  Alert, Button, Card, Col, Descriptions, Empty, Modal, Popconfirm, Row, Space, Statistic, Table, Tag, Typography, message,
 } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -11,7 +11,17 @@ import { SimBriefButton } from "../../components/SimBriefButton";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { fmtBlock, fmtUtc, money, policyAction, settlementStatus } from "../../ops";
-import type { OpsFreeFlight, OpsLoadSheet, OpsRoster, OpsSettlement, OpsTask } from "../../types";
+import type {
+  FlightStatus, OpsFreeFlight, OpsLoadSheet, OpsRoster, OpsSettlement, OpsTask,
+} from "../../types";
+import { fmtHms } from "../../utils";
+
+const LIVE_POLL_MS = 2000;
+
+function num(value: number | null | undefined, digits = 0): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  return value.toLocaleString(undefined, { maximumFractionDigits: digits });
+}
 
 const { Text } = Typography;
 
@@ -28,6 +38,7 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
   const [active, setActive] = useState<ActiveResponse | null>(null);
   const [load, setLoad] = useState<OpsLoadSheet | null>(null);
   const [settlement, setSettlement] = useState<OpsSettlement | null>(null);
+  const [flightStatus, setFlightStatus] = useState<FlightStatus | null>(null);
   const [busy, setBusy] = useState(false);
 
   const loadAll = useCallback(async () => {
@@ -55,10 +66,14 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     if (recording.active) void loadAll();
   }, [recording.active, loadAll]);
 
-  const startRecording = async () => {
+  const startRecording = async (actualZfw?: number | null) => {
     setBusy(true);
     try {
-      await api("/local/recording/start", { method: "POST" });
+      const res = await api<{ warnings?: string[] }>("/local/recording/start", {
+        method: "POST",
+        body: JSON.stringify({ actual_zfw_kg: actualZfw ?? null }),
+      });
+      (res.warnings || []).forEach((w) => message.warning(w));
       await refresh();
       await loadAll();
       message.success(tr("已开始记录，落地后自动结算", "Recording started; settlement runs after landing"));
@@ -67,6 +82,40 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  /** 推出前 ZFW 校验：实际 ZFW 低于配载单时提示「可能漏装旅客/货物」，确认后继续。 */
+  const startWithZfwCheck = async () => {
+    let actual = flightStatus?.actual_zfw_kg ?? null;
+    if (actual === null) {
+      try {
+        const latest = await api<FlightStatus>("/local/ops/flight-status");
+        setFlightStatus(latest);
+        actual = latest.actual_zfw_kg ?? null;
+      } catch {
+        actual = null;
+      }
+    }
+    const planned = load?.zfw_kg ?? null;
+    if (actual !== null && planned !== null && actual < planned) {
+      const shortage = Math.round(planned - actual);
+      const ok = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: tr("实际 ZFW 低于配载单", "Actual ZFW is below the load sheet"),
+          content: tr(
+            `实际 ${Math.round(actual as number)} kg，配载单 ${Math.round(planned)} kg，少 ${shortage} kg；可能漏装旅客/货物。仍要开始记录吗？`,
+            `Actual ${Math.round(actual as number)} kg vs load sheet ${Math.round(planned)} kg (${shortage} kg short). Passengers or cargo may be missing. Start anyway?`,
+          ),
+          okText: tr("仍要开始", "Start anyway"),
+          okButtonProps: { danger: true },
+          cancelText: tr("返回检查", "Back"),
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!ok) return;
+    }
+    await startRecording(actual);
   };
 
   const stopRecording = async (abort: boolean) => {
@@ -117,6 +166,27 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
 
   const task = active?.task || null;
   const rosterLeg = active?.roster?.legs.find((l) => l.id === task?.roster_leg_id);
+  const flightId = task?.flight_record_id;
+
+  // 实时状态：飞行中每 2s 取 SimLink 最新采样（速度/高度/位置/ETE/ETA）
+  useEffect(() => {
+    if (!flightId) {
+      setFlightStatus(null);
+      return undefined;
+    }
+    let alive = true;
+    const tick = async () => {
+      try {
+        const status = await api<FlightStatus>("/local/ops/flight-status");
+        if (alive) setFlightStatus(status);
+      } catch {
+        if (alive) setFlightStatus(null);
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), LIVE_POLL_MS);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [flightId]);
 
   return (
     <div className={embedded ? "ops-embedded" : "page"}>
@@ -181,7 +251,10 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
             <Space wrap style={{ marginTop: 8 }}>
               {recording.active && recording.flight_id === task.flight_record_id ? (
                 <>
-                  <Tag color="processing">{tr("记录中", "Recording")} · {recording.samples} pts · {recording.phase}</Tag>
+                  <Tag color="processing">
+                    {tr("记录中", "Recording")} · {tr("发动机", "Engine")} {fmtHms(recording.engine_seconds)}
+                    {" · "}{tr("已飞", "Airborne")} {fmtHms(recording.flight_seconds)} · {recording.phase}
+                  </Tag>
                   <Button danger type="primary" icon={<PoweroffOutlined />} loading={busy}
                     onClick={() => void stopRecording(false)}>
                     {tr("结束并结算", "Stop & settle")}
@@ -199,7 +272,7 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                     callsign={task.callsign}
                     opsLeg={{ flightRecordId: task.flight_record_id }}
                   />
-                  <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void startRecording()}>
+                  <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void startWithZfwCheck()}>
                     {tr("开始记录", "Start recording")}
                   </Button>
                   <Text type="secondary">
@@ -210,6 +283,43 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                 </>
               )}
             </Space>
+          </Card>
+
+          <Card
+            className="panel"
+            variant="borderless"
+            style={{ marginTop: 16 }}
+            title={tr("实时状态", "Live status")}
+            extra={flightStatus?.phase ? <Tag color="processing">{flightStatus.phase}</Tag> : null}
+          >
+            <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }}>
+              <Descriptions.Item label={tr("地速", "GS")}>{num(flightStatus?.gs_kt)} kt</Descriptions.Item>
+              <Descriptions.Item label={tr("表速", "IAS")}>{num(flightStatus?.ias_kt)} kt</Descriptions.Item>
+              <Descriptions.Item label={tr("高度", "ALT")}>{num(flightStatus?.alt_ft)} ft</Descriptions.Item>
+              <Descriptions.Item label="AGL">{num(flightStatus?.agl_ft)} ft</Descriptions.Item>
+              <Descriptions.Item label={tr("升降率", "V/S")}>{num(flightStatus?.vs_fpm)} fpm</Descriptions.Item>
+              <Descriptions.Item label={tr("位置", "Position")}>
+                {flightStatus?.lat != null && flightStatus?.lon != null
+                  ? `${flightStatus.lat.toFixed(4)}, ${flightStatus.lon.toFixed(4)}`
+                  : "—"}
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("剩余", "Remaining")}>{num(flightStatus?.remaining_nm)} NM</Descriptions.Item>
+              <Descriptions.Item label="ETE / ETA">
+                {flightStatus?.ete_min != null ? `${num(flightStatus.ete_min)} min` : "—"}
+                {" · "}
+                {flightStatus?.eta_utc ? fmtUtc(flightStatus.eta_utc) : "—"}
+              </Descriptions.Item>
+            </Descriptions>
+            {flightStatus && !flightStatus.available ? (
+              <Text type="secondary">{tr("没有 SimLink 采样（检查 SimLink 是否在线）",
+                "No SimLink samples — check that SimLink is running")}</Text>
+            ) : null}
+            {flightStatus?.actual_zfw_kg != null && load && load.zfw_kg != null ? (
+              <Text type={flightStatus.actual_zfw_kg < load.zfw_kg ? "danger" : "secondary"}>
+                {tr("实际 ZFW", "Actual ZFW")} {num(flightStatus.actual_zfw_kg)} kg
+                {" / "}{tr("配载单", "Load sheet")} {num(load.zfw_kg)} kg
+              </Text>
+            ) : null}
           </Card>
 
           {load ? (

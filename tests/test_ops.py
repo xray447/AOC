@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from aoc_core.lock import InstanceLocked, SingleInstance
 from aoc_core.paths import AppPaths
+from aoc_core.ops.economy import parse_utc
 from aoc_core.ops.service import OpsError
 from aoc_core.service import PersonalService
+from aoc_route.simbrief import split_callsign
 
 
 @pytest.fixture()
@@ -487,29 +489,30 @@ def test_ops_status_reports_idle_ground_and_flight(ops: PersonalService, monkeyp
 
 
 def test_simbrief_preview_carries_frozen_payload(ops: PersonalService):
-    """SimBrief 链接带上配载，且开始前预算 == 开始后固化。"""
+    """SimBrief 链接用 ZFW（manualzfw）+ airline/fltnum，且开始前预算 == 开始后固化。"""
     roster, _ = _confirm(ops)
     preview = ops.simbrief_for_leg(roster_id=roster["id"], sequence=1)
     payload = preview["payload"]
     assert payload["pax"] > 0
-    assert payload["payload_kg"] and payload["payload_kg"] > 0
+    assert payload["zfw_kg"] and payload["zfw_kg"] > 0
     assert payload["registration"]
+    airline, fltnum = split_callsign(payload["callsign"])
     url = preview["simbrief_url"]
-    # 只要一个 kg 的 payload，不预填高度
-    assert f"payload={int(round(payload['payload_kg']))}" in url
-    assert "reg=" in url and "callsign=" in url
+    # 配载用 manualzfw（千磅，3 位小数）；呼号拆成 airline + fltnum；不预填高度
+    assert f"manualzfw={payload['zfw_kg'] * 2.2046226 / 1000:.3f}" in url
+    assert "reg=" in url
+    assert f"airline={airline}" in url and fltnum and f"fltnum={fltnum}" in url
     assert "fl=" not in url
-    for legacy in ("pax=", "cargo=", "fuel="):
+    for legacy in ("payload=", "callsign=", "pax=", "cargo=", "fuel="):
         assert legacy not in url
 
     started = ops.ops.start_leg(roster["id"], 1)
     sheet = started["load_sheet"]
     assert payload["pax"] == sheet["pax_total"]
-    expected = float(sheet["zfw_kg"]) - float(sheet["oew_kg"])
-    assert payload["payload_kg"] == pytest.approx(expected, abs=0.1)
+    assert payload["zfw_kg"] == pytest.approx(float(sheet["zfw_kg"]), abs=0.1)
 
     frozen = ops.simbrief_for_leg(flight_record_id=started["task"]["flight_record_id"])
-    assert f"payload={int(round(expected))}" in frozen["simbrief_url"]
+    assert f"manualzfw={float(sheet['zfw_kg']) * 2.2046226 / 1000:.3f}" in frozen["simbrief_url"]
     assert frozen["payload"]["registration"] == payload["registration"]
     assert "fl=" not in frozen["simbrief_url"]
 
@@ -533,7 +536,12 @@ def test_abort_recording_clears_task(ops: PersonalService):
     roster, _ = _confirm(ops)
     ops.ops.start_leg(roster["id"], 1)
     ops.flights.start()
-    assert ops.recording_status()["active"] is True
+    status = ops.recording_status()
+    assert status["active"] is True
+    # 记录状态只展示计时：字段存在且非负（采样点数不进 UI）
+    assert status["engine_seconds"] >= 0
+    assert status["flight_seconds"] >= 0
+    assert status["engine_estimated"] in (True, False)
     ops.flights.stop(abort=True)
     assert ops.ops.active_task() is None
     assert ops.ops.get_aircraft(roster["aircraft_id"])["status"] == "ACTIVE"
@@ -559,3 +567,109 @@ def test_finance_summary_totals_and_periods(ops: PersonalService):
         assert summary["periods"][1]["flights"] == 1
         assert summary["monthly"][-1]["flights"] == 1
     assert "balance" not in summary
+
+
+# ------------------------------------------------------- 自由飞出发机场（C-06）
+def test_free_airports_only_lists_airports_with_available_aircraft(ops: PersonalService):
+    """出发机场下拉只列有可用飞机的机场，飞机被锁走后该机场消失。"""
+    items = ops.ops.free_airports()
+    assert items, "演示机队应至少有一个可用机场"
+    available = {(a.get("current_airport_icao") or "").upper() for a in ops.ops.free_aircraft()}
+    assert {a["icao"] for a in items} == {i for i in available if i}
+    assert all(a["aircraft"] >= 1 for a in items)
+
+    target = items[0]["icao"]
+    dest = "ZSSS" if target != "ZSSS" else "ZBAA"
+    for aircraft in ops.ops.free_aircraft(target):
+        ops.ops.create_free_flight(
+            {"aircraft_id": aircraft["id"], "dep_icao": target, "arr_icao": dest})
+    assert target not in {a["icao"] for a in ops.ops.free_airports()}
+
+
+def test_free_flight_dep_time_defaults_to_now_plus_50min(ops: PersonalService):
+    """缺省计划起飞时间 = 领取时刻 + 50min（不再是领取时刻）。"""
+    free = _free_flight(ops, "B-1672", "ZBAA", "ZSSS")
+    dep = parse_utc(free["dep_time_utc"])
+    minutes = (dep - datetime.now(timezone.utc)).total_seconds() / 60
+    assert 45 <= minutes <= 52
+
+
+# ------------------------------------------------- 推出前 ZFW 校验（C-08）
+def test_start_leg_warns_when_actual_zfw_below_load_sheet(ops: PersonalService):
+    """实际 ZFW 低于配载单时只提示、不阻断，并把差异写进任务。"""
+    roster, _ = _confirm(ops)
+    started = ops.ops.start_leg(roster["id"], 1, 1000)
+    sheet = started["load_sheet"]
+    assert started["warnings"], "低于配载单应给出 warnings"
+    assert started["task"]["actual_zfw_kg"] == pytest.approx(1000)
+    assert started["task"]["zfw_delta_kg"] == pytest.approx(1000 - float(sheet["zfw_kg"]))
+    assert ops.ops.get_aircraft(roster["aircraft_id"])["status"] == "IN_FLIGHT"
+
+
+def test_start_free_flight_records_actual_zfw(ops: PersonalService):
+    free = _free_flight(ops, "B-1672", "ZBAA", "ZSSS")
+    started = ops.ops.start_free_flight(free["id"], 1000)
+    assert started["warnings"]
+    assert started["task"]["actual_zfw_kg"] == pytest.approx(1000)
+
+
+def test_flight_status_computes_ete_from_latest_sample(ops: PersonalService, monkeypatch):
+    """执行页实时状态：ETE = 剩余大圆距离 ÷ 地速；未起飞/地速 < 50kt/无采样时为 null。"""
+    sample = {
+        "gs_kt": 450, "ias_kt": 260, "alt_ft": 35000, "agl_ft": 34000,
+        "lat": 36.0, "lon": 118.0, "vs_fpm": 0, "on_ground": False,
+        "total_weight_kg": 62000, "fuel_weight_kg": 7000,
+    }
+
+    async def _sample():
+        return sample
+
+    monkeypatch.setattr(ops, "latest_sample", _sample)
+    status = asyncio.run(ops.ops_flight_status())
+    assert status["available"] is True
+    assert status["actual_zfw_kg"] == pytest.approx(55000)
+    # 没有任务时不知道该飞到哪，不猜剩余距离
+    assert status["remaining_nm"] is None and status["ete_min"] is None
+
+    roster, _ = _confirm(ops)
+    ops.ops.start_leg(roster["id"], 1)
+    status = asyncio.run(ops.ops_flight_status())
+    assert status["remaining_nm"] > 0
+    assert status["ete_min"] == pytest.approx(status["remaining_nm"] / 450 * 60, rel=0.02)
+    assert status["eta_utc"]
+
+    # 地速 < 50kt（滑行/未起飞）：ETE/ETA 为 null，界面显示「—」；剩余距离照给
+    slow = {**sample, "gs_kt": 30, "on_ground": True}
+
+    async def _slow():
+        return slow
+
+    monkeypatch.setattr(ops, "latest_sample", _slow)
+    taxi = asyncio.run(ops.ops_flight_status())
+    assert taxi["remaining_nm"] > 0
+    assert taxi["ete_min"] is None and taxi["eta_utc"] is None
+
+    async def _none():
+        return None
+
+    monkeypatch.setattr(ops, "latest_sample", _none)
+    empty = asyncio.run(ops.ops_flight_status())
+    assert empty["available"] is False
+    assert empty["ete_min"] is None and empty["eta_utc"] is None
+
+
+def test_recording_start_persists_actual_zfw_and_timers(ops: PersonalService):
+    """记录开始时补录实际 ZFW，落进 flight_record；计时字段存在且非负。"""
+    roster, _ = _confirm(ops)
+    ops.ops.start_leg(roster["id"], 1)
+    warnings = ops.ops.set_actual_zfw(5000)
+    assert warnings
+    ops.flights.start()
+    status = ops.recording_status()
+    assert status["active"] is True
+    assert status["engine_seconds"] >= 0
+    assert status["flight_seconds"] >= 0
+    assert status["engine_estimated"] in (True, False)
+    flight = ops.db.get_flight(status["flight_id"])
+    assert flight["actual_zfw_kg"] == pytest.approx(5000)
+    assert flight["zfw_delta_kg"] is not None and flight["zfw_delta_kg"] < 0

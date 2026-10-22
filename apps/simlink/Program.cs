@@ -51,7 +51,8 @@ internal static class Program
         {
             var path = ctx.Request.Path.Value ?? "";
             bool protectedPath = path.StartsWith("/status") || path.StartsWith("/samples")
-                                 || path.StartsWith("/events") || path.StartsWith("/command");
+                                 || path.StartsWith("/events") || path.StartsWith("/command")
+                                 || path.StartsWith("/latest");
             if (protectedPath && ctx.Request.Headers["X-SimLink-Token"] != token)
             {
                 ctx.Response.StatusCode = 401;
@@ -63,6 +64,7 @@ internal static class Program
 
         app.MapGet("/health", () => Results.Json(new { ok = true, version = "0.1.0" }));
         app.MapGet("/status", () => Results.Json(engine.Status()));
+        app.MapGet("/latest", () => Results.Json(new { sample = engine.LatestSample() }));
         app.MapGet("/samples", (long? since, int? limit) =>
         {
             var (samples, last) = engine.Samples(since ?? -1, limit ?? 3000);

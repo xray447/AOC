@@ -395,6 +395,10 @@ class RecordingStatus(Model):
     started_at: str | None = None
     samples: int = 0
     phase: str = "PREFLIGHT"
+    # 计时只用于展示：发动机运转时间 / 已飞行时间（秒），口径见 P-04
+    engine_seconds: int = 0
+    flight_seconds: int = 0
+    engine_estimated: bool = False
     simlink_connected: bool = False
     simlink_version: str | None = None
     sim_connected: bool = False

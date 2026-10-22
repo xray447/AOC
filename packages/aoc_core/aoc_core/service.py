@@ -15,12 +15,12 @@ import threading
 import time as _time
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from aoc_integrations.volanta import VolantaClient, extract_track, parse_csv, parse_stored_flight
-from aoc_navdata import NavData, NavDataError
+from aoc_navdata import NavData, NavDataError, haversine_nm
 from aoc_protocol.schemas import (
     AirportOut,
     FlownLegIn,
@@ -346,6 +346,8 @@ class PersonalService:
             "runways": [{
                 "ident": r.get("name"), "heading": r.get("hdg"),
                 "length_m": r.get("length_m"), "ils": r.get("ils"),
+                # 入口坐标（跑道接地区俯视图要用）：阈值端经纬度 + 标高
+                "lat": r.get("lat"), "lon": r.get("lon"), "elev_ft": r.get("elev_ft"),
             } for r in runways],
         }
 
@@ -500,7 +502,7 @@ class PersonalService:
                                         free_id=free_id, flight_record_id=flight_record_id)
         url = self.route.simbrief(
             ctx.get("dep") or "", ctx.get("arr") or "", aircraft=ctx.get("aircraft_type"),
-            callsign=ctx.get("callsign"), payload_kg=ctx.get("payload_kg"),
+            callsign=ctx.get("callsign"), zfw_kg=ctx.get("zfw_kg"),
             registration=ctx.get("registration"))
         return {"simbrief_url": url, "payload": ctx}
 
@@ -516,7 +518,7 @@ class PersonalService:
                 return {"ok": True, "aborted": True, "task": task}
         return self.ops.abort_task(reason, task=task)
 
-    async def start_recording(self) -> dict:
+    async def start_recording(self, actual_zfw_kg: float | None = None) -> dict:
         if not self._simlink_client:
             raise RuntimeError("SimLink 未连接，无法开始记录；请确认模拟器和 SimLink 已启动")
         try:
@@ -525,8 +527,70 @@ class PersonalService:
             self.flights.last_error = f"SimLink 未响应: {type(exc).__name__}"
             raise RuntimeError("SimLink 未连接，无法开始记录；请确认模拟器和 SimLink 已启动") from exc
         self._evt_seq = -1
+        # 推出前 ZFW 校验：偏低只提示，任务照常开始；差异随任务进入 flight_record
+        warnings = self.ops.set_actual_zfw(actual_zfw_kg)
         self.flights.start(resp.get("recording_id"), resp.get("recording_started_at"), manual=True)
-        return self.recording_status()
+        return {**self.recording_status(), "warnings": warnings}
+
+    async def latest_sample(self) -> dict[str, Any] | None:
+        client = self._simlink_client
+        if client is None:
+            return None
+        try:
+            return await client.latest_sample()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def ops_flight_status(self) -> dict[str, Any]:
+        """执行页实时状态：取 SimLink 最新采样，组装速度/高度/位置/ETE 与 ZFW。
+
+        未起飞、地速 < 50kt 或没有采样时 `remaining_nm`/`ete_min`/`eta_utc` 为 null，
+        界面显示「—」，不猜测。
+        """
+        out: dict[str, Any] = {
+            "available": False, "on_ground": None,
+            "gs_kt": None, "ias_kt": None, "alt_ft": None, "agl_ft": None,
+            "lat": None, "lon": None, "vs_fpm": None, "phase": None,
+            "remaining_nm": None, "ete_min": None, "eta_utc": None,
+            "total_weight_kg": None, "fuel_weight_kg": None, "actual_zfw_kg": None,
+        }
+        sample = await self.latest_sample()
+        if sample:
+            out["available"] = True
+            for key in ("gs_kt", "ias_kt", "alt_ft", "agl_ft", "vs_fpm"):
+                value = sample.get(key)
+                out[key] = round(float(value), 1) if isinstance(value, (int, float)) else None
+            for key in ("lat", "lon"):
+                value = sample.get(key)
+                out[key] = round(float(value), 5) if isinstance(value, (int, float)) else None
+            out["on_ground"] = bool(sample.get("on_ground"))
+            total = sample.get("total_weight_kg")
+            fuel = sample.get("fuel_weight_kg")
+            if isinstance(total, (int, float)):
+                out["total_weight_kg"] = round(float(total), 1)
+            if isinstance(fuel, (int, float)):
+                out["fuel_weight_kg"] = round(float(fuel), 1)
+            if out["total_weight_kg"] is not None and out["fuel_weight_kg"] is not None:
+                out["actual_zfw_kg"] = round(out["total_weight_kg"] - out["fuel_weight_kg"], 1)
+        phase = self._last_status.get("phase")
+        if not phase:
+            phase = self.flights.status().phase
+            phase = getattr(phase, "value", phase)
+        out["phase"] = str(phase) if phase else None
+        task = self.ops.active_task()
+        arr = (task or {}).get("arr_icao")
+        if arr and out["lat"] is not None and out["lon"] is not None:
+            arr_info = self.nav.airport(arr) if self.nav is not None else None
+            if arr_info:
+                remaining = haversine_nm(out["lat"], out["lon"], arr_info["lat"], arr_info["lon"])
+                out["remaining_nm"] = round(remaining, 1)
+                gs = out["gs_kt"] or 0.0
+                if not out["on_ground"] and gs >= 50:
+                    ete = remaining / gs * 60.0
+                    out["ete_min"] = round(ete, 1)
+                    out["eta_utc"] = (datetime.now(timezone.utc) + timedelta(minutes=ete)) \
+                        .isoformat(timespec="seconds").replace("+00:00", "Z")
+        return out
 
     async def stop_recording(self, abort: bool = False) -> dict:
         if self._simlink_client:
@@ -554,6 +618,13 @@ class PersonalService:
         self.flights.simlink_version = status.get("version")
         self.flights.sim_connected = bool(status.get("sim_connected"))
         self.flights.aircraft_title = status.get("aircraft_title") or self.flights.aircraft_title
+        # 发动机运转时间 / 已飞行时间由 SimLink 计时，这里只透传给 UI（不进结算）
+        try:
+            self.flights.engine_seconds = int(status.get("engine_seconds") or 0)
+            self.flights.flight_seconds = int(status.get("flight_seconds") or 0)
+        except (TypeError, ValueError):
+            pass
+        self.flights.engine_estimated = bool(status.get("engine_estimated"))
         desired_auto = bool(self._settings.get("auto_start", True))
         if self._auto_start_sent != desired_auto:
             try:

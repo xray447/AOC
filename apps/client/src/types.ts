@@ -71,6 +71,21 @@ export interface Airport {
   visited?: boolean;
 }
 
+/** 跑道几何（入口坐标 + 真航向 + 长度），跑道接地区俯视图用。 */
+export interface AirportRunway {
+  ident?: string | null;
+  heading?: number | null;
+  length_m?: number | null;
+  ils?: boolean | null;
+  lat?: number | null;
+  lon?: number | null;
+  elev_ft?: number | null;
+}
+
+export interface AirportDetail extends Airport {
+  runways: AirportRunway[];
+}
+
 export interface Candidate {
   icao: string;
   iata?: string | null;
@@ -198,10 +213,14 @@ export interface FlightRecord {
   fuel_start_kg?: number | null;
   fuel_end_kg?: number | null;
   fuel_used_kg?: number | null;
+  actual_zfw_kg?: number | null;
+  zfw_delta_kg?: number | null;
   max_g_flight?: number | null;
   max_g_landing?: number | null;
   touchdown_g?: number | null;
   touchdown_vs_fpm?: number | null;
+  touchdown_lat?: number | null;
+  touchdown_lon?: number | null;
   runway_ident?: string | null;
   threshold_distance_m?: number | null;
   centerline_offset_m?: number | null;
@@ -244,6 +263,9 @@ export interface RecordingStatus {
   started_at: string | null;
   samples: number;
   phase: string;
+  engine_seconds: number;
+  flight_seconds: number;
+  engine_estimated: boolean;
   simlink_connected: boolean;
   simlink_version: string | null;
   sim_connected: boolean;
@@ -616,6 +638,38 @@ export interface OpsPolicyResult {
   action: string;
   review_required: boolean;
   breakdown: { kind: string; action: string; penalty: number; detail: string; value?: number }[];
+}
+
+/** 有可用飞机的机场（自由飞出发机场下拉数据源）。 */
+export interface OpsFreeAirport {
+  icao: string;
+  iata?: string | null;
+  name?: string | null;
+  city?: string | null;
+  country?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  aircraft: number;
+}
+
+/** 执行页实时状态（取 SimLink 最新采样；缺失字段为 null，界面显示「—」）。 */
+export interface FlightStatus {
+  available: boolean;
+  on_ground: boolean | null;
+  gs_kt: number | null;
+  ias_kt: number | null;
+  alt_ft: number | null;
+  agl_ft: number | null;
+  lat: number | null;
+  lon: number | null;
+  vs_fpm: number | null;
+  phase: string | null;
+  remaining_nm: number | null;
+  ete_min: number | null;
+  eta_utc: string | null;
+  total_weight_kg: number | null;
+  fuel_weight_kg: number | null;
+  actual_zfw_kg: number | null;
 }
 
 export interface OpsFreeFlight {

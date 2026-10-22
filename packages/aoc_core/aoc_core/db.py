@@ -30,6 +30,7 @@ FLIGHT_COLUMNS = [
     "block_off_utc", "takeoff_utc", "landing_utc", "block_on_utc", "block_minutes",
     "route_string", "route_source", "coverage", "altitude_valid", "mission_type",
     "distance_nm", "fuel_start_kg", "fuel_end_kg", "fuel_used_kg",
+    "actual_zfw_kg", "zfw_delta_kg",
     "max_g_flight", "max_g_landing", "touchdown_g", "touchdown_vs_fpm",
     "touchdown_lat", "touchdown_lon", "runway_ident", "threshold_distance_m",
     "centerline_offset_m", "bounce_count", "landing_distance_m", "landing_rating",
@@ -121,6 +122,8 @@ CREATE TABLE IF NOT EXISTS flight_record (
     fuel_start_kg REAL,
     fuel_end_kg REAL,
     fuel_used_kg REAL,
+    actual_zfw_kg REAL,
+    zfw_delta_kg REAL,
     max_g_flight REAL,
     max_g_landing REAL,
     touchdown_g REAL,
@@ -233,6 +236,10 @@ class Database:
             for name, ddl in (("callsign", "TEXT"), ("registration", "TEXT")):
                 if name not in existing:
                     con.execute(f"alter table volanta_flight add column {name} {ddl}")
+            flight_cols = {r["name"] for r in con.execute("pragma table_info(flight_record)")}
+            for name, ddl in (("actual_zfw_kg", "REAL"), ("zfw_delta_kg", "REAL")):
+                if name not in flight_cols:
+                    con.execute(f"alter table flight_record add column {name} {ddl}")
 
     def _backfill_volanta_flights(self) -> None:
         """旧版本只把导入航段写进 flown_leg：这里补齐 volanta_flight（幂等，不删任何数据）。"""

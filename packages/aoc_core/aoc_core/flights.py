@@ -205,6 +205,10 @@ class FlightService:
         self.simlink_version: str | None = None
         self.aircraft_title: str | None = None
         self.last_error: str | None = None
+        # 记录状态展示用的计时（口径见 P-04），由 SimLink 下发、只展示不结算
+        self.engine_seconds = 0
+        self.flight_seconds = 0
+        self.engine_estimated = False
         self._persisted = self._load_persisted()
 
     # -- 持久化 -----------------------------------------------------------
@@ -270,6 +274,13 @@ class FlightService:
             return self.status()
         self.recorder = FlightRecorder(fid, started, self.paths)
         self.recorder.add_event(0.0, "recording_started", {"manual": manual})
+        actual_zfw = (ctx or {}).get("actual_zfw_kg")
+        zfw_delta = (ctx or {}).get("zfw_delta_kg")
+        if actual_zfw is not None:
+            # 推出前 ZFW 校验结果：写进事件，供日志详情核对（字段同时落库）
+            self.recorder.add_event(0.0, "zfw_check", {
+                "actual_zfw_kg": actual_zfw, "delta_kg": zfw_delta,
+            })
         if existing is None:
             record: dict[str, Any] = {
                 "id": fid, "mode": "PERSONAL", "status": "RECORDING",
@@ -288,6 +299,7 @@ class FlightService:
                     "dep_icao": ctx.get("dep_icao"), "arr_icao": ctx.get("arr_icao"),
                     "mission_type": ctx.get("mission_type") or "SCHEDULED",
                     "scheduled_dep_utc": ctx.get("scheduled_dep_utc"),
+                    "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
                 })
             self.db.insert_flight(record)
         self._save_persisted()
@@ -481,6 +493,9 @@ class FlightService:
             started_at=rec.started_at if rec else None,
             samples=len(rec.samples) if rec else 0,
             phase=rec.phase if rec else Phase.PREFLIGHT,
+            engine_seconds=self.engine_seconds if rec else 0,
+            flight_seconds=self.flight_seconds if rec else 0,
+            engine_estimated=bool(self.engine_estimated and rec),
             simlink_connected=self.simlink_connected,
             simlink_version=self.simlink_version,
             sim_connected=self.sim_connected,

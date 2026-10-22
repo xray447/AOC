@@ -139,7 +139,8 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 rec = get(f"{base}/local/recording/status", token)
                 if rec.get("active"):
-                    print(f"recording: phase={rec['phase']} samples={rec['samples']}")
+                    print(f"recording: phase={rec['phase']} engine_s={rec.get('engine_seconds')} "
+                          f"flight_s={rec.get('flight_seconds')}")
                 time.sleep(2.0)
         assert settlement, "超时：没有生成结算"
         print(f"settlement: {settlement['status']} action={settlement['policy_action']} "

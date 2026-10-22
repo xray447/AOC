@@ -154,21 +154,27 @@ def test_a26_simbrief_without_route(service: RouteService):
     assert "route=" not in url
 
 
-def test_simbrief_prefills_callsign(service: RouteService):
-    """开始前点 SimBrief 时带上航班号（运营模式的 AOC101 / AUV123）。"""
+def test_simbrief_splits_callsign(service: RouteService):
+    """呼号拆成 airline + fltnum（SimBrief 不接受 callsign）。"""
     url = service.simbrief("ZBAA", "ZSSS", 350, "A320", None, "aoc101")
-    assert "callsign=AOC101" in url
+    assert "airline=AOC" in url and "fltnum=101" in url
     assert "type=A320" in url
+    assert "callsign=" not in url
     # 不预填高度，高度交给 SimBrief 自己算
     assert "fl=" not in url
 
+    # 没有末尾数字时只传 airline，呼号需在 SimBrief 内手动确认
+    plain = service.simbrief("ZBAA", "ZSSS", 350, "A320", None, "AUV")
+    assert "airline=AUV" in plain
+    assert "fltnum=" not in plain and "callsign=" not in plain
 
-def test_simbrief_payload_in_kg_only(service: RouteService):
-    """配载只带一个 kg 的 payload，不再拆 pax/cargo/fuel。"""
+
+def test_simbrief_uses_manualzfw(service: RouteService):
+    """配载改用 ZFW（千磅、3 位小数）；payload/pax/cargo/fuel 都不是 SimBrief 参数。"""
     url = service.simbrief("ZBAA", "ZSSS", 350, "A320", None, "AOC101", 6120, "B-1671")
-    assert "payload=6120" in url
+    assert "manualzfw=13.492" in url      # 6120 kg × 2.2046226 ÷ 1000
     assert "reg=B-1671" in url
-    for legacy in ("pax=", "cargo=", "fuel=", "fl="):
+    for legacy in ("payload=", "callsign=", "pax=", "cargo=", "fuel=", "fl="):
         assert legacy not in url
 
 

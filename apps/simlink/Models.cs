@@ -18,6 +18,16 @@ public sealed class Sample
     [JsonPropertyName("bank_deg")] public double BankDeg { get; set; }
     [JsonPropertyName("on_ground")] public bool OnGround { get; set; }
     [JsonPropertyName("fuel_kg")] public double FuelKg { get; set; }
+    /// <summary>总重（磅 → kg）：SimVar `TOTAL WEIGHT`。</summary>
+    [JsonPropertyName("total_weight_kg")] public double TotalWeightKg { get; set; }
+    /// <summary>燃油重量（磅 → kg）：SimVar `FUEL TOTAL QUANTITY WEIGHT`。</summary>
+    [JsonPropertyName("fuel_weight_kg")] public double FuelWeightKg { get; set; }
+    /// <summary>四台发动机转速（`GENERAL ENG RPM:1..4`），用于判定发动机运转。</summary>
+    [JsonPropertyName("eng_rpm")] public double[] EngRpm { get; set; } = new double[4];
+    /// <summary>四台发动机 N1（%），`GENERAL ENG RPM` 恒为 0 时的退化判定。</summary>
+    [JsonPropertyName("eng_n1")] public double[] EngN1 { get; set; } = new double[4];
+    /// <summary>四台发动机燃烧状态（0/1），退化判定用。</summary>
+    [JsonPropertyName("eng_combustion")] public double[] EngCombustion { get; set; } = new double[4];
     [JsonPropertyName("g")] public double G { get; set; } = 1.0;
     [JsonPropertyName("gear")] public int Gear { get; set; }
     [JsonPropertyName("flaps")] public int Flaps { get; set; }
@@ -44,6 +54,12 @@ public sealed class RecordingInfo
     [JsonPropertyName("samples")] public int Samples { get; set; }
     [JsonPropertyName("events")] public int Events { get; set; }
     [JsonPropertyName("phase")] public string Phase { get; set; } = "PREFLIGHT";
+    /// <summary>发动机运转时间（秒，模拟时间）：任一 RPM &gt; 200 起算，四台全部 &lt; 200 持续 5s 停止。</summary>
+    [JsonPropertyName("engine_seconds")] public int EngineSeconds { get; set; }
+    /// <summary>已飞行时间（秒，模拟时间）：takeoff 起算，landing 冻结。</summary>
+    [JsonPropertyName("flight_seconds")] public int FlightSeconds { get; set; }
+    /// <summary>计时走退化判定（N1/燃烧）或记录开始时发动机已在转，无法精确回溯。</summary>
+    [JsonPropertyName("engine_estimated")] public bool EngineEstimated { get; set; }
     [JsonPropertyName("sim_connected")] public bool SimConnected { get; set; }
     [JsonPropertyName("aircraft_title")] public string? AircraftTitle { get; set; }
     [JsonPropertyName("sim_version")] public string? SimVersion { get; set; }

@@ -37,6 +37,7 @@ CONSTRAINT_LIMITS = {
     "max_turnaround_min": (30, 1440, 360),
 }
 FREE_LOCK_MINUTES = 30
+FREE_DEP_OFFSET_MINUTES = 50
 CANDIDATE_TTL_SECONDS = 300
 LEDGER_TYPES = (
     "REVENUE_PAX", "REVENUE_PAX_BUSINESS", "REVENUE_PAX_FIRST", "REVENUE_CARGO",
@@ -92,7 +93,10 @@ def _simbrief_payload(*, dep: str | None = None, arr: str | None = None,
                       aircraft_type: str | None = None, callsign: str | None = None,
                       registration: str | None = None,
                       sheet: dict[str, Any] | None = None) -> dict[str, Any]:
-    """SimBrief 预填参数：机场/机型/呼号/注册号，有配载单时再带上旅客与重量。"""
+    """SimBrief 预填参数：机场/机型/呼号/注册号，有配载单时再带上旅客与 ZFW。
+
+    链接里只传 `airline`+`fltnum` 与 `manualzfw`（千磅）；`pax` 仅用于界面展示。
+    """
     payload: dict[str, Any] = {
         "dep": (dep or "").upper(), "arr": (arr or "").upper(),
         "aircraft_type": aircraft_type, "callsign": callsign,
@@ -116,6 +120,37 @@ def _simbrief_payload(*, dep: str | None = None, arr: str | None = None,
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _actual_zfw(value: Any) -> float | None:
+    """把前端/SimVar 传上来的实际 ZFW 转成 kg；非法值返回 None。"""
+    if value is None or value == "":
+        return None
+    try:
+        actual = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(actual, 1) if actual > 0 else None
+
+
+def zfw_check(actual_zfw_kg: Any, planned_zfw_kg: Any) -> tuple[float | None, float | None, list[str]]:
+    """实际 ZFW 与配载单比对：返回 (实际值, 差异, 警告)。偏低只提示，不阻断开始。"""
+    actual = _actual_zfw(actual_zfw_kg)
+    try:
+        planned = float(planned_zfw_kg) if planned_zfw_kg else None
+    except (TypeError, ValueError):
+        planned = None
+    if actual is None:
+        return None, None, []
+    if not planned:
+        return actual, None, []
+    delta = round(actual - planned, 1)
+    warnings: list[str] = []
+    if delta < 0:
+        warnings.append(
+            f"实际 ZFW {actual:.0f} kg 低于配载单 {planned:.0f} kg（少 {abs(delta):.0f} kg），"
+            "可能漏装旅客/货物")
+    return actual, delta, warnings
 
 
 class OpsService:
@@ -1148,6 +1183,32 @@ class OpsService:
         return self.roster(roster_id) or {}
 
     # ------------------------------------------------------------------ 自由飞
+    def free_airports(self) -> list[dict[str, Any]]:
+        """有可用飞机（ACTIVE 且未锁/未在飞）的机场：出发机场下拉只列这些。
+
+        按飞机当前位置（`aircraft.current_airport_icao`）去重，无机队的机场不出现。
+        """
+        counts: dict[str, int] = {}
+        for row in self.free_aircraft():
+            icao = (row.get("current_airport_icao") or "").strip().upper()
+            if icao:
+                counts[icao] = counts.get(icao, 0) + 1
+        nav = self.nav
+        items: list[dict[str, Any]] = []
+        for icao in sorted(counts):
+            info = nav.airport(icao) if nav is not None else None
+            info = info or {}
+            items.append({
+                "icao": icao,
+                "iata": info.get("iata"),
+                "name": info.get("name"),
+                "city": info.get("city"),
+                "country": info.get("country"),
+                "lat": info.get("lat"), "lon": info.get("lon"),
+                "aircraft": counts[icao],
+            })
+        return items
+
     def free_aircraft(self, dep: str | None = None, type_id: str | None = None) -> list[dict[str, Any]]:
         fleet = [a for a in self.list_fleet() if a["status"] == "ACTIVE" and not a.get("locked")]
         if dep:
@@ -1200,7 +1261,8 @@ class OpsService:
                 "dep_time_utc, status, lock_expires_at, created_at, updated_at) "
                 "values(?,?,?,?,?,?,?,?,?,?)",
                 (free_id, aircraft_id, data.get("flight_instance_id"), dep, arr,
-                 data.get("dep_time_utc") or stamp, "LOCKED", _iso(expires), stamp, stamp))
+                 data.get("dep_time_utc") or _iso(now + timedelta(minutes=FREE_DEP_OFFSET_MINUTES)),
+                 "LOCKED", _iso(expires), stamp, stamp))
             if instance:
                 con.execute("update flight_instance set status='ASSIGNED', assigned_aircraft_id=?, updated_at=? "
                             "where id=?", (aircraft_id, stamp, instance["id"]))
@@ -1404,7 +1466,8 @@ class OpsService:
             return None
         return task
 
-    def start_leg(self, roster_id: str, sequence: int) -> dict[str, Any]:
+    def start_leg(self, roster_id: str, sequence: int,
+                  actual_zfw_kg: Any = None) -> dict[str, Any]:
         roster = self.roster(roster_id)
         if not roster:
             raise OpsError("NOT_FOUND", "班表不存在")
@@ -1438,6 +1501,8 @@ class OpsService:
                              (leg["flight_instance_id"],)) if leg.get("flight_instance_id") else None
         # seed 与航段绑定（而非随机 flight_id），保证「开始前」的 SimBrief 配载与开始时固化的一致
         load = self._leg_load(leg, type_row, seed=f"roster-{leg['id']}", params=params)
+        # 推出前 ZFW 校验：低于配载单只提示，不阻断（C-08）
+        actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
         task = {
             "kind": "ROSTER", "roster_id": roster_id, "roster_leg_id": leg["id"],
             "flight_instance_id": leg.get("flight_instance_id"), "flight_record_id": flight_id,
@@ -1447,6 +1512,7 @@ class OpsService:
             "scheduled_dep_utc": (instance or {}).get("scheduled_dep_utc"),
             "mission_type": (instance or {}).get("mission_type") or "SCHEDULED",
             "started_at": utcnow(),
+            "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
         }
         stamp = utcnow()
         with self._tx() as con:
@@ -1481,9 +1547,10 @@ class OpsService:
                         "where roster_id=? and status='HELD'", (stamp, roster_id))
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "LEG_START", "roster_leg", leg["id"], "PLANNED", "IN_PROGRESS")
-        return {"task": task, "load_sheet": self.load_sheet(flight_id), "roster": self.roster(roster_id)}
+        return {"task": task, "load_sheet": self.load_sheet(flight_id),
+                "roster": self.roster(roster_id), "warnings": warnings}
 
-    def start_free_flight(self, free_id: str) -> dict[str, Any]:
+    def start_free_flight(self, free_id: str, actual_zfw_kg: Any = None) -> dict[str, Any]:
         free = self.free_flight(free_id)
         if not free:
             raise OpsError("NOT_FOUND", "自由飞行任务不存在")
@@ -1500,12 +1567,14 @@ class OpsService:
         policy_row, sources = resolve_policy(policy, aircraft_type=type_row, aircraft=aircraft)
         version = int((self._one("select max(version) as v from ops_config_version") or {}).get("v") or 0)
         load = self._free_load(free, type_row, seed=f"free-{free_id}", params=params)
+        actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
         task = {
             "kind": "FREE", "free_flight_id": free_id, "flight_record_id": flight_id,
             "aircraft_id": aircraft.get("id"), "dep_icao": free["dep_icao"],
             "arr_icao": free["arr_icao"], "aircraft_type": type_row.get("icao"),
             "callsign": self._free_callsign(free_id), "scheduled_dep_utc": free.get("dep_time_utc"),
             "mission_type": "FREE", "started_at": utcnow(),
+            "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
         }
         stamp = utcnow()
         with self._tx() as con:
@@ -1538,7 +1607,25 @@ class OpsService:
                         "where free_flight_id=? and status='HELD'", (stamp, free_id))
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "FREE_FLIGHT_START", "free_flight", free_id, "LOCKED", "IN_FLIGHT")
-        return {"task": task, "load_sheet": self.load_sheet(flight_id), "free_flight": self.free_flight(free_id)}
+        return {"task": task, "load_sheet": self.load_sheet(flight_id),
+                "free_flight": self.free_flight(free_id), "warnings": warnings}
+
+    def set_actual_zfw(self, actual_zfw_kg: Any) -> list[str]:
+        """记录开始前补录实际 ZFW（由 SimLink 采样换算），返回偏低警告。
+
+        差异写进当前任务，开始录制时带入 `flight_record`，供事后核对。
+        """
+        task = self.active_task()
+        if not task:
+            return []
+        sheet = self.load_sheet(task.get("flight_record_id") or "") or {}
+        actual, delta, warnings = zfw_check(actual_zfw_kg, sheet.get("zfw_kg"))
+        if actual is None:
+            return []
+        task["actual_zfw_kg"] = actual
+        task["zfw_delta_kg"] = delta
+        self._meta_set(ACTIVE_TASK_KEY, task)
+        return warnings
 
     def _callsign(self, flight_number: str | None) -> str:
         """抽班：用档案里的航班号前缀改写班期号（AOC101 → 自定义前缀）。"""

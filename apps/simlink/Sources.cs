@@ -9,6 +9,11 @@ public interface ISimSource : IDisposable
     bool Connected { get; }
     string? SimVersion { get; }
     string? AircraftTitle { get; }
+    /// <summary>
+    /// `Sample.T` 是否已经是模拟时间（demo/replay 按倍速推进时钟）。
+    /// false 表示 T 是真实秒，Engine 累计模拟时间时要乘以 `sim_rate`。
+    /// </summary>
+    bool ClockIsSimTime => false;
     event Action<Sample>? Frame;
     void Start();
     void Stop();
@@ -27,6 +32,7 @@ public sealed class DemoSource : ISimSource
     public bool Connected => true;
     public string? SimVersion => "demo-1.0";
     public string? AircraftTitle => "AOC Demo A320";
+    public bool ClockIsSimTime => true;
     public event Action<Sample>? Frame;
 
     public void Start()
@@ -92,12 +98,18 @@ public sealed class DemoSource : ISimSource
             gs = 125 * (1 - k); onGround = true;
         }
         double g = t >= touchdown && t < touchdown + 1.0 ? 1.42 : (t > touchdown + 1 ? 1.02 : 1.0);
+        double fuelKg = Math.Max(1200, 8000 - (t / 255.0) * 6200);
+        // 演示机：20s 起动发动机、落地后 10s 关车；载荷按 14t 固定，ZFW = 总重 − 燃油
+        bool engineOn = t >= 20 && t < touchdown + 10;
+        double rpm = engineOn ? 2400 : 0;
         return new Sample
         {
             T = t, Lat = lat, Lon = lon, AltFt = alt, AglFt = Math.Max(0, agl), GsKt = Math.Max(0, gs),
             IasKt = Math.Max(0, gs * 0.92), VsFpm = vs, HdgTrue = 165,
             PitchDeg = t < takeoff ? 0 : (t < 60 ? 8 : (t > 228 ? 5 : 2)),
-            BankDeg = 0, OnGround = onGround, FuelKg = Math.Max(1200, 8000 - (t / 255.0) * 6200),
+            BankDeg = 0, OnGround = onGround, FuelKg = fuelKg,
+            TotalWeightKg = 42000 + 14000 + fuelKg, FuelWeightKg = fuelKg,
+            EngRpm = new[] { rpm, rpm, 0, 0 }, EngN1 = new double[4], EngCombustion = new double[4],
             G = g, Gear = t < 20 || t > 215 ? 1 : 0,
             Flaps = t < 15 ? 0 : (t < takeoff ? 1 : (t > 205 ? 3 : 0)),
             Paused = false, SimRate = speed,
@@ -126,6 +138,7 @@ public sealed class ReplaySource : ISimSource
     public bool Connected => true;
     public string? SimVersion => "replay";
     public string? AircraftTitle => "Replay";
+    public bool ClockIsSimTime => true;
     public event Action<Sample>? Frame;
 
     public ReplaySource(string path, double speed = 4.0)

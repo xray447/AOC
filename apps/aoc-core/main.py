@@ -276,10 +276,11 @@ def create_app(config: CoreConfig) -> FastAPI:
     @app.get("/local/routes/simbrief")
     def route_simbrief(dep: str, arr: str, aircraft_type: str | None = None,
                        route: str | None = None, callsign: str | None = None,
-                       payload_kg: float | None = None, registration: str | None = None):
+                       zfw_kg: float | None = None, registration: str | None = None):
+        """公开 SimBrief 预填：呼号拆 airline/fltnum，配载用 manualzfw（由 ZFW kg 换算）。"""
         return {"simbrief_url": service.route.simbrief(
             dep, arr, aircraft=aircraft_type, route=route, callsign=callsign,
-            payload_kg=payload_kg, registration=registration)}
+            zfw_kg=zfw_kg, registration=registration)}
 
     @app.get("/local/routes/engine")
     def route_engine():
@@ -406,9 +407,9 @@ def create_app(config: CoreConfig) -> FastAPI:
         return service.recording_status()
 
     @app.post("/local/recording/start")
-    async def recording_start():
+    async def recording_start(body: dict[str, Any] | None = None):
         try:
-            return await service.start_recording()
+            return await service.start_recording((body or {}).get("actual_zfw_kg"))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "SIMLINK_UNAVAILABLE",
                                                          "message": str(exc)}) from exc
@@ -576,8 +577,14 @@ def create_app(config: CoreConfig) -> FastAPI:
         return service.ops.expire_roster(roster_id)
 
     @app.post("/local/ops/rosters/{roster_id}/legs/{sequence}/start")
-    def ops_leg_start(roster_id: str, sequence: int):
-        return service.ops.start_leg(roster_id, sequence)
+    def ops_leg_start(roster_id: str, sequence: int, body: dict[str, Any] | None = None):
+        """开始航段；可带 `actual_zfw_kg`，低于配载单时在 `warnings[]` 提示（不阻断）。"""
+        return service.ops.start_leg(roster_id, sequence, (body or {}).get("actual_zfw_kg"))
+
+    @app.get("/local/ops/free-flights/airports")
+    def ops_free_airports():
+        """有可用飞机的机场：出发机场下拉只列这些（不再列无机队机场）。"""
+        return {"items": service.ops.free_airports()}
 
     @app.get("/local/ops/free-flights/aircraft")
     def ops_free_aircraft(dep: str | None = None, type_id: str | None = None):
@@ -596,8 +603,9 @@ def create_app(config: CoreConfig) -> FastAPI:
         return service.ops.heartbeat_free(free_id)
 
     @app.post("/local/ops/free-flights/{free_id}/start")
-    def ops_free_start(free_id: str):
-        return service.ops.start_free_flight(free_id)
+    def ops_free_start(free_id: str, body: dict[str, Any] | None = None):
+        """开始自由飞；可带 `actual_zfw_kg`，偏低时只给 `warnings[]`。"""
+        return service.ops.start_free_flight(free_id, (body or {}).get("actual_zfw_kg"))
 
     @app.post("/local/ops/free-flights/{free_id}/cancel")
     def ops_free_cancel(free_id: str):
@@ -612,6 +620,11 @@ def create_app(config: CoreConfig) -> FastAPI:
     @app.get("/local/ops/status")
     def ops_status():
         return service.ops_status()
+
+    @app.get("/local/ops/flight-status")
+    async def ops_flight_status():
+        """执行页实时状态：速度/高度/位置/ETE/ETA + 实际 ZFW（取 SimLink 最新采样）。"""
+        return await service.ops_flight_status()
 
     @app.get("/local/ops/load-sheets/{flight_id}")
     def ops_load_sheet(flight_id: str):

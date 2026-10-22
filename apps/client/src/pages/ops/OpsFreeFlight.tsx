@@ -1,7 +1,8 @@
 import { CarOutlined, PlayCircleOutlined, ReloadOutlined } from "@ant-design/icons";
 import {
-  Alert, Button, Card, Col, Descriptions, Empty, Form, Popconfirm, Row, Select, Space, Table, Tag, message,
+  Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Form, Popconfirm, Row, Select, Space, Table, Tag, message,
 } from "antd";
+import dayjs, { type Dayjs } from "dayjs";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api";
@@ -9,12 +10,16 @@ import { AirportSelect } from "../../components/AirportSelect";
 import { SimBriefButton } from "../../components/SimBriefButton";
 import { useI18n } from "../../i18n";
 import { aircraftStatus, fmtUtc } from "../../ops";
-import type { OpsAircraft, OpsFreeFlight, OpsProfile } from "../../types";
+import type { OpsAircraft, OpsFreeAirport, OpsFreeFlight, OpsProfile } from "../../types";
+
+/** 计划起飞时间默认 now + 50min（界面本地时区，提交转 UTC）。 */
+const DEFAULT_DEP_OFFSET_MIN = 50;
 
 interface FreeForm {
   dep_icao: string;
   arr_icao: string;
   aircraft_id?: string;
+  dep_time_utc?: Dayjs;
 }
 
 export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) {
@@ -23,6 +28,8 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
   const [aircraft, setAircraft] = useState<OpsAircraft[]>([]);
   const [current, setCurrent] = useState<OpsFreeFlight | null>(null);
   const [profile, setProfile] = useState<OpsProfile | null>(null);
+  const [depAirports, setDepAirports] = useState<OpsFreeAirport[]>([]);
+  const [airportsLoading, setAirportsLoading] = useState(false);
   const [dep, setDep] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm<FreeForm>();
@@ -33,20 +40,34 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
     setAircraft(res.items);
   }, []);
 
+  const loadAirports = useCallback(async () => {
+    setAirportsLoading(true);
+    try {
+      const res = await api<{ items: OpsFreeAirport[] }>("/local/ops/free-flights/airports");
+      setDepAirports(res.items);
+      return res.items;
+    } finally {
+      setAirportsLoading(false);
+    }
+  }, []);
+
   const load = useCallback(async () => {
-    const [p, cur] = await Promise.all([
+    const [p, cur, airports] = await Promise.all([
       api<OpsProfile>("/local/ops/profile"),
       api<OpsFreeFlight>("/local/ops/free-flights/current"),
+      loadAirports(),
     ]);
     setProfile(p);
     setCurrent(cur && cur.id ? cur : null);
-    const start = dep || p.base_airport_icao || "";
-    if (!dep) {
-      setDep(start);
-      form.setFieldValue("dep_icao", start);
-    }
+    // 出发机场只允许「有机场」的机场：当前选择/基地不在列表里时落到第一座可用机场
+    const allowed = new Set(airports.map((a) => a.icao));
+    const start = allowed.has(dep) ? dep
+      : allowed.has(p.base_airport_icao || "") ? (p.base_airport_icao as string)
+        : (airports[0]?.icao || "");
+    setDep(start);
+    form.setFieldValue("dep_icao", start || undefined);
     await loadAircraft(start);
-  }, [dep, form, loadAircraft]);
+  }, [dep, form, loadAircraft, loadAirports]);
 
   useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
 
@@ -68,7 +89,14 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
     }
     setBusy(true);
     try {
-      await api("/local/ops/free-flights", { method: "POST", body: JSON.stringify(values) });
+      const body = {
+        dep_icao: values.dep_icao,
+        arr_icao: values.arr_icao,
+        aircraft_id: values.aircraft_id,
+        // 界面按本地时区显示，提交统一转 UTC
+        dep_time_utc: values.dep_time_utc ? values.dep_time_utc.toISOString() : undefined,
+      };
+      await api("/local/ops/free-flights", { method: "POST", body: JSON.stringify(body) });
       await load();
       message.success(tr("已锁定飞机（30 分钟）", "Aircraft locked for 30 minutes"));
     } catch (e) {
@@ -82,7 +110,9 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
     if (!current) return;
     setBusy(true);
     try {
-      await api(`/local/ops/free-flights/${current.id}/start`, { method: "POST" });
+      const res = await api<{ warnings?: string[] }>(
+        `/local/ops/free-flights/${current.id}/start`, { method: "POST" });
+      (res.warnings || []).forEach((w) => message.warning(w));
       message.success(tr("任务已开始，配载已固化", "Task started, load sheet frozen"));
       navigate("/ops/execute");
     } catch (e) {
@@ -135,6 +165,7 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
             </Descriptions.Item>
             <Descriptions.Item label={tr("飞机", "Aircraft")}>{current.aircraft?.registration || "—"} · {current.aircraft?.type_icao || ""}</Descriptions.Item>
             <Descriptions.Item label={tr("航段", "Leg")}>{current.dep_icao} → {current.arr_icao}</Descriptions.Item>
+            <Descriptions.Item label={tr("计划起飞", "ETD")}>{fmtUtc(current.dep_time_utc)}</Descriptions.Item>
             <Descriptions.Item label={tr("锁到期", "Lock expires")}>{fmtUtc(current.lock_expires_at)}</Descriptions.Item>
           </Descriptions>
           <Space style={{ marginTop: 8 }} wrap>
@@ -162,9 +193,26 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
         <Row gutter={16}>
           <Col xs={24} lg={10}>
             <Card className="panel" variant="borderless" title={tr("领取飞机", "Claim aircraft")}>
-              <Form form={form} layout="vertical" initialValues={{ dep_icao: profile?.base_airport_icao || "" }}>
-                <Form.Item name="dep_icao" label={tr("出发机场（= 飞机当前位置）", "Departure (= aircraft position)")} rules={[{ required: true }]}>
-                  <AirportSelect onChange={(v) => void changeDep(v)} placeholder="ZBAA" />
+              <Form
+                form={form}
+                layout="vertical"
+                initialValues={{
+                  dep_icao: profile?.base_airport_icao || "",
+                  dep_time_utc: dayjs().add(DEFAULT_DEP_OFFSET_MIN, "minute"),
+                }}
+              >
+                <Form.Item
+                  name="dep_icao"
+                  label={tr("出发机场（= 飞机当前位置）", "Departure (= aircraft position)")}
+                  rules={[{ required: true }]}
+                  extra={depAirports.length ? tr("只列有机队的机场", "Only airports with aircraft") : undefined}
+                >
+                  <AirportSelect
+                    onChange={(v) => void changeDep(v)}
+                    placeholder={depAirports.length ? "ZBAA" : tr("没有可用机场", "No airports")}
+                    airports={depAirports}
+                    loading={airportsLoading}
+                  />
                 </Form.Item>
                 <Form.Item name="aircraft_id" label={tr("飞机", "Aircraft")}>
                   <Select
@@ -178,10 +226,28 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
                 <Form.Item name="arr_icao" label={tr("到达机场", "Arrival")} rules={[{ required: true }]}>
                   <AirportSelect placeholder="ZSSS" />
                 </Form.Item>
+                <Form.Item
+                  name="dep_time_utc"
+                  label={tr("计划起飞时间（本地时区）", "Planned departure (local time)")}
+                  rules={[{ required: true }]}
+                  extra={tr("默认当前时间 + 50 分钟", "Defaults to now + 50 min")}
+                >
+                  <DatePicker showTime format="YYYY-MM-DD HH:mm" allowClear={false} style={{ width: "100%" }} />
+                </Form.Item>
                 <Button type="primary" block icon={<CarOutlined />} loading={busy} onClick={() => void create()}>
                   {tr("锁定飞机（30 分钟）", "Lock aircraft (30 min)")}
                 </Button>
               </Form>
+              {depAirports.length ? null : (
+                <Alert
+                  style={{ marginTop: 12 }}
+                  type="warning"
+                  showIcon
+                  message={tr("没有可用飞机", "No available aircraft")}
+                  description={tr("先在机队页添加飞机并设置当前位置，出发机场才会出现在下拉里。",
+                    "Add aircraft on the fleet page and set their location; only those airports appear here.")}
+                />
+              )}
               <Alert
                 style={{ marginTop: 12 }}
                 type="info"

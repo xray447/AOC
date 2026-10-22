@@ -138,6 +138,17 @@ def test_ops_finance_summary_and_task_abort(app_client):
     assert app_client.get("/local/ops/legs/simbrief").status_code == 422
 
 
+def test_ops_flight_status_and_free_airports(app_client):
+    """执行页实时状态与出发机场下拉：无 SimLink 时字段齐全（值为 null），机场只列有机队的。"""
+    status = app_client.get("/local/ops/flight-status").json()
+    assert status["available"] is False
+    for key in ("gs_kt", "ias_kt", "alt_ft", "agl_ft", "lat", "lon", "vs_fpm", "phase",
+                "remaining_nm", "ete_min", "eta_utc", "actual_zfw_kg"):
+        assert key in status
+    airports = app_client.get("/local/ops/free-flights/airports").json()["items"]
+    assert isinstance(airports, list)
+
+
 def test_open_external_uses_default_browser(app_client, monkeypatch):
     """SimBrief 等外链交给系统默认浏览器打开，且只允许 http/https。"""
     import main

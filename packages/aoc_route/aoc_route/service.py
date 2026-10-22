@@ -200,11 +200,11 @@ class RouteService:
 
     def simbrief(self, dep: str, arr: str, cruise_fl: int = 350,
                  aircraft: str | None = None, route: str | None = None,
-                 callsign: str | None = None, payload_kg: float | None = None,
+                 callsign: str | None = None, zfw_kg: float | None = None,
                  registration: str | None = None) -> str:
         """cruise_fl 仅为兼容旧调用保留，链接里不再预填高度。"""
         return build_url((dep or "").strip().upper(), (arr or "").strip().upper(),
-                         aircraft, route, callsign, payload_kg, registration)
+                         aircraft, route, callsign, zfw_kg, registration)
 
     def coverage(self, dep: str, arr: str, cruise_fl: int = 350) -> CoverageResult:
         dep, arr = dep.upper().strip(), arr.upper().strip()

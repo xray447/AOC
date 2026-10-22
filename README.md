@@ -68,6 +68,8 @@ python -X utf8 apps/aoc-core/main.py --port 0 --home "$env:LOCALAPPDATA\AOC" --s
 
 或一键开发：`powershell -File tools/dev.ps1`（构建前端 → demo SimLink → 起 aoc-core 并开浏览器）。
 
+一键完整编译：`powershell -ExecutionPolicy Bypass -File tools/build.ps1`（或双击 `tools\build.cmd`）——Python 依赖 → 客户端 → 管理端 → SimLink publish → Tauri NSIS/MSI → 便携 ZIP → ruff/pytest，产物落在 `out/`；可加 `-SkipTauri`、`-SkipTests`、`-SkipDocker`、`-Clean` 等裁剪，日志写到 `out/build-<时间戳>.log`。
+
 ## 测试
 
 ```powershell

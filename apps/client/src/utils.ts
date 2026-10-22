@@ -61,6 +61,15 @@ export function fmtMinutes(min?: number | null): string {
   return h > 0 ? `${h}h${m.toString().padStart(2, "0")}m` : `${m}m`;
 }
 
+/** 秒数 → HH:MM:SS（记录状态里的发动机运转/已飞行时间）。 */
+export function fmtHms(seconds?: number | null): string {
+  const total = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+}
+
 export function fmtDateTime(iso?: string | null): string {
   if (!iso) return "—";
   return dayjs(iso).format("YYYY-MM-DD HH:mm");

@@ -4,13 +4,36 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, download } from "../api";
 import { MetricCard } from "../components/MetricCard";
+import { RunwayTouchdown, projectOnRunway } from "../components/RunwayTouchdown";
 import { TrackMap } from "../components/TrackMap";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
-import type { FlightRecord, TrackData } from "../types";
+import type { AirportDetail, AirportRunway, FlightRecord, TrackData } from "../types";
 import { fmtAltitude, fmtDateTime, fmtDistance, fmtMinutes, fmtWeight, ratingLabels, statusLabels } from "../utils";
 
 const { Text } = Typography;
+
+/** 优先按跑道号匹配；没有跑道号时取与接地点横向偏移最小的跑道。 */
+function pickRunway(airport: AirportDetail | null, ident?: string | null,
+                    lat?: number | null, lon?: number | null): AirportRunway | null {
+  const runways = airport?.runways?.filter((r) => r.lat != null && r.lon != null && r.heading != null) || [];
+  if (!runways.length) return null;
+  const wanted = (ident || "").trim().toUpperCase();
+  if (wanted) {
+    const exact = runways.find((r) => (r.ident || "").trim().toUpperCase() === wanted);
+    if (exact) return exact;
+  }
+  if (lat != null && lon != null) {
+    let best: AirportRunway | null = null;
+    let bestOffset = Number.POSITIVE_INFINITY;
+    for (const r of runways) {
+      const offset = Math.abs(projectOnRunway(r, lat, lon).lateral);
+      if (offset < bestOffset) { bestOffset = offset; best = r; }
+    }
+    if (best) return best;
+  }
+  return runways[0];
+}
 
 export function LogDetail() {
   const { id } = useParams<{ id: string }>();
@@ -19,6 +42,7 @@ export function LogDetail() {
   const navigate = useNavigate();
   const [flight, setFlight] = useState<FlightRecord | null>(null);
   const [track, setTrack] = useState<TrackData | null>(null);
+  const [airport, setAirport] = useState<AirportDetail | null>(null);
   const [notes, setNotes] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -34,6 +58,16 @@ export function LogDetail() {
       setFlight(f);
       setTrack(t);
       setNotes(f.notes || "");
+      // 到达机场跑道几何（入口坐标/真航向/长度）：接地区俯视图用；无 navdata 时降级
+      if (f.arr_icao) {
+        try {
+          setAirport(await api<AirportDetail>(`/local/airports/${encodeURIComponent(f.arr_icao)}`));
+        } catch {
+          setAirport(null);
+        }
+      } else {
+        setAirport(null);
+      }
     } catch (e) {
       message.error((e as Error).message);
     } finally {
@@ -72,6 +106,7 @@ export function LogDetail() {
 
   const rating = flight.landing_rating ? ratingLabels[flight.landing_rating] : null;
   const status = statusLabels[flight.status];
+  const runway = pickRunway(airport, flight.runway_ident, flight.touchdown_lat, flight.touchdown_lon);
 
   return (
     <div className="page">
@@ -136,6 +171,30 @@ export function LogDetail() {
         ) : <Empty />}
       </Card>
 
+      <Card
+        className="panel"
+        variant="borderless"
+        title={tr("跑道接地区", "Runway touchdown")}
+        extra={runway ? <Text className="muted">{runway.ident || flight.runway_ident || ""} · {Math.round(Number(runway.length_m) || 0)} m</Text> : null}
+      >
+        {runway && flight.touchdown_lat != null && flight.touchdown_lon != null ? (
+          <RunwayTouchdown
+            runway={runway}
+            touchdownLat={flight.touchdown_lat}
+            touchdownLon={flight.touchdown_lon}
+            thresholdDistanceM={flight.threshold_distance_m}
+            centerlineOffsetM={flight.centerline_offset_m}
+            points={track?.points || []}
+            height={260}
+          />
+        ) : (
+          <Text type="secondary">
+            {tr("无跑道数据（navdata 缺失或未识别跑道号），轨迹回放不受影响",
+              "No runway data (navdata missing or runway not identified); track replay is unaffected")}
+          </Text>
+        )}
+      </Card>
+
       <Row gutter={[12, 12]}>
         <Col xs={24} lg={14}>
           <Card className="panel" variant="borderless" title={tr("飞行详情", "Flight details")} size="small">
@@ -147,6 +206,14 @@ export function LogDetail() {
               <Descriptions.Item label={tr("燃油", "Fuel")}>
                 {flight.fuel_start_kg != null ? `${fmtWeight(flight.fuel_start_kg, settings.units)} → ${fmtWeight(flight.fuel_end_kg, settings.units)}` : "—"}
                 {flight.fuel_used_kg != null ? <span className="muted"> ({fmtWeight(flight.fuel_used_kg, settings.units)})</span> : null}
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("实际 ZFW", "Actual ZFW")}>
+                {flight.actual_zfw_kg != null ? fmtWeight(flight.actual_zfw_kg, settings.units) : "—"}
+                {flight.zfw_delta_kg != null ? (
+                  <span className="muted">
+                    {" "}({flight.zfw_delta_kg > 0 ? "+" : ""}{Math.round(flight.zfw_delta_kg)} kg)
+                  </span>
+                ) : null}
               </Descriptions.Item>
               <Descriptions.Item label="AIRAC">{flight.airac || "—"}</Descriptions.Item>
               <Descriptions.Item label={tr("轨迹点", "Track points")}>{flight.track_points ?? "—"} / {tr("原始", "raw")} {(flight as unknown as { track_profile?: { raw_points?: number } }).track_profile?.raw_points ?? "—"}</Descriptions.Item>
