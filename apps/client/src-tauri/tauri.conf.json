@@ -43,10 +43,7 @@
     "longDescription": "记录 MSFS 飞行、生成航路、回放轨迹与落地评估的个人飞行助理。",
     "resources": {
       "../dist": "client",
-      "../../../packages": "packages",
-      "../../../data": "data",
-      "../../../Pre-train/src": "Pre-train/src",
-      "../../../apps/aoc-core": "aoc-core",
+      "../../../out/core/aoc-core": "aoc-core",
       "../../../apps/simlink/bin/Release/net8.0/win-x64": "simlink"
     },
     "windows": {

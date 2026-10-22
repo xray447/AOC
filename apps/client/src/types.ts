@@ -80,6 +80,8 @@ export interface AirportRunway {
   lat?: number | null;
   lon?: number | null;
   elev_ft?: number | null;
+  /** 内移入口（米）：着陆入口 = 物理入口 + 内移；旧库或缺失时为 0。 */
+  displaced_threshold_m?: number | null;
 }
 
 export interface AirportDetail extends Airport {
@@ -223,6 +225,8 @@ export interface FlightRecord {
   touchdown_lon?: number | null;
   runway_ident?: string | null;
   threshold_distance_m?: number | null;
+  /** 着陆入口内移量（米），距入口距离已扣掉这段。 */
+  displaced_threshold_m?: number | null;
   centerline_offset_m?: number | null;
   bounce_count?: number | null;
   landing_distance_m?: number | null;

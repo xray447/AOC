@@ -8,6 +8,8 @@
     <AssemblyName>aoc-simlink</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <!-- 生产启动不得弹控制台（P-11）：stdout/stderr 由父进程重定向到 logs\simlink.log -->
+    <OutputType>WinExe</OutputType>
   </PropertyGroup>
 
   <!-- SimConnect SDK：优先使用 spike 里已经验证过的托管 DLL，其次 MSFS SDK 默认路径。 -->

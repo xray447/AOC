@@ -1,0 +1,276 @@
+name: build
+
+# 云端编译与产物（TODO §5 / 08 §4 CI 构建）
+# - push（main / tag v*）、pull_request、workflow_dispatch
+# - PR 只跑 test，不产包
+# - tag 构建把 NSIS/MSI/便携 ZIP 挂到 Release
+# 约束：navdata / network.pkl / SimBrief key 不进仓库与产物；单次构建超时 45 min。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bundle:
+        description: "Tauri bundle 类型"
+        type: choice
+        default: both
+        options: [both, nsis, msi]
+      make_release:
+        description: "把安装包挂到 Release（需要 tag 或手动指定）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 静态检查 + 单测 + 前端类型/构建 + SimLink 编译
+  # ---------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python deps
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: ruff (F,E9)
+        run: python -m ruff check packages apps tests tools --select F,E9
+
+      - name: pytest
+        run: python -m pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/client/package-lock.json
+
+      - name: Client build (tsc --noEmit + vite build)
+        working-directory: apps/client
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: SimLink build
+        run: dotnet build apps/simlink -c Release
+
+  # ---------------------------------------------------------------------------
+  # 2. 自包含 aoc-core（PyInstaller onedir）
+  # ---------------------------------------------------------------------------
+  core:
+    name: core
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python deps + PyInstaller
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build aoc-core.exe (onedir)
+        run: python -X utf8 tools/build_core_exe.py --verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aoc-core-win64
+          path: out/core/aoc-core
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. 自包含 SimLink
+  # ---------------------------------------------------------------------------
+  simlink:
+    name: simlink
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish (self-contained win-x64)
+        run: >
+          dotnet publish apps/simlink -c Release -r win-x64 --self-contained true
+          -o apps/simlink/bin/Release/net8.0/win-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aoc-simlink-win64
+          path: apps/simlink/bin/Release/net8.0/win-x64
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. Tauri 安装包（NSIS / MSI）
+  # ---------------------------------------------------------------------------
+  app:
+    name: app
+    needs: [core, simlink]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aoc-core-win64
+          path: out/core/aoc-core
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aoc-simlink-win64
+          path: apps/simlink/bin/Release/net8.0/win-x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/client/package-lock.json
+
+      - name: Client deps
+        working-directory: apps/client
+        run: npm ci --no-audit --no-fund
+
+      # Windows runner 已带 MSVC / WebView2，只缺 Rust
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/client/src-tauri
+
+      - name: Resolve bundles
+        id: bundles
+        shell: pwsh
+        run: |
+          $value = "${{ inputs.bundle }}"
+          if ([string]::IsNullOrWhiteSpace($value) -or $value -eq "both") { $value = "nsis,msi" }
+          "list=$value" >> $env:GITHUB_OUTPUT
+
+      - name: Tauri build
+        working-directory: apps/client
+        run: npm run tauri build -- --bundles ${{ steps.bundles.outputs.list }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aoc-installers
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            apps/client/src-tauri/target/release/bundle/nsis/*-setup.exe
+            apps/client/src-tauri/target/release/bundle/msi/*.msi
+
+  # ---------------------------------------------------------------------------
+  # 5. 便携 ZIP（AOC-portable.exe + 自包含 core/simlink）
+  # ---------------------------------------------------------------------------
+  portable:
+    name: portable
+    needs: [core]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/client/package-lock.json
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aoc-core-win64
+          path: out/core/aoc-core
+
+      - name: Client build
+        working-directory: apps/client
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Portable zip
+        run: python -X utf8 tools/make_portable.py --no-core
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aoc-portable-win64
+          path: out/AOC-portable-*-win64.zip
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 6. Release（tag v* 或手动勾选 make_release）
+  # ---------------------------------------------------------------------------
+  release:
+    name: release
+    needs: [app, portable]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.make_release == true
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aoc-installers
+          path: dist/installers
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aoc-portable-win64
+          path: dist/portable
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: AOC ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build {0}', github.run_number) }}
+          draft: true
+          files: |
+            dist/installers/**/*-setup.exe
+            dist/installers/**/*.msi
+            dist/portable/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

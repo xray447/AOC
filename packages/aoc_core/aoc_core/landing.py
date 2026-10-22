@@ -147,6 +147,8 @@ def evaluate(points: list[dict], nav: NavData | None = None,
                     for a, b in zip(points[landing:i + 1], points[landing + 1:i + 2])) * 1852
                 break
 
+        # 着陆入口 = 物理入口 + 内移（displaced threshold）；距入口距离从着陆入口起算
+        displaced = float(runway.get("displaced_threshold_m") or 0.0) if runway else 0.0
         metrics = {
             "touchdown_vs_fpm": round(float(touchdown_vs), 1) if touchdown_vs is not None else None,
             "touchdown_g": round(touchdown_g, 2) if touchdown_g else None,
@@ -156,7 +158,8 @@ def evaluate(points: list[dict], nav: NavData | None = None,
             "touchdown_lon": float(td["lon"]),
             "runway_ident": runway["ident"] if runway else None,
             "runway_airport": runway["airport"] if runway else None,
-            "threshold_distance_m": runway["along_m"] if runway else None,
+            "threshold_distance_m": round(runway["along_m"] - displaced, 1) if runway else None,
+            "displaced_threshold_m": round(displaced, 1) if runway else None,
             "centerline_offset_m": runway["lateral_m"] if runway else None,
             "bounce_count": bounce,
             "landing_distance_m": round(landing_distance, 0) if landing_distance else None,

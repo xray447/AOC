@@ -1,65 +1,14 @@
 # TODO
 
-> 来源：2026-10-22 文档变更（运营模式 · 飞行执行 / SimBrief）。文档先改，代码已按下述条目跟进并补测试。
+> 更新：2026-10-22 文档变更（运营模式 · 飞行执行 / SimBrief）已全部落地——代码 + 测试 + 文档同步，
+> 下面只剩需要真人/干净机才能完成的验收项。
 
-## 待实现
+## 待人工验收
 
-### 1. 跑道窗口 10Hz 采样（`RUNWAY` 段）
-
-- 问题：现在 `Engine.SaveSample()` 在地面按 1Hz 保存，`track.py` 又把 on-ground 判成 `TAXI`（10s 一点）；起飞滑跑/落地滑跑的点间距 300–800m，接地区画不出连续线。
-- SimLink `apps/simlink/Engine.cs::SaveSample`：跑道窗口内改为 **0.1s**——`OnGround && 距机场 < 5NM`，或 `AGL < 100ft && 距到达机场 < 5NM`；窗口内不受 `_hz` 限制；起飞滑跑至离地、落地至 `GsKt < 40` 或离开跑道。
-- 核心 `packages/aoc_core/aoc_core/track.py`：新增 `MODE_RUNWAY`（与上面同窗口），保存间隔 **0.1s**，不抽稀；`TAXI` 只保留非跑道滑行（10s）；超预算时 `RUNWAY` 不参与 Douglas–Peucker，只压 `STRAIGHT/TAXI`。
-- 前端 `components/RunwayTouchdown.tsx`：滑跑线优先取 `RUNWAY` 段点（退化才用接地后全部点），保证线条连续。
-- 测试：`tests/test_track.py` 补「跑道段 10Hz、点间距 ≤8m、不抽稀、不计入超预算削减」；`tools/smoke_m1.py` 检查落地后 `RUNWAY` 段存在。
-- 文档已同步：`01` P-05/P-06/A-21、`02` §7.2/§7.4/§10.1、`03` §2。
-
-### 2. 跑道内移入口（displaced threshold）
-
-- 数据源：Little Navmap `runway_end.offset_threshold`（英尺）已有入口内移值，例如 KJFK 31L ≈ 1000m；当前 `aoc_navdata/navdata.py::_load_runways` 没有 SELECT 这列。
-- `aoc_navdata`：按可选列读取 `offset_threshold`，单位校准（英尺→米，取不到列/为 0 时按 0）；跑道对象增加 `displaced_threshold_m`，`length_m` 仍为物理长度。
-- `aoc_core/landing.py`：`threshold_distance_m` 以「着陆入口 = 物理入口 + 内移」为基准；`/local/airports/{icao}` 与 `/local/flights/{id}` 透出 `displaced_threshold_m`，旧库/旧数据缺失时按 0。
-- 前端 `components/RunwayTouchdown.tsx`：画物理跑道端、着陆入口、内移段（着色/斜纹），刻度从着陆入口起算；内移为 0 时布局与现在一致。
-- 测试：构造 KJFK 31L 跑道数据断言 `displaced_threshold_m ≈ 1000`；无 `offset_threshold` 列时回退 0 且不报错；`threshold_distance_m` 以着陆入口计算。
-- 文档已同步：`01` P-06/P-09、`03` §2/§6、`09` §5。
-
-### 3. 无控制台启动 + 系统托盘图标
-
-- **去掉两个命令行窗口**：
-  - Tauri `apps/client/src-tauri/src`：拉起 `aoc-core.exe`（自包含，见第 4 项）与 `aoc-simlink.exe` 时用 `CommandExt::creation_flags(CREATE_NO_WINDOW)`；stdout/stderr 重定向到 `%LOCALAPPDATA%/AOC/logs/core.log`、`simlink.log`。
-  - `apps/simlink`：csproj `<OutputType>WinExe</OutputType>`（或保留 Console 但由父进程隐藏），自身日志写文件，不依赖控制台输出。
-  - 开发脚本 `tools/dev.ps1` 保留可见控制台（调试用）；生产启动路径不得弹窗。
-- **托盘图标**：
-  - 安装版：Tauri `TrayIconBuilder`（图标 + tooltip 状态），菜单「打开客户端 / 打开日志目录 / 退出」；关闭主窗口最小化到托盘（设置可改「关闭即退出」），退出时结束两个 sidecar。
-  - 便携版：新增 `AOC-portable.exe` 启动器（.NET WinForms `NotifyIcon` 或等价实现）：无控制台拉起包内 `aoc-core.exe` 与 `aoc-simlink.exe`，健康检查通过后 `Process.Start` 默认浏览器；菜单同上。
-  - 单实例：安装版命名互斥聚焦窗口；便携版检测已有实例时只打开页面，不重复起进程。
-- **便携包调整**：`tools/make_portable.py` 产物增加 `AOC-portable.exe`；`start.bat`/`start.py` 保留排障（会显示控制台）。
-- **测试/验收**：新增 T-21 与 A-32——双击无控制台窗口、托盘出现、安装版直开窗口 / 便携版默认浏览器、退出后无残留 `aoc-core`/`aoc-simlink`。
-- 文档已同步：`01` P-11/A-32、`02` §2.1/§13.1、`08` §2/T-01/T-05/T-21、`09` §1/§4/§5、`10` §5、`README` D-29。
-
-### 4. 自包含打包（去掉 Python / .NET 依赖）
-
-- `tools/build_core_exe.py`（新增）或 `aoc-core.spec`：PyInstaller `--noconsole --onedir`，包含 `fastapi/uvicorn/pydantic/httpx/numpy/scipy/tzdata` 与 `packages/*`、`data/`、`Pre-train/src`；产物 `out/core/aoc-core.exe`，启动参数不变（`--port --token --home --static-dir`）。
-- `apps/simlink`：发布命令改 `dotnet publish -c Release -r win-x64 --self-contained true`（不要求 .NET 8）；体积增加约 60–80 MB。
-- `apps/client/src-tauri`：`bundle.resources` 从 Python 源码改为 `aoc-core.exe` 目录；`tauri.conf.json` 同步。
-- `tools/make_portable.py`：打包 `aoc-core.exe` + 自包含 SimLink，不再复制 `packages/` 源码；`smoke_portable.py` 改为直接起 exe。
-- 体积预算：PyInstaller（numpy/scipy）约 80–150 MB；NSIS/MSI 与便携 ZIP 相应变大，更新 08 的体积记录。
-- 验证：干净 Windows（无 Python/.NET/Node）跑 T-01、T-06a；`/local/health`、航路建图、SimLink 连接均正常。
-- 文档已同步：`01` P-11、`02` §7.2/§13.1、`08` §2/§4.4.1/T-01/T-06a、`09` §1/§4/§5、`10` §5、`README` D-30。
-
-### 5. GitHub Actions：云端编译与产物
-
-- 新增 `.github/workflows/build.yml`，`runs-on: windows-latest`，触发：`push`（main + tag `v*`）、`pull_request`、`workflow_dispatch`。
-- 作业拆分（可并行）：
-  - **test**：Python 3.12 + `pip install -r requirements.txt` → `pytest` + `ruff check packages apps tests tools --select F,E9`；前端 `npm ci && npm run build`（`tsc --noEmit`）；`dotnet build apps/simlink -c Release`。
-  - **core**：按 TODO §4 跑 PyInstaller 生成 `aoc-core.exe`（onedir），上传 artifact `aoc-core-win64`。
-  - **simlink**：`dotnet publish -c Release -r win-x64 --self-contained true`，上传 artifact `aoc-simlink-win64`。
-  - **app**：`npm ci` + `cargo` 缓存 + `npm run tauri build -- --bundles nsis,msi`；Windows runner 已带 MSVC/WebView2，需 `dtolnay/rust-toolchain@stable`；上传 `AOC-*-setup.exe`、`*.msi`。
-  - **portable**：下载 core/app 产物 → `tools/make_portable.py` 打包 ZIP（含 `AOC-portable.exe`）并上传。
-- Tag 构建额外用 `softprops/action-gh-release`（或 `tauri-apps/tauri-action`）把 NSIS/MSI/便携 ZIP 挂到 Release；PR 只跑 test，不产包。
-- 缓存：`actions/setup-python` 的 pip、`actions/setup-node` 的 npm、`actions/cache` 的 `~/.cargo` 与 `apps/client/src-tauri/target`、`~/.nuget/packages`。
-- 约束：不把 navdata / `network.pkl` / SimBrief key 放进仓库与产物；Windows 路径与中文编码回归；单次构建超时 45 min；artifact 保留 14 天。
-- 可选：`workflow_dispatch` 输入 `bundle=nsis|msi|both`、`make_release=true`；签名（Authenticode）留到有证书后。
-- 文档：在 `08` §4 增加「CI 构建」小节与徽章；`README` 补构建状态。
+- **T-21 / A-32**（安装版 + 便携版）：双击无控制台窗口、托盘出现、安装版直开窗口 / 便携版默认浏览器、关闭窗口最小化到托盘、托盘「退出」后无残留 `aoc-core` / `aoc-simlink`。
+- **T-01 / T-06a**（干净 Windows，无 Python / .NET / Node）：用 `out/AOC-0.1.0-x64-setup.exe` / `*.msi` / `AOC-portable-*-win64.zip` 各跑一次。
+- **体积实测**：自包含改造后 `out/AOC-portable-*-win64.zip`、NSIS/MSI 重新生成，把实测值回填 `08` §2 / §4.4（`aoc-core` onedir 已实测 134 MB）。
+- **Authenticode 签名**：等证书。
 
 ## 已完成（代码 + 文档）
 
@@ -111,3 +60,51 @@
 - 数据：`GET /local/flights/{id}` 的 `touchdown_lat/lon`、`threshold_distance_m`、`centerline_offset_m`、`runway_ident`；`/track` 取接地后的点；`GET /local/airports/{arr_icao}` 的跑道几何新增 `lat`/`lon`/`elev_ft`（入口坐标 + 真航向 + 长度）。
 - 兜底：无 navdata 或 `runway_ident` 为空/未匹配时显示「无跑道数据」，不影响主地图轨迹。
 - 验收：`A-31`（落地后打开日志详情即见俯视图）。
+
+### 8. 跑道窗口 10Hz 采样（`RUNWAY` 段）
+
+- SimLink `Engine.cs::SaveSample`：新增 `InRunwayWindow()`——`OnGround && GsKt >= 40`，或 `!OnGround && AGL < 100ft`（无导航库，用它近似「距机场 < 5NM」），窗口内间隔 **0.1s**、不受 `_hz` 限制；起飞滑跑至离地、落地至 `GsKt < 40` 自然收尾。SimConnect 用 `SIM_FRAME` 逐帧回调，10Hz 有数据来源。
+- 核心 `track.py`：新增 `MODE_RUNWAY` 与 `runway_window()`（同口径），`interval_s[RUNWAY]=0.1`，`select_saved()` 对 RUNWAY 段**逐点保存、不抽稀**；`TAXI` 仍只保留非跑道滑行（10s）。`detect_mode()` 把跑道窗口放在进近/转弯判定之前。
+- **BIN_V2**：`dt` 由「整秒 1 字节」改成「0.1s 2 字节」（`<HiiiHHhHh`），否则 0.1s 采样时间戳全退化成 0；`write_chunks` 默认写 `BIN_V2`，`decode_points/decode_chunks` 按 chunk 的 `encoding` 兼容解码旧 `BIN_V1`。`track_profile.encoding` 与 `/track` 的 `encoding` 同步。
+- 前端 `RunwayTouchdown.tsx`：滑跑线优先取 `mode === "RUNWAY"` 的点（至少 2 点），退化才用接地后全部点。
+- 测试：`tests/test_track.py::test_runway_window_covers_roll_and_low_altitude` / `test_runway_segment_is_10hz_and_not_thinned`（10Hz、点间距 ≤8m、不抽稀）/ `test_bin_v2_keeps_sub_second_timestamps`；`tools/smoke_m1.py` 断言落地后存在 `RUNWAY` 段。
+- 文档：`01` P-05/P-06/A-21、`02` §7.2/§7.4/§10.1、`03` §2。
+
+### 9. 跑道内移入口（displaced threshold）
+
+- `aoc_navdata/navdata.py::_load_runways`：按可选列读取 `runway_end.offset_threshold`，用「跑道两端坐标反推长度」的比例判断该库长度类字段是英尺还是米（`_raw_length_is_feet`），英尺 → 米；缺列/0/异常一律按 0。跑道对象新增 `displaced_threshold_m`，`length_m` 仍是物理长度。
+- `aoc_core/landing.py`：`threshold_distance_m = along_m − displaced_threshold_m`（着陆入口 = 物理入口 + 内移），并回写 `displaced_threshold_m`。
+- 数据/接口：`flight_record.displaced_threshold_m`（老库自动补列）、`/local/airports/{icao}` 的每条跑道带 `displaced_threshold_m`、`GET /local/flights/{id}` 透出同名字段；`nav.find_runway()` 返回值也带该字段。
+- 前端 `RunwayTouchdown.tsx`：画物理跑道端、着陆入口、内移段（斜纹着色），刻度/「距入口」从着陆入口起算；内移为 0 时布局与之前一致。
+- 测试：`tests/test_landing.py::test_displaced_threshold_read_from_navdata`（KJFK 31L ≈ 1000 m，物理长度不变）、`::test_missing_offset_column_falls_back_to_zero`、`::test_threshold_distance_measured_from_displaced_threshold`（接地在 1200 m → 距着陆入口 200 m）。
+
+### 10. 无控制台启动 + 系统托盘图标
+
+- Tauri 外壳 `apps/client/src-tauri/src/main.rs`：release 构建给 `aoc-core` / `aoc-simlink` 子进程加 `CREATE_NO_WINDOW`（`CommandExt::creation_flags`），stdout/stderr 重定向到 `%LOCALAPPDATA%/AOC/logs/core.log`、`simlink.log`；debug 构建保留控制台。
+- 托盘：`tauri = { features = ["tray-icon"] }` + `TrayIconBuilder`（窗口图标 + tooltip），菜单「打开客户端 / 打开日志目录 / 退出」；左键点托盘聚焦窗口；退出时结束两个 sidecar。关闭主窗口改为 `prevent_close()` + `hide()`（最小化到托盘）。
+- 单实例：启动时绑定固定回环端口作为实例锁，已有实例则直接退出，不重复起 sidecar。
+- `apps/simlink/AocSimLink.csproj`：`<OutputType>WinExe</OutputType>`（自身不弹控制台；日志由父进程重定向）。
+- 便携版：新增 `tools/portable-launcher`（`AOC-portable.exe`，纯 Win32 P/Invoke 托盘，**不依赖 WinForms/WPF**，自包含单文件约 14 MB）：无控制台拉起包内 `aoc-core.exe` + `aoc-simlink.exe`，健康检查（`/local/health`）通过后打开默认浏览器，菜单同上，命名互斥单实例，退出时结束子进程。子进程挂在 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）上，启动器被任务管理器强杀也不会留残留进程；`Shell_NotifyIcon` 失败会写 `logs/launcher.log`（Win32 错误码）。
+- 注意：`out/core/aoc-core/aoc-core.exe` 只是 API sidecar（无托盘、无界面），托盘在 `AOC-portable.exe` 与新构建的 Tauri 安装包里；Win11 默认把新托盘图标收进 `^` 溢出区。
+- `tools/make_portable.py`：产物带 `AOC-portable.exe`，`start.bat`/`start.py` 保留为排障入口（会显示控制台，优先用包内 exe）。
+- 顺带修掉冻结版的启动崩溃：`--noconsole` 下 `sys.stdout/stderr is None`，`uvicorn` 的 formatter 会 `AttributeError: 'NoneType' object has no attribute 'isatty'` 并以「Unable to configure formatter 'default'」退出；`main.py::_ensure_streams()` 先把它们接到 `logs/stdout.log`、`logs/stderr.log`。同时捕获 `KeyboardInterrupt` / 其它异常写日志退出，避免冻结版弹 traceback 对话框。
+- 验证：`cargo check --offline`（含 tray-icon）通过；打包版 `aoc-core.exe` 实测 `/local/health` 0.5s 内 200、退出无残留。
+- 待人工：T-21 / A-32。文档：`01` P-11/A-32、`02` §2.1/§13.1、`08` §2/T-01/T-05/T-21、`09` §1/§4/§5、`10` §5、`README` D-29。
+
+### 11. 自包含打包（去掉 Python / .NET 依赖）
+
+- 新增 `tools/build_core_exe.py`：PyInstaller `--noconsole --onedir`，`--paths` 带 `packages/*`，`--add-data data;data` 与 `Pre-train/src;Pre-train/src`，hidden import `numpy/scipy`、`--collect-submodules uvicorn`、`--collect-all tzdata`，并 `--exclude-module torch/pandas/PIL/matplotlib/...`（打包机上的无关大件）。产物 `out/core/aoc-core/aoc-core.exe`（onedir，**实测 134 MB**），参数不变（`--port --token --home --static-dir`）。`--verify` 跑一次 `aoc-core.exe --help`。
+- 新增 `apps/aoc-core/entry.py`：冻结后先把 `AOC_ROOT` 指向 `_MEIPASS`，再调 `main.main()`；`main.py` / `aoc_core.service` / `aoc_route.graph` / `aoc_route.aip` 的 `ROOT` 改为「`AOC_ROOT` → 冻结 `_MEIPASS` → `__file__` 层级」三级解析。
+- `apps/simlink`：发布命令改 `--self-contained true`（不要求 .NET 8）。
+- `apps/client/src-tauri/tauri.conf.json`：`bundle.resources` 从 Python 源码改为 `{ "../dist": "client", "../../../out/core/aoc-core": "aoc-core", "simlink": ... }`；`main.rs` 增加 `resource_dir/aoc-core/aoc-core.exe` 启动分支（仍保留源码 python 回退给开发用）。
+- `tools/make_portable.py`：打包 `aoc-core/` + 自包含 SimLink + `AOC-portable.exe`，不再复制 `packages/` 源码；`start.py` 优先起 exe。
+- `tools/build.ps1`：新增 `aoc-core self-contained (PyInstaller)` 步骤（`-SkipCore` 可跳过），SimLink 改自包含，`-Clean` 清 `out/core`。
+- 文档：`08` §2/§4.4/§4.4.1、`README` D-30。
+
+### 12. GitHub Actions：云端编译与产物
+
+- 新增 `.github/workflows/build.yml`：`windows-latest`，触发 `push`（main + tag `v*`）/`pull_request`/`workflow_dispatch`（`bundle=nsis|msi|both`、`make_release`），`concurrency` 去重，`timeout-minutes: 45`。
+- 作业：`test`（ruff F,E9 + pytest + `npm ci && npm run build`（含 `tsc --noEmit`）+ `dotnet build`；PR 只跑它）→ `core`（`tools/build_core_exe.py --verify` → artifact `aoc-core-win64`）、`simlink`（自包含 publish → `aoc-simlink-win64`）→ `app`（下载两个产物到资源目录 + `dtolnay/rust-toolchain@stable` + `Swatinem/rust-cache` → `npm run tauri build -- --bundles ...` → `aoc-installers`）、`portable`（下载 core + 前端构建 → `tools/make_portable.py --no-core` → `aoc-portable-win64`）→ `release`（tag 或 `make_release` 时 `softprops/action-gh-release` 出草稿 Release）。
+- 缓存：pip / npm / cargo（`apps/client/src-tauri`）/ NuGet；artifact `retention-days: 14`。
+- 约束：navdata / `network.pkl` / SimBrief key 不进仓库与产物；签名等有证书再补。
+- 文档：`08` §4.7「CI 构建」、`README` 构建状态徽章。

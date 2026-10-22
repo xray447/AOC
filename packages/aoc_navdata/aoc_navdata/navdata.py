@@ -187,9 +187,12 @@ class NavData:
             return
         length_expr = "r.length" if "length" in rcols else "null"
         ils_expr = "r.has_ils" if "has_ils" in rcols else ("r.ils" if "ils" in rcols else "null")
+        # 内移入口（displaced threshold）：Little Navmap 的 runway_end.offset_threshold（英尺）
+        offset_expr = "re.offset_threshold" if "offset_threshold" in ecols else "null"
         sql = (
             "select a.ident as airport, re.name as name, re.heading as heading, re.laty as lat, "
-            f"re.lonx as lon, re.altitude as elev, {length_expr} as length, {ils_expr} as ils "
+            f"re.lonx as lon, re.altitude as elev, {length_expr} as length, {ils_expr} as ils, "
+            f"{offset_expr} as offset_threshold "
             "from runway r join runway_end re "
             "on re.runway_end_id in (r.primary_end_id, r.secondary_end_id) "
             "join airport a on a.airport_id = r.airport_id where a.ident is not null"
@@ -206,12 +209,27 @@ class NavData:
                 "lon": row["lon"],
                 "elev_ft": row["elev"],
                 "length_raw": row["length"],
+                "offset_threshold_raw": row["offset_threshold"],
                 "ils": bool(row["ils"]) if row["ils"] is not None else None,
             })
-        # 跑道长度：优先 runway.length，否则由反向跑道端反推
+        # 跑道长度：优先 runway.length，否则由反向跑道端反推；内移入口按同一单位口径换算
         for ends in self._runways.values():
             for end in ends:
                 end["length_m"] = self._runway_length_m(end, ends)
+                end["displaced_threshold_m"] = self._displaced_threshold_m(end, ends)
+
+    def _raw_length_is_feet(self, end: dict, ends: list[dict]) -> bool | None:
+        """用两端坐标反推的几何长度判断该库的长度类字段是英尺还是米。"""
+        geo = self._runway_geo_length_m(end, ends)
+        raw = end.get("length_raw")
+        if not raw or not geo or not (300.0 < geo < 20000.0):
+            return None
+        ratio = float(raw) / geo
+        if 2.5 <= ratio <= 4.5:
+            return True
+        if 0.8 <= ratio <= 1.25:
+            return False
+        return None
 
     def _runway_length_m(self, end: dict, ends: list[dict]) -> float | None:
         geo = self._runway_geo_length_m(end, ends)
@@ -221,15 +239,28 @@ class NavData:
             # runway.length 的单位因数据源而异（Little Navmap/Navigraph 用英尺）。
             # 用两端坐标反推的几何长度做比例校准，避免按绝对值猜单位：
             # 短跑道（如 1200 m = 3937 ft）会被"大于 5000 才当英尺"的阈值误判成 3937 m。
-            if geo and 300.0 < geo < 20000.0:
-                ratio = value / geo
-                if 2.5 <= ratio <= 4.5:
-                    return round(value / FT_PER_M, 1)
-                if 0.8 <= ratio <= 1.25:
-                    return round(value, 1)
+            feet = self._raw_length_is_feet(end, ends)
+            if feet is True:
+                return round(value / FT_PER_M, 1)
+            if feet is False:
+                return round(value, 1)
             # 没有可用几何参照时的兜底：米制跑道极少超过 6000 m
             return round(value / FT_PER_M, 1) if value > 5000 else round(value, 1)
         return round(geo, 1) if geo else None
+
+    def _displaced_threshold_m(self, end: dict, ends: list[dict]) -> float:
+        """内移入口（米）。缺失列 / 0 / 无法解析时按 0，旧库不受影响。"""
+        raw = end.get("offset_threshold_raw")
+        try:
+            value = float(raw or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if value <= 0:
+            return 0.0
+        feet = self._raw_length_is_feet(end, ends)
+        if feet is None:
+            feet = value > 500  # 内移入口极少超过 500m
+        return round(value / FT_PER_M if feet else value, 1)
 
     def _runway_geo_length_m(self, end: dict, ends: list[dict]) -> float | None:
         recip = reciprocal_name(end["name"])
@@ -384,6 +415,8 @@ class NavData:
                     "distance_nm": round(dist, 3), "heading_diff_deg": round(diff, 1),
                     "along_m": round(fix[0], 1), "lateral_m": round(fix[1], 1),
                     "length_m": rwy.get("length_m"), "ils": rwy.get("ils"),
+                    # 沿跑道方向从物理入口量起；着陆入口 = 物理入口 + 内移
+                    "displaced_threshold_m": rwy.get("displaced_threshold_m") or 0.0,
                 }
                 score = diff + dist * 5
                 if best is None or score < best["_score"]:

@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace AocSimLink;
 
 /// <summary>
-/// 飞行状态机 + 本地队列。SimLink 只负责采集、自动起降、按 1Hz/2Hz 保存；
+/// 飞行状态机 + 本地队列。SimLink 只负责采集、自动起降、按 1Hz/2Hz（跑道窗口 0.1s）保存；
 /// 落地指标、轨迹分段与日志由 aoc-core 处理。
 /// </summary>
 public sealed class Engine : IDisposable
@@ -321,10 +321,20 @@ public sealed class Engine : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// 跑道窗口（P-05/P-06）：地面上 GS &gt;= 40kt（起飞滑跑 / 落地滑跑），或空中 AGL &lt; 100ft。
+    /// SimLink 没有导航库，用这个近似代替「距机场 &lt; 5NM」；窗口内按 0.1s 保存，
+    /// 否则接地区画不出连续滑跑线。
+    /// </summary>
+    private static bool InRunwayWindow(Sample s) =>
+        s.OnGround ? s.GsKt >= 40.0 : s.AglFt < 100.0;
+
     private void SaveSample(Sample s)
     {
         var t = Math.Max(0, s.T - _recStartT);
-        double interval = s.AglFt < 3000 && !s.OnGround ? 0.5 : 1.0 / Math.Max(0.5, _hz);
+        double interval = InRunwayWindow(s)
+            ? 0.1
+            : (s.AglFt < 3000 && !s.OnGround ? 0.5 : 1.0 / Math.Max(0.5, _hz));
         if (t < _nextSampleT) return;
         _nextSampleT = t + interval;
         var saved = new Sample

@@ -1,6 +1,8 @@
-"""便携包启动器（打包为 start.py）。
+"""便携包排障启动器（打包为 start.py，会显示控制台）。
 
-不使用 cmd 的 `start` 内建命令：先拉起 SimLink（可选），再启动 aoc-core。
+正常使用请双击 `AOC-portable.exe`（托盘 + 无控制台 + 默认浏览器）。
+这个脚本只在排障时用：同样优先起包内自包含的 `aoc-core\\aoc-core.exe`，
+缺少 exe 时退回 Python 源码（要求本机有 Python 3.10+）。
 """
 from __future__ import annotations
 
@@ -32,9 +34,13 @@ def main() -> int:
     else:
         print("未找到 apps/simlink/aoc-simlink.exe，遥测功能不可用。")
 
-    core = ROOT / "apps" / "aoc-core" / "main.py"
-    cmd = [sys.executable, "-X", "utf8", str(core), "--port", "0", "--home", str(home),
-           "--static-dir", str(ROOT / "app"), "--open"]
+    core_exe = ROOT / "aoc-core" / "aoc-core.exe"
+    if core_exe.exists():
+        cmd = [str(core_exe)]
+    else:
+        print("未找到 aoc-core/aoc-core.exe，退回 Python 源码（需要 Python 3.10+）。")
+        cmd = [sys.executable, "-X", "utf8", str(ROOT / "apps" / "aoc-core" / "main.py")]
+    cmd += ["--port", "0", "--home", str(home), "--static-dir", str(ROOT / "app"), "--open"]
     try:
         return subprocess.call(cmd)
     except KeyboardInterrupt:

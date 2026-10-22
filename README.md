@@ -4,6 +4,14 @@
 单机运营模式（M2）：机队 → 航线/班期 → 抽班/自由飞 → 配载 → 结算 → 账本，外加应用内「运营规则」与复核队列；**无服务端、无账号、可断网**。
 联机模式（M3）：`aoc-server`（FastAPI + PostgreSQL/SQLite）+ 账号/公司/角色/邀请码 + 并发锁 + 离线补传 + 独立网页管理端（`apps/admin-web`）；桌面客户端新增「联机模式」入口。
 
+## 构建状态
+
+[![build](https://github.com/OWNER/REPO/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/build.yml)
+
+CI（`.github/workflows/build.yml`，windows-latest）跑 `ruff` + `pytest` + 前端 `tsc --noEmit` + `dotnet build`，
+并产出 `aoc-core-win64`、`aoc-simlink-win64`、Tauri NSIS/MSI（`aoc-installers`）与便携 ZIP（`aoc-portable-win64`）；
+tag `v*` 时自动挂到 Release。本地等价流程见 `docs/08-便携包与测试清单.md` §4.4–§4.7。
+
 ## 快速开始
 
 ### 联机模式（M3，推荐先看）

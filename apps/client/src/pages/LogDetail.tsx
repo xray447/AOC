@@ -184,6 +184,7 @@ export function LogDetail() {
             touchdownLon={flight.touchdown_lon}
             thresholdDistanceM={flight.threshold_distance_m}
             centerlineOffsetM={flight.centerline_offset_m}
+            displacedThresholdM={flight.displaced_threshold_m ?? runway.displaced_threshold_m ?? 0}
             points={track?.points || []}
             height={260}
           />

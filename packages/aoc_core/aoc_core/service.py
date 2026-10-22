@@ -47,7 +47,20 @@ from .simlink import SimLinkClient
 from .stats import compute_stats
 from .track import decode_chunks
 
-ROOT = Path(__file__).resolve().parents[3]
+def _resolve_root() -> Path:
+    """仓库布局 / PyInstaller onedir 都能定位 `data`、`Pre-train`（D-30）。"""
+    import os
+    import sys
+
+    env = os.environ.get("AOC_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).parent)))
+    return Path(__file__).resolve().parents[3]
+
+
+ROOT = _resolve_root()
 log = logging.getLogger("aoc-core")
 
 
@@ -348,6 +361,8 @@ class PersonalService:
                 "length_m": r.get("length_m"), "ils": r.get("ils"),
                 # 入口坐标（跑道接地区俯视图要用）：阈值端经纬度 + 标高
                 "lat": r.get("lat"), "lon": r.get("lon"), "elev_ft": r.get("elev_ft"),
+                # 内移入口（米）；旧库没有该列时为 0
+                "displaced_threshold_m": r.get("displaced_threshold_m") or 0.0,
             } for r in runways],
         }
 
@@ -434,11 +449,15 @@ class PersonalService:
         chunks = self.db.list_chunks(flight_id)
         points, segments = decode_chunks(chunks, self.paths)
         flight = self.db.get_flight(flight_id) or {}
+        # 一条记录里可能混着 BIN_V1（旧）与 BIN_V2（跑道 10Hz）段
+        encodings = {(c.get("encoding") or "BIN_V1") for c in chunks}
+        encoding = encodings.pop() if len(encodings) == 1 else ("MIXED" if encodings else "BIN_V2")
         return {
             "flight_id": flight_id, "points": points, "segments": segments,
             "events": self.db.list_events(flight_id),
             "total_points": len(points), "raw_points": (flight.get("track_profile") or {}).get("raw_points"),
-            "fidelity_m": flight.get("track_fidelity_m"), "encoding": "BIN_V1",
+            "fidelity_m": flight.get("track_fidelity_m"),
+            "encoding": encoding,
         }
 
     def delete_flight(self, flight_id: str) -> bool:

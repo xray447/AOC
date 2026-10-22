@@ -6,6 +6,8 @@ interface Props {
   touchdownLon?: number | null;
   thresholdDistanceM?: number | null;
   centerlineOffsetM?: number | null;
+  /** 内移入口（米）：着陆入口 = 物理入口 + 内移；0/缺省时与物理入口重合。 */
+  displacedThresholdM?: number | null;
   points?: TrackPoint[];
   height?: number;
 }
@@ -38,16 +40,26 @@ function runwayLength(runway: AirportRunway): number {
   return Number.isFinite(len) && len > 200 ? len : 3000;
 }
 
+/** 内移入口不会超过跑道的一半，脏数据也不至于把图压没。 */
+function displacedLength(runway: AirportRunway, length: number, explicit?: number | null): number {
+  const raw = Number(explicit ?? runway.displaced_threshold_m ?? 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(raw, length * 0.5);
+}
+
 /**
- * 跑道接地区俯视图：跑道轮廓/中线/入口 + 接地点 + 接地后滑跑轨迹 + 距入口/中心线偏移。
+ * 跑道接地区俯视图：跑道轮廓/中线 + 物理入口 + 着陆入口（内移段着色）+ 接地点
+ * + 接地后滑跑轨迹（优先用 RUNWAY 段 10Hz 点）+ 距入口/中心线偏移。
  * 横向按米单独缩放（默认放大 1.6×），纵向为真实比例，图中标注了横向放大倍数。
  */
 export function RunwayTouchdown({
-  runway, touchdownLat, touchdownLon, thresholdDistanceM, centerlineOffsetM, points = [], height = 260,
+  runway, touchdownLat, touchdownLon, thresholdDistanceM, centerlineOffsetM,
+  displacedThresholdM, points = [], height = 260,
 }: Props) {
   if (!runway || runway.lat == null || runway.lon == null) return null;
   const hasTouchdown = touchdownLat != null && touchdownLon != null;
   const length = runwayLength(runway);
+  const displaced = displacedLength(runway, length, displacedThresholdM);
   const width = 960;
   const padX = 56;
   const centerY = height / 2;
@@ -57,8 +69,10 @@ export function RunwayTouchdown({
     ? projectOnRunway(runway, touchdownLat as number, touchdownLon as number)
     : null;
 
-  // 接地后的滑跑轨迹：从最接近接地点的采样点开始，取跑道附近的点
-  const projected = points.map((p) => ({ t: p.t, ...projectOnRunway(runway, p.lat, p.lon) }));
+  // 接地后的滑跑轨迹：跑道段（10Hz）优先，退化时才用接地后全部点
+  const runwayPoints = points.filter((p) => p.mode === "RUNWAY");
+  const sourcePoints = runwayPoints.length >= 2 ? runwayPoints : points;
+  const projected = sourcePoints.map((p) => ({ t: p.t, ...projectOnRunway(runway, p.lat, p.lon) }));
   let start = 0;
   if (hasTouchdown && projected.length) {
     let best = Number.POSITIVE_INFINITY;
@@ -88,23 +102,41 @@ export function RunwayTouchdown({
     .map((p, i) => `${i === 0 ? "M" : "L"}${x(p.along).toFixed(1)},${y(p.lateral).toFixed(1)}`)
     .join(" ");
 
-  const tdAlong = td ? td.along : thresholdDistanceM ?? null;
+  // 距入口距离以着陆入口（物理入口 + 内移）为基准
+  const tdAlong = td ? td.along - displaced : thresholdDistanceM ?? null;
   const tdLateral = td ? td.lateral : centerlineOffsetM ?? null;
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height} role="img"
       aria-label="Runway touchdown view">
+      <defs>
+        <pattern id="aoc-displaced-hatch" width="8" height="8" patternUnits="userSpaceOnUse"
+          patternTransform="rotate(45)">
+          <line x1={0} y1={0} x2={0} y2={8} stroke="currentColor" strokeOpacity={0.45} strokeWidth={2} />
+        </pattern>
+      </defs>
+
+      {/* 跑道轮廓（物理长度） */}
       <rect x={x(0)} y={y(-halfWidthM)} width={x(length) - x(0)}
         height={y(halfWidthM) - y(-halfWidthM)}
         fill="currentColor" fillOpacity={0.08} stroke="currentColor" strokeOpacity={0.35} />
+      {/* 内移段（不可用着陆区） */}
+      {displaced > 0 ? (
+        <rect x={x(0)} y={y(-halfWidthM)} width={x(displaced) - x(0)}
+          height={y(halfWidthM) - y(-halfWidthM)} fill="url(#aoc-displaced-hatch)" fillOpacity={0.25} />
+      ) : null}
       {/* 中线 */}
       <line x1={x(0)} y1={centerY} x2={x(length)} y2={centerY}
         stroke="currentColor" strokeOpacity={0.5} strokeDasharray="10 8" />
-      {/* 入口（阈值） */}
+      {/* 物理入口 */}
       <line x1={x(0)} y1={y(-halfWidthM)} x2={x(0)} y2={y(halfWidthM)}
-        stroke="currentColor" strokeOpacity={0.8} strokeWidth={2.5} />
-      <text x={x(0)} y={y(-halfWidthM) - 8} fontSize={12} fill="currentColor" fillOpacity={0.75}>
-        {runway.ident || "RWY"} 入口
+        stroke="currentColor" strokeOpacity={displaced > 0 ? 0.45 : 0.8} strokeWidth={2.5} />
+      {/* 着陆入口（内移后） */}
+      <line x1={x(displaced)} y1={y(-halfWidthM)} x2={x(displaced)} y2={y(halfWidthM)}
+        stroke="currentColor" strokeOpacity={0.85} strokeWidth={2.5} />
+      <text x={x(displaced)} y={y(-halfWidthM) - 8} fontSize={12} fill="currentColor" fillOpacity={0.75}>
+        {runway.ident || "RWY"} {displaced > 0 ? "着陆入口" : "入口"}
+        {displaced > 0 ? `（内移 ${Math.round(displaced)} m）` : ""}
       </text>
       <text x={x(length)} y={y(-halfWidthM) - 8} fontSize={12} textAnchor="end"
         fill="currentColor" fillOpacity={0.6}>
@@ -129,12 +161,13 @@ export function RunwayTouchdown({
       ) : null}
 
       {tdAlong != null ? (
-        <line x1={x(0)} y1={centerY} x2={x(tdAlong)} y2={centerY}
+        <line x1={x(displaced)} y1={centerY} x2={x(displaced + tdAlong)} y2={centerY}
           stroke="#fa541c" strokeOpacity={0.45} strokeWidth={1} />
       ) : null}
 
       <text x={padX} y={height - 12} fontSize={11} fill="currentColor" fillOpacity={0.55}>
-        横向放大 {exaggeration.toFixed(1)}×（纵向真实比例）· 距入口 {tdAlong != null ? `${Math.round(tdAlong)} m` : "—"}
+        横向放大 {exaggeration.toFixed(1)}×（纵向真实比例）· 距{displaced > 0 ? "着陆" : ""}入口{" "}
+        {tdAlong != null ? `${Math.round(tdAlong)} m` : "—"}
         {" · "}中心线偏移 {tdLateral != null ? `${tdLateral > 0 ? "+" : ""}${tdLateral.toFixed(1)} m` : "—"}
       </text>
     </svg>

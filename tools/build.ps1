@@ -35,6 +35,10 @@
 .PARAMETER SkipClient
     Skip the React SPA build.
 
+.PARAMETER SkipCore
+    Skip the self-contained aoc-core.exe (PyInstaller) build. Note that the
+    Tauri bundle and the portable zip both point at out/core/aoc-core.
+
 .PARAMETER SkipAdmin
     Skip the admin web build.
 
@@ -78,6 +82,7 @@ param(
     [switch]$Reinstall,
     [switch]$SkipPythonDeps,
     [switch]$SkipClient,
+    [switch]$SkipCore,
     [switch]$SkipAdmin,
     [switch]$SkipSimlink,
     [switch]$SkipTauri,
@@ -269,6 +274,7 @@ try {
                 "apps/client/dist",
                 "apps/admin-web/dist",
                 "apps/client/src-tauri/target/release/bundle",
+                "out/core",
                 "out/AOC-portable-$Version",
                 ".pytest_cache",
                 ".ruff_cache"
@@ -307,6 +313,21 @@ try {
         }
     }
 
+    if (-not $SkipCore) {
+        Invoke-Step "aoc-core self-contained (PyInstaller onedir)" {
+            if (-not (Test-PythonModule "PyInstaller")) {
+                Write-Host "  PyInstaller 未安装，尝试安装…" -ForegroundColor Yellow
+                Invoke-Native $PythonExe @("-m", "pip", "install", "pyinstaller")
+            }
+            Invoke-Native $PythonExe @("-X", "utf8", "tools/build_core_exe.py", "--verify")
+            $coreExe = Join-Path $Root "out/core/aoc-core/aoc-core.exe"
+            if (-not (Test-Path $coreExe)) {
+                throw "expected $coreExe - the Tauri bundle resources point at out/core/aoc-core"
+            }
+            Add-Produced "out/core/aoc-core"
+        }
+    }
+
     if (-not $SkipAdmin) {
         Invoke-Step "Admin web (apps/admin-web)" {
             Invoke-NodeBuild "apps/admin-web"
@@ -320,11 +341,12 @@ try {
     if (-not $SkipSimlink) {
         Invoke-Step "SimLink (.NET 8 publish)" {
             $publishDir = Join-Path $Root "apps/simlink/bin/Release/net8.0/win-x64"
+            # 自包含：目标机器不需要 .NET 8 运行时（体积 +60~80 MB，见 08 §4.4.1）
             Invoke-Native "dotnet" @(
                 "publish", "apps/simlink",
                 "-c", "Release",
                 "-r", "win-x64",
-                "--self-contained", "false",
+                "--self-contained", "true",
                 "-o", $publishDir
             )
             $exe = Join-Path $publishDir "aoc-simlink.exe"
@@ -344,6 +366,10 @@ try {
             $simlinkExe = Join-Path $Root "apps/simlink/bin/Release/net8.0/win-x64/aoc-simlink.exe"
             if (-not (Test-Path $simlinkExe)) {
                 Write-Host "  WARNING: simlink publish folder missing, tauri bundle resources may fail" -ForegroundColor Yellow
+            }
+            $coreExe = Join-Path $Root "out/core/aoc-core/aoc-core.exe"
+            if (-not (Test-Path $coreExe)) {
+                Write-Host "  WARNING: out/core/aoc-core/aoc-core.exe missing, run without -SkipCore" -ForegroundColor Yellow
             }
 
             $bundleList = @($Bundles.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })

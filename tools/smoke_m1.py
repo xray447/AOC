@@ -116,6 +116,8 @@ def main() -> int:
         assert flight["track_points"] > 0
         track = get(f"{base}/local/flights/{flight['id']}/track", token)
         assert track["points"], track
+        runway_segments = [s for s in track["segments"] if s["mode"] == "RUNWAY"]
+        assert runway_segments, f"落地后缺少 RUNWAY 段：{[s['mode'] for s in track['segments']]}"
         gpx = urlopen(Request(f"{base}/local/flights/{flight['id']}/export?format=gpx",
                               headers={"X-AOC-Token": token}), timeout=10).read().decode()
         assert "<gpx" in gpx and "<trkpt" in gpx

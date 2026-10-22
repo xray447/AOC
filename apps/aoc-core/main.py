@@ -30,7 +30,13 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 
 def _find_root(start: Path) -> Path:
-    """兼容两种布局：仓库 apps/aoc-core/main.py 与 Tauri resources/aoc-core/main.py。"""
+    """兼容三种布局：仓库源码、Tauri resources/aoc-core、PyInstaller onedir（D-30）。"""
+    env = os.environ.get("AOC_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    if getattr(sys, "frozen", False):
+        # PyInstaller 6：--onedir 的 data/ 与 Pre-train/ 都在 _internal（_MEIPASS）下
+        return Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).parent)))
     for parent in (start, *start.parents):
         if (parent / "packages" / "aoc_core").is_dir():
             return parent
@@ -752,6 +758,22 @@ def _write_runtime(paths: AppPaths, port: int, token: str, simlink: dict | None)
     paths.runtime.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _ensure_streams(logs_dir: Path) -> None:
+    """可执行版（PyInstaller --noconsole）没有 stdout/stderr。
+
+    没有真流时 `uvicorn` 的 formatter 会在 `sys.stdout.isatty()` 上抛
+    AttributeError（Unable to configure formatter 'default'），日志与
+    `print(..., file=sys.stderr)` 也会失效。这里把它们接到 logs 目录。
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is not None:
+            continue
+        try:
+            setattr(sys, name, open(logs_dir / f"{name}.log", "a", encoding="utf-8", buffering=1))
+        except OSError:
+            pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AOC core sidecar")
     parser.add_argument("--home", default=None, help="数据目录（默认 %%LOCALAPPDATA%%/AOC）")
@@ -765,6 +787,7 @@ def main() -> int:
 
     home = Path(args.home) if args.home else None
     paths = AppPaths.create(home)
+    _ensure_streams(paths.logs)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -790,7 +813,17 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
     log.info("AOC core %s listening on http://127.0.0.1:%s (home=%s)", __version__, port, paths.home)
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    except KeyboardInterrupt:
+        # 退出（Ctrl+C / 父进程关闭窗口）不是错误：PyInstaller --noconsole 版
+        # 未捕获的 KeyboardInterrupt 会弹一个 traceback 对话框。
+        return 0
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - 冻结版要留日志而不是弹框
+        log.exception("aoc-core 异常退出: %s", exc)
+        return 1
     return 0
 
 

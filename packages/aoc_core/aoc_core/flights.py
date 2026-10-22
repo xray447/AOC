@@ -426,11 +426,12 @@ class FlightService:
         block_minutes = round(((result.get("block_on_t") or 0) - (result.get("block_off_t") or 0)) / 60.0, 1)
         anomalies = self._anomalies(points)
         profile = {
-            "profile": "adaptive_v2", "base_hz": 1, "encoding": "BIN_V1",
+            "profile": "adaptive_v2", "base_hz": 1, "encoding": "BIN_V2",
             "max_gap_s": cfg.max_gap_s, "straight_interval_s": 20, "turn_interval_s": 2,
             "turn_threshold_deg_s": cfg.turn_enter_dps, "turn_exit_deg_s": 1.5,
             "climb_descent_interval_s": 5, "taxi_interval_s": 10,
-            "approach_hz": 1, "target_size_kb": 500, "fidelity_m": 30,
+            "approach_hz": 1, "runway_hz": 10,
+            "target_size_kb": 500, "fidelity_m": 30,
             "raw_points": len(points), "saved_points": len(saved), "segments": len(segments),
         }
         update: dict[str, Any] = {
@@ -452,6 +453,7 @@ class FlightService:
             "touchdown_lon": metrics.get("touchdown_lon"),
             "runway_ident": metrics.get("runway_ident"),
             "threshold_distance_m": metrics.get("threshold_distance_m"),
+            "displaced_threshold_m": metrics.get("displaced_threshold_m"),
             "centerline_offset_m": metrics.get("centerline_offset_m"),
             "bounce_count": metrics.get("bounce_count"),
             "landing_distance_m": metrics.get("landing_distance_m"),

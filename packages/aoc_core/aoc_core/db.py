@@ -34,6 +34,7 @@ FLIGHT_COLUMNS = [
     "max_g_flight", "max_g_landing", "touchdown_g", "touchdown_vs_fpm",
     "touchdown_lat", "touchdown_lon", "runway_ident", "threshold_distance_m",
     "centerline_offset_m", "bounce_count", "landing_distance_m", "landing_rating",
+    "displaced_threshold_m",
     "track_profile_json", "track_points", "track_bytes", "track_fidelity_m",
     "track_sha256", "data_gap_seconds", "validation_status",
     "validation_notes_json", "anomaly_flags_json", "notes", "created_at", "updated_at",
@@ -136,6 +137,7 @@ CREATE TABLE IF NOT EXISTS flight_record (
     bounce_count INTEGER,
     landing_distance_m REAL,
     landing_rating TEXT,
+    displaced_threshold_m REAL,
     track_profile_json TEXT,
     track_points INTEGER,
     track_bytes INTEGER,
@@ -237,7 +239,8 @@ class Database:
                 if name not in existing:
                     con.execute(f"alter table volanta_flight add column {name} {ddl}")
             flight_cols = {r["name"] for r in con.execute("pragma table_info(flight_record)")}
-            for name, ddl in (("actual_zfw_kg", "REAL"), ("zfw_delta_kg", "REAL")):
+            for name, ddl in (("actual_zfw_kg", "REAL"), ("zfw_delta_kg", "REAL"),
+                              ("displaced_threshold_m", "REAL")):
                 if name not in flight_cols:
                     con.execute(f"alter table flight_record add column {name} {ddl}")
 

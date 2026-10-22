@@ -18,7 +18,17 @@ import threading
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+def _resolve_root() -> Path:
+    """仓库布局 / PyInstaller onedir 都能定位 `data`、`Pre-train`（D-30）。"""
+    env = os.environ.get("AOC_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).parent)))
+    return Path(__file__).resolve().parents[3]
+
+
+ROOT = _resolve_root()
 DEFAULT_PRE_TRAIN = ROOT / "Pre-train"
 DEFAULT_PKL = ROOT / "data" / "network.pkl"
 
