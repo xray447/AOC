@@ -99,7 +99,7 @@ AOC 是面向模拟飞行玩家的桌面软件，提供以下运行形态：
 | 机场 / 跑道 / 程序 / 天气采集 | `dispatcher/{procedures,weather,operations,ntrack}.py` | 复用数据模型与降级策略 |
 | 机型库 | `dispatcher/aircrafts.json` | 作为机型模板初始数据（212 项） |
 | 日本移管点 / 运行规则 | `transfer_points.json`、`operation.json` | 作为公司模式「航路点 / 运行规则」的参考数据 |
-| 航路图引擎 | `Pre-train/src/{network,infer,geo}.py` + `artifacts/network.pkl` | 包成 `aoc-route` 服务，`graph_route()` 约 20ms/对 |
+| 航路图引擎 | `Pre-train/src/{network,db,geo}.py`（运行时副本在 `packages/aoc_route/aoc_route/net`）+ 用户 navdata 现建图 | 包成 `aoc-route` 服务，单个 OD 约几毫秒 |
 | 导航数据库 | `Pre-train/dataset/little_navmap_navigraph.sqlite` | 作为统一 navdata，AIRAC 版本化后只读挂载 |
 
 **注意**：`japan-flight-dispatcher` 的 Volanta 实现依赖浏览器会话，属于非官方接口，存在失效与 ToS 风险；文档将其定位为「尽力而为的可选同步」，并提供 CSV 导入与手动补录作为兜底。

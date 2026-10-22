@@ -35,7 +35,7 @@ def _find_root(start: Path) -> Path:
     if env and Path(env).is_dir():
         return Path(env)
     if getattr(sys, "frozen", False):
-        # PyInstaller 6：--onedir 的 data/ 与 Pre-train/ 都在 _internal（_MEIPASS）下
+        # PyInstaller 6：--onedir 的 data/ 在 _internal（_MEIPASS）下
         return Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).parent)))
     for parent in (start, *start.parents):
         if (parent / "packages" / "aoc_core").is_dir():

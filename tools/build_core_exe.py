@@ -26,6 +26,23 @@ EXE = OUT / "aoc-core" / "aoc-core.exe"
 PACKAGES = ["aoc_protocol", "aoc_core", "aoc_navdata", "aoc_route", "aoc_integrations"]
 
 
+def data_args() -> list[str]:
+    """按目录是否存在拼 `--add-data`。
+
+    航路建图 / Dijkstra 源码已内置在 `packages/aoc_route/aoc_route/net`（随
+    `--hidden-import aoc_route` 进包），产物只需要 `data/`；目录缺失时跳过而不是让
+    PyInstaller 直接 ERROR（干净 checkout 上曾有 `Unable to find ... when adding`）。
+    """
+    pairs = [(ROOT / "data", "data")]
+    args: list[str] = []
+    for src, dest in pairs:
+        if not src.is_dir():
+            print(f"[warn] 跳过 --add-data：{src} 不存在（产物里没有 {dest}）")
+            continue
+        args += ["--add-data", f"{src};{dest}"]
+    return args
+
+
 def pyinstaller_args(console: bool) -> list[str]:
     args = [
         "--noconfirm", "--clean",
@@ -34,8 +51,7 @@ def pyinstaller_args(console: bool) -> list[str]:
         "--distpath", str(DIST),
         "--workpath", str(WORK),
         "--specpath", str(SPEC),
-        "--add-data", f"{ROOT / 'data'};data",
-        "--add-data", f"{ROOT / 'Pre-train' / 'src'};Pre-train/src",
+        *data_args(),
         "--paths", str(ROOT / "apps" / "aoc-core"),
         # 建图在运行时用 sys.path 动态导入网络模块，静态分析看不到
         "--hidden-import", "numpy",
@@ -60,6 +76,8 @@ def pyinstaller_args(console: bool) -> list[str]:
     for pkg in PACKAGES:
         args += ["--paths", str(ROOT / "packages" / pkg)]
         args += ["--hidden-import", pkg]
+    # 航路图内核（建图 + Dijkstra）在 graph.py 里函数内惰性 import，显式收集避免漏包
+    args += ["--collect-submodules", "aoc_route"]
     args.append("--noconsole" if not console else "--console")
     args.append(str(ROOT / "apps" / "aoc-core" / "entry.py"))
     return args

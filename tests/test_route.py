@@ -247,9 +247,10 @@ def test_graph_cache_tag_changes_with_navdata(tmp_path: Path):
     assert cache_tag(db, None).startswith("unknown-")
 
 
-def test_ensure_graph_without_builder(tmp_path: Path):
+def test_ensure_graph_reports_build_failure(tmp_path: Path):
+    # 建图内核已内置（aoc_route.net），这里用一个不是导航库的文件逼出建图失败
     graph = GraphProvider(pre_train_dir=tmp_path / "missing", cache_dir=tmp_path / "cache")
     nav = tmp_path / "nav.sqlite"
     nav.write_bytes(b"x")
     assert graph.ensure(nav, "2610") is False
-    assert "建图脚本不存在" in graph.error
+    assert graph.error.startswith("建图失败")

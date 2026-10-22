@@ -1,7 +1,8 @@
 """PyInstaller 入口（D-30）：先固定资源根目录，再交给 `main.main()`。
 
-打包时不带 Python 解释器与 `packages/` 源码目录，`data/` 与 `Pre-train/src`
-随包发布；`AOC_ROOT` 指向 PyInstaller 的 `_MEIPASS`（onedir 即 `_internal/`）。
+打包时不带 Python 解释器与 `packages/` 源码目录，`data/` 随包发布；航路建图源码已在
+`aoc_route.net`（随包进 exe），不再需要仓库外的 `Pre-train/src`。
+`AOC_ROOT` 指向 PyInstaller 的 `_MEIPASS`（onedir 即 `_internal/`）。
 """
 from __future__ import annotations
 

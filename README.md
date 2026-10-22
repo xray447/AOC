@@ -109,7 +109,7 @@ python -X utf8 tools/smoke_portable.py  # 便携包端到端
 - `deploy/`：Dockerfile、docker-compose、环境变量样例
 - `tools/`：构建、便携包与冒烟脚本（`dev.ps1`、`make_portable.py`、`smoke_m1.py`、`smoke_m2.py`、`smoke_m3.py`、`ui_smoke.py`）
 - `data/`：机型模板与 AIP fixture（`aip_routes_sample.csv`）
-- `Pre-train/`：航路图算法（`src/network.py` 用 navdata 建图）；运行时只随包分发 `src`，不带宽 59MB 的 `network.pkl` 与模型权重
+- `Pre-train/`：航路图算法与训练工程（不入库）；运行时副本（建图 `network.py` + Dijkstra）已内置在 `packages/aoc_route/aoc_route/net`，只有训练/改算法时才需要本目录
 - `docs/`：需求、架构、路线图与交付说明（`09-M1`、`10-M2`、`11-M3`）
 
 ## 状态
