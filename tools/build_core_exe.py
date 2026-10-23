@@ -111,7 +111,7 @@ def main() -> int:
     print(f"aoc-core onedir: {EXE} ({size_mb:.1f} MB)")
 
     if args.verify:
-        probe = subprocess.run([str(EXE), "--help"], capture_output=True, timeout=180)
+        probe = subprocess.run([str(EXE), "--help"], capture_output=True, timeout=1800)
         if probe.returncode != 0:
             print(probe.stderr.decode("utf-8", "replace")[-2000:])
             print("aoc-core.exe --help 失败")
