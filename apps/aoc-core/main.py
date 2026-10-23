@@ -774,7 +774,7 @@ def _ensure_streams(logs_dir: Path) -> None:
             pass
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AOC core sidecar")
     parser.add_argument("--home", default=None, help="数据目录（默认 %%LOCALAPPDATA%%/AOC）")
     parser.add_argument("--port", type=int, default=0)
@@ -783,7 +783,36 @@ def main() -> int:
     parser.add_argument("--open", action="store_true")
     parser.add_argument("--simlink-url", default=os.environ.get("AOC_SIMLINK_URL"))
     parser.add_argument("--simlink-token", default=os.environ.get("AOC_SIMLINK_TOKEN"))
-    args = parser.parse_args()
+    parser.add_argument("--version", action="store_true", help="打印版本后退出（CI 探活用）")
+    return parser
+
+
+def _emit(text: str) -> None:
+    """`--noconsole` 冻结版里 `sys.stdout`/`sys.stderr` 都是 `None`，写不得。"""
+    for stream in (sys.stdout, sys.__stdout__):
+        if stream is None:
+            continue
+        try:
+            stream.write(text)
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+        return
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    parser = build_parser()
+    # `-h/--help` 交给 argparse 时会往 sys.stdout 写；冻结版该流是 None（老版本
+    # argparse 直接抛 AttributeError → PyInstaller 弹模态框 → CI 卡到超时）。
+    # 自己拦下来只保证退出码 0，`--version` 同理，供打包后探活。
+    if "-h" in argv or "--help" in argv:
+        _emit(parser.format_help())
+        return 0
+    if "--version" in argv or "-V" in argv:
+        _emit(f"aoc-core {__version__}\n")
+        return 0
+    args = parser.parse_args(argv)
 
     home = Path(args.home) if args.home else None
     paths = AppPaths.create(home)

@@ -149,6 +149,20 @@ def test_ops_flight_status_and_free_airports(app_client):
     assert isinstance(airports, list)
 
 
+def test_cli_probe_survives_missing_streams(monkeypatch):
+    """`--noconsole` 冻结版 sys.stdout/stderr 为 None：`--version`/`--help` 必须正常退出。
+
+    否则 PyInstaller 会弹模态对话框，无桌面的 CI 上 aoc-core.exe --help 一直挂到超时。
+    """
+    import main
+
+    monkeypatch.setattr(main.sys, "stdout", None)
+    monkeypatch.setattr(main.sys, "__stdout__", None)
+    for argv in (["aoc-core", "--version"], ["aoc-core", "--help"]):
+        monkeypatch.setattr(main.sys, "argv", argv)
+        assert main.main() == 0
+
+
 def test_open_external_uses_default_browser(app_client, monkeypatch):
     """SimBrief 等外链交给系统默认浏览器打开，且只允许 http/https。"""
     import main
