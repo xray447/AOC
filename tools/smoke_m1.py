@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -114,10 +115,29 @@ def main() -> int:
               f"points={flight['track_points']}")
         assert flight["status"] == "COMPLETED", flight
         assert flight["track_points"] > 0
+
+        # §27：自动开录从发动机启动开始 —— block_off 早于起飞、发动机时间大于已飞时间
+        def _dt(value: str) -> datetime:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        assert _dt(flight["block_off_utc"]) < _dt(flight["takeoff_utc"]), flight
+        engine_s = flight.get("engine_seconds") or 0
+        flight_s = (_dt(flight["landing_utc"]) - _dt(flight["takeoff_utc"])).total_seconds()
+        assert engine_s > flight_s, f"发动机时间 {engine_s}s 应大于已飞时间 {flight_s}s"
+        assert not flight.get("engine_estimated"), "发动机时间不应标 estimated"
+        # §30：落地后滑到机位才收尾（滑入段不能丢）
+        assert (_dt(flight["block_on_utc"]) - _dt(flight["landing_utc"])).total_seconds() >= 60, flight
+
         track = get(f"{base}/local/flights/{flight['id']}/track", token)
         assert track["points"], track
         runway_segments = [s for s in track["segments"] if s["mode"] == "RUNWAY"]
         assert runway_segments, f"落地后缺少 RUNWAY 段：{[s['mode'] for s in track['segments']]}"
+        takeoff_t = (_dt(flight["takeoff_utc"]) - _dt(flight["block_off_utc"])).total_seconds()
+        landing_t = (_dt(flight["landing_utc"]) - _dt(flight["block_off_utc"])).total_seconds()
+        taxi_out = [s for s in track["segments"] if s["mode"] == "TAXI" and s["end_t"] <= takeoff_t]
+        taxi_in = [s for s in track["segments"] if s["mode"] == "TAXI" and s["start_t"] >= landing_t]
+        assert taxi_out, f"起飞前缺少滑出段：{[s['mode'] for s in track['segments']]}"
+        assert taxi_in, f"落地后缺少滑入段：{[s['mode'] for s in track['segments']]}"
         gpx = urlopen(Request(f"{base}/local/flights/{flight['id']}/export?format=gpx",
                               headers={"X-AOC-Token": token}), timeout=10).read().decode()
         assert "<gpx" in gpx and "<trkpt" in gpx

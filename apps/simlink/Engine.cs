@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text.Json;
 
 namespace AocSimLink;
@@ -8,6 +9,16 @@ namespace AocSimLink;
 /// </summary>
 public sealed class Engine : IDisposable
 {
+    /// <summary>内存里最多保留的采样条数：磁盘上的 samples.jsonl 才是权威，core 每 1–2s 就会取走。</summary>
+    private const int MaxSamples = 20000;
+    /// <summary>预录帧按 1Hz 保留（10 min ≈ 600 条），起点要能覆盖发动机启动与起飞前滑行。</summary>
+    private const double PreRollStepS = 1.0;
+    private const double PreRollWindowS = 600.0;
+    /// <summary>自动开录判定：发动机运转 / 地速 &gt; 3kt 持续这么久就开录。</summary>
+    private const double AutoStartHoldS = 10.0;
+    /// <summary>靠「停机刹车置位」收尾时的最短保持时间（收到 AutoStopHoldS 以内）。</summary>
+    private const double ParkingBrakeHoldS = 30.0;
+
     private readonly ISimSource _source;
     private readonly string _queueRoot;
     private readonly AdaptiveSampler _sampler = new();
@@ -16,8 +27,9 @@ public sealed class Engine : IDisposable
     private readonly Queue<Sample> _preRoll = new();
     private readonly object _lock = new();
     private readonly JsonSerializerOptions _json = new() { WriteIndented = false };
+    private readonly ArrayBufferWriter<byte> _jsonBuffer = new(4096);
 
-    private StreamWriter? _queue;
+    private FileStream? _queue;
     private bool _recording;
     private string? _recordingId;
     private string _startedAt = "";
@@ -28,10 +40,15 @@ public sealed class Engine : IDisposable
     private string _phase = "PREFLIGHT";
     private Sample? _prevFrame;
     private double? _airborneSince;
-    private double? _groundSince;
+    // 自动开录/收尾的计时器（§27/§30）：停稳与滑行必须分开计，不能用「接地后」当「停稳」
+    private double? _engineOnSince;
+    private double? _taxiSince;
+    private double? _stoppedSince;
+    private double? _parkingBrakeSince;
     private bool _hasTakeoff;
     private double _hz = 1.0;
     private double _lastErrorT = -100;
+    private double _lastPreRollT = -100;
 
     // 计时（P-04）：模拟时间累计，按 sim_rate 折算；暂停不计
     private double _simClock;
@@ -44,7 +61,10 @@ public sealed class Engine : IDisposable
     private bool _engineEstimated;
 
     public bool AutoStart { get; set; } = true;
-    public double AutoStopHoldS { get; set; } = 30.0;
+    /// <summary>自动开录起点：engine（默认，发动机运转 10s）/ taxi（滑行 10s）/ takeoff（旧行为：离地 5s）。</summary>
+    public string AutoStartMode { get; set; } = "engine";
+    /// <summary>自动收尾：连续静止（GS &lt; 5kt）或停机刹车保持这么久。</summary>
+    public double AutoStopHoldS { get; set; } = 60.0;
     public string? LastFinishedId { get; private set; }
 
     public Engine(ISimSource source, string home)
@@ -53,6 +73,7 @@ public sealed class Engine : IDisposable
         _queueRoot = Path.Combine(home, "simlink-queue");
         Directory.CreateDirectory(_queueRoot);
         _source.Frame += OnFrame;
+        _source.ConnectionChanged += OnConnectionChanged;
     }
 
     public string SourceName => _source.Name;
@@ -78,6 +99,9 @@ public sealed class Engine : IDisposable
                 SimVersion = _source.SimVersion,
                 Source = _source.Name,
                 AutoStart = AutoStart,
+                AutoStartMode = AutoStartMode,
+                ReconnectAttempts = _source.ReconnectAttempts,
+                LastConnectError = _source.LastConnectError,
             };
         }
     }
@@ -88,6 +112,9 @@ public sealed class Engine : IDisposable
         lock (_lock) return _prevFrame;
     }
 
+    /// <summary>立刻重建 SimConnect（前端「重新连接」）；非 simconnect 源为空操作。</summary>
+    public void ReconnectSource() => _source.Reconnect();
+
     /// <summary>已飞行时间（秒）：takeoff 起算，landing 冻结；未起飞为 0。</summary>
     private double FlightSecondsNow()
     {
@@ -96,11 +123,26 @@ public sealed class Engine : IDisposable
         return Math.Max(0, end - _takeoffSim);
     }
 
+    /// <summary>按 `Seq` 二分找起点，避免每个轮询都全表扫描。</summary>
+    private int IndexAfter(long since)
+    {
+        int lo = 0, hi = _samples.Count;
+        while (lo < hi)
+        {
+            var mid = lo + (hi - lo) / 2;
+            if (_samples[mid].Seq <= since) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
     public (List<Sample> samples, long lastSeq) Samples(long since, int limit)
     {
         lock (_lock)
         {
-            var list = _samples.Where(s => s.Seq > since).Take(Math.Max(1, limit)).ToList();
+            var start = IndexAfter(since);
+            var count = Math.Min(Math.Max(1, limit), _samples.Count - start);
+            var list = count > 0 ? _samples.GetRange(start, count) : new List<Sample>();
             return (list, _samples.Count == 0 ? -1 : _samples[^1].Seq);
         }
     }
@@ -130,10 +172,12 @@ public sealed class Engine : IDisposable
             _recStartT = _prevFrame?.T ?? 0;
             _nextSampleT = 0;
             _recording = true;
-            // 计时归零：记录开始时发动机已在转 → 从此刻起算并标 estimated=true
-            _engineSeconds = 0;
             _engineOffSince = null;
-            _engineEstimated = _engineRunning;
+            // 开录后重新计时，避免同一个「已满足条件」的计时器反复触发
+            _engineOnSince = null;
+            _taxiSince = null;
+            _stoppedSince = null;
+            _parkingBrakeSince = null;
             if (_landed)
             {
                 // 上一次飞行已落地：不要把旧航班的起飞时刻算进新的记录
@@ -142,26 +186,32 @@ public sealed class Engine : IDisposable
                 _takeoffSim = 0;
                 _landingSim = null;
             }
-            // 自动开始时把起飞前 20s 的预录帧补进来，保留起飞机场与起飞时刻；
-            // 同时避免把 _hasTakeoff 重置成 false（否则落地后不会自动收尾）。
+            // 自动开录把预录窗口里的帧全部补进来（含地面滑行帧）：block_off 落在
+            // 发动机启动/开始滑行的时刻，TAXI 段与发动机时间才能回溯（旧版只补离地后的帧）。
             var pre = new List<Sample>();
             if (!manual)
             {
                 var frames = _preRoll.ToArray();
-                for (int i = 0; i < frames.Length; i++)
+                if (frames.Length > 0)
                 {
-                    if (frames[i].OnGround) continue;
-                    _recStartT = frames[i].T;
-                    pre.AddRange(frames.Skip(i));
-                    break;
+                    _recStartT = frames[0].T;
+                    pre.AddRange(frames);
                 }
             }
-            _hasTakeoff = !manual && pre.Count > 0;
-            _phase = _hasTakeoff ? "CRUISE" : "PREFLIGHT";
+            // 空中自动开录（takeoff 模式）时已经起飞：状态机不会再产生 takeoff 事件
+            _hasTakeoff = !manual && _airborneSince != null;
+            if (_hasTakeoff) _takeoffSim = _simClock;
+            _phase = _hasTakeoff ? "CLIMB" : "PREFLIGHT";
             var dir = Path.Combine(_queueRoot, _recordingId);
             Directory.CreateDirectory(dir);
-            _queue = new StreamWriter(Path.Combine(dir, "samples.jsonl"), append: false) { AutoFlush = true };
+            _queue = new FileStream(Path.Combine(dir, "samples.jsonl"), FileMode.Create,
+                FileAccess.Write, FileShare.Read);
             AddEvent(0, "recording_started", new() { ["manual"] = manual, ["pre_roll"] = pre.Count });
+            // 发动机启动/开始滑行发生在开录之前：补进事件流（时刻相对预录首帧）
+            if (_engineRunning && _engineOnSince != null)
+                AddEvent(Math.Max(0, _engineOnSince.Value - _recStartT), "engine_start", new());
+            if (_taxiSince != null)
+                AddEvent(Math.Max(0, _taxiSince.Value - _recStartT), "taxi_start", new());
             foreach (var frame in pre) SaveSample(frame);
             Console.Error.WriteLine($"recording started ({_recordingId}, manual={manual}, pre_roll={pre.Count})");
             return Status();
@@ -177,6 +227,10 @@ public sealed class Engine : IDisposable
     {
         if (!_recording) return Status();
         _recording = false;
+        _engineOnSince = null;
+        _taxiSince = null;
+        _stoppedSince = null;
+        _parkingBrakeSince = null;
         LastFinishedId = _recordingId;
         AddEvent(Math.Max(0, (_prevFrame?.T ?? _recStartT) - _recStartT), "recording_stopped", new());
         try { _queue?.Dispose(); } catch { }
@@ -204,14 +258,30 @@ public sealed class Engine : IDisposable
         _events.Add(new FlightEvent { Seq = _evtSeq++, T = Math.Max(0, t), Type = type, Data = data });
     }
 
+    /// <summary>连接/断线也要进事件流：飞行中模拟器退出再进，日志里能看到缺口与重连。</summary>
+    private void OnConnectionChanged(bool connected)
+    {
+        lock (_lock)
+        {
+            if (!_recording) return;
+            var t = Math.Max(0, (_prevFrame?.T ?? _recStartT) - _recStartT);
+            AddEvent(t, connected ? "sim_connected" : "sim_disconnected", new());
+        }
+    }
+
     private void OnFrame(Sample s)
     {
         lock (_lock)
         {
             try
             {
-                _preRoll.Enqueue(s);
-                while (_preRoll.Count > 0 && s.T - _preRoll.Peek().T > 20) _preRoll.Dequeue();
+                // 预录只留 5Hz：逐帧（30–60Hz）存 20s 会白占上千个对象
+                if (s.T - _lastPreRollT >= PreRollStepS)
+                {
+                    _lastPreRollT = s.T;
+                    _preRoll.Enqueue(s);
+                }
+                while (_preRoll.Count > 0 && s.T - _preRoll.Peek().T > PreRollWindowS) _preRoll.Dequeue();
                 var dt = _prevFrame == null ? 0 : s.T - _prevFrame.T;
                 var simDt = dt > 0 && dt <= 3.0
                     ? dt * (_source.ClockIsSimTime ? 1.0 : (s.SimRate <= 0 ? 1.0 : s.SimRate))
@@ -222,8 +292,7 @@ public sealed class Engine : IDisposable
                     UpdateEngine(s, simDt);
                 }
                 UpdateStateMachine(s);
-                if (!_recording && AutoStart && _airborneSince != null && s.T - _airborneSince >= 5.0)
-                    StartRecording(manual: false);
+                if (!_recording && AutoStart && AutoStartDue(s)) StartRecording(manual: false);
                 if (_recording) SaveSample(s);
             }
             catch (Exception exc)
@@ -238,12 +307,30 @@ public sealed class Engine : IDisposable
         }
     }
 
+    /// <summary>
+    /// 自动开录判定（§27）：默认从「发动机启动」开始，而不是离地 5s 之后；
+    /// 这样起飞前滑行、等待与发动机时间都能进日志。takeoff 保留旧行为。
+    /// </summary>
+    private bool AutoStartDue(Sample s) => (AutoStartMode ?? "engine").ToLowerInvariant() switch
+    {
+        "takeoff" => _airborneSince != null && s.T - _airborneSince >= 5.0,
+        "taxi" => _taxiSince != null && s.T - _taxiSince >= AutoStartHoldS,
+        _ => _engineOnSince != null && s.T - _engineOnSince >= AutoStartHoldS,
+    };
+
     private void UpdateStateMachine(Sample s)
     {
+        // 滑行计时（taxi 模式）与「停稳」计时（收尾判定）：都必须连续满足，不能被单帧打断
+        if (s.OnGround && s.GsKt > 3.0) _taxiSince ??= s.T;
+        else if (!s.OnGround || s.GsKt <= 1.0) _taxiSince = null;
+        if (s.GsKt < 5.0) _stoppedSince ??= s.T;
+        else _stoppedSince = null;
+        if (s.ParkingBrake) _parkingBrakeSince ??= s.T;
+        else _parkingBrakeSince = null;
+
         bool fresh = _prevFrame != null && s.T - _prevFrame.T <= 3.0;
         if (!s.OnGround)
         {
-            _groundSince = null;
             _airborneSince ??= s.T;
             if (fresh && _prevFrame!.OnGround)
             {
@@ -263,7 +350,6 @@ public sealed class Engine : IDisposable
         else
         {
             _airborneSince = null;
-            _groundSince ??= s.T;
             if (fresh && !_prevFrame!.OnGround)
             {
                 _landed = true;
@@ -275,9 +361,22 @@ public sealed class Engine : IDisposable
                 _phase = "LANDING";
             }
             if (_hasTakeoff && s.GsKt < 5) _phase = "TAXI_IN";
-            if (_recording && _hasTakeoff && s.GsKt < 5 && s.T - _groundSince >= AutoStopHoldS)
-                StopLocked();
+            if (_recording && _hasTakeoff) MaybeAutoStop(s);
         }
+    }
+
+    /// <summary>
+    /// 自动收尾（§30）：旧判据是「接地满 30s 后任意一帧 GS&lt;5 就停」，滑行中减速、
+    /// 过跑道口等待都会误停。现在要求「连续静止」达到 hold，或停机刹车保持，
+    /// 或「停机刹车 + 发动机全部关车」——真到机位才结束。
+    /// </summary>
+    private void MaybeAutoStop(Sample s)
+    {
+        var stoppedLongEnough = _stoppedSince != null && s.T - _stoppedSince >= AutoStopHoldS;
+        var parkedLongEnough = _parkingBrakeSince != null
+            && s.T - _parkingBrakeSince >= Math.Min(AutoStopHoldS, ParkingBrakeHoldS);
+        var parkedWithEnginesOff = s.ParkingBrake && !_engineRunning;
+        if (stoppedLongEnough || parkedLongEnough || parkedWithEnginesOff) StopLocked();
     }
 
     /// <summary>
@@ -297,10 +396,15 @@ public sealed class Engine : IDisposable
             if (!_engineRunning)
             {
                 _engineRunning = true;
+                // 新的发动机启动：自动开录从这一刻起算（§27），发动机计时也从零开始
+                _engineOnSince = s.T;
+                _engineSeconds = 0;
+                _engineEstimated = fallbackRunning && !rpmRunning;
                 if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_start", new());
             }
             _engineOffSince = null;
-            if (_recording) _engineSeconds += simDt;
+            // 未开始记录也要累计：开录时可以从预录回溯，不必标 estimated
+            _engineSeconds += simDt;
             return;
         }
         if (!_engineRunning) return;
@@ -308,6 +412,7 @@ public sealed class Engine : IDisposable
         if (s.T - _engineOffSince < 5.0) return;
         _engineRunning = false;
         _engineOffSince = null;
+        _engineOnSince = null;
         if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_stop", new());
     }
 
@@ -324,9 +429,9 @@ public sealed class Engine : IDisposable
     /// <summary>
     /// 跑道窗口（P-05/P-06）：地面上 GS &gt;= 40kt（起飞滑跑 / 落地滑跑），或空中 AGL &lt; 100ft。
     /// SimLink 没有导航库，用这个近似代替「距机场 &lt; 5NM」；窗口内按 0.1s 保存，
-    /// 否则接地区画不出连续滑跑线。
+    /// 否则接地区画不出连续滑跑线。SimConnect 源也用它决定回调频率（SECOND / SIM_FRAME）。
     /// </summary>
-    private static bool InRunwayWindow(Sample s) =>
+    public static bool InRunwayWindow(Sample s) =>
         s.OnGround ? s.GsKt >= 40.0 : s.AglFt < 100.0;
 
     private void SaveSample(Sample s)
@@ -344,11 +449,39 @@ public sealed class Engine : IDisposable
             PitchDeg = s.PitchDeg, BankDeg = s.BankDeg, OnGround = s.OnGround, FuelKg = s.FuelKg,
             TotalWeightKg = s.TotalWeightKg, FuelWeightKg = s.FuelWeightKg,
             EngRpm = s.EngRpm, EngN1 = s.EngN1, EngCombustion = s.EngCombustion,
+            ParkingBrake = s.ParkingBrake,
             G = s.G, Gear = s.Gear, Flaps = s.Flaps, Paused = s.Paused, SimRate = s.SimRate,
         };
         _sampler.Update(saved);
         _samples.Add(saved);
-        _queue?.WriteLine(JsonSerializer.Serialize(saved, _json));
+        if (_samples.Count > MaxSamples) _samples.RemoveRange(0, _samples.Count - MaxSamples);
+        WriteQueue(saved);
+    }
+
+    /// <summary>逐点写盘：直接序列化进复用缓冲，避免每点新建一个字符串。</summary>
+    private void WriteQueue(Sample saved)
+    {
+        var queue = _queue;
+        if (queue == null) return;
+        try
+        {
+            _jsonBuffer.ResetWrittenCount();
+            using (var writer = new Utf8JsonWriter(_jsonBuffer))
+            {
+                JsonSerializer.Serialize(writer, saved, _json);
+            }
+            queue.Write(_jsonBuffer.WrittenSpan);
+            queue.WriteByte((byte)'\n');
+            queue.Flush();
+        }
+        catch (Exception exc)
+        {
+            if (saved.T - _lastErrorT > 5)
+            {
+                _lastErrorT = saved.T;
+                Console.Error.WriteLine($"queue write failed: {exc.Message}");
+            }
+        }
     }
 
     public void Start() => _source.Start();

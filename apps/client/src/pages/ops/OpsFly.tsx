@@ -1,7 +1,7 @@
 import { ReloadOutlined } from "@ant-design/icons";
 import { Button, Space, Tabs } from "antd";
 import { useMemo, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useI18n } from "../../i18n";
 import { OpsExecute } from "./OpsExecute";
 import { OpsFreeFlightPage } from "./OpsFreeFlight";
@@ -15,17 +15,30 @@ const TAB_PATH: Record<FlyTab, string> = {
   execute: "/ops/execute",
 };
 
-/** 抽班、自由飞行、配载与执行合并为一页（三个页签），旧路由继续可用。 */
+function isFlyTab(value: string | null): value is FlyTab {
+  return value === "roster" || value === "free" || value === "execute";
+}
+
+/**
+ * 抽班、自由飞行、配载与执行合并为一页（三个页签），旧路由继续可用。
+ *
+ * 页签来源优先级：`?tab=`（顶部状态条等深链）→ 路径（/ops/roster 等）→ 默认「抽班」。
+ * 切换页签时跳到规范路径，`?tab=` 查询参数随之清掉，避免刷新后与高亮不一致。
+ */
 export function OpsFly() {
   const { tr } = useI18n();
   const location = useLocation();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const [refreshKey, setRefreshKey] = useState(0);
 
   const tab = useMemo<FlyTab>(() => {
-    const found = (Object.keys(TAB_PATH) as FlyTab[]).find((key) => TAB_PATH[key] === location.pathname);
+    const fromQuery = params.get("tab");
+    if (isFlyTab(fromQuery)) return fromQuery;
+    const found = (Object.keys(TAB_PATH) as FlyTab[])
+      .find((key) => TAB_PATH[key] === location.pathname);
     return found ?? "roster";
-  }, [location.pathname]);
+  }, [params, location.pathname]);
 
   return (
     <div className="page">
@@ -44,7 +57,10 @@ export function OpsFly() {
 
       <Tabs
         activeKey={tab}
-        onChange={(key) => navigate(TAB_PATH[key as FlyTab])}
+        onChange={(key) => {
+          const next = isFlyTab(key) ? key : "roster";
+          navigate(TAB_PATH[next], { replace: false });
+        }}
         items={[
           {
             key: "roster",

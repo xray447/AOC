@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 import statistics
 import threading
@@ -22,10 +23,38 @@ MIN_CHECK_NM = 200.0
 MAX_GAP_NM = 200.0
 MAX_GAP_PCT = 20.0
 FT_PER_M = 3.280839895
+# navdata 没有 is_military 列时的军用机场兜底关键词（见 docs/TODO §23）
+MILITARY_NAME_PATTERNS = (
+    r"\bAIR\s*FORCE\b", r"\bAFB\b", r"\bAAF\b", r"\bNAVAL\b", r"\bARMY\b",
+    r"\bMILITARY\b", r"\bAIRBASE\b", r"\bAB\b",
+)
+# 跑道宽度 → 可接受的最大翼展（米）。45–60 m 是 4D/4E 冲突区，只能保守按 D（52 m）
+WINGSPAN_BY_WIDTH = ((45.0, 36), (60.0, 52), (float("inf"), 80))
 
 
 class NavDataError(RuntimeError):
     pass
+
+
+def _military_flag(raw: object, name: object) -> bool:
+    """军用机场判定：`is_military` 有值就照它，缺列/空值时退回名称关键词。"""
+    try:
+        if raw is not None:
+            return bool(int(float(str(raw))))
+    except (TypeError, ValueError):
+        pass
+    text = str(name or "").upper()
+    return any(re.search(pattern, text) for pattern in MILITARY_NAME_PATTERNS)
+
+
+def max_wingspan_for_width(width_m: float | None) -> int | None:
+    """按跑道宽度推可接受的最大翼展（米）；宽度缺失时返回 None（不限制）。"""
+    if width_m is None:
+        return None
+    for limit, wingspan in WINGSPAN_BY_WIDTH:
+        if width_m < limit:
+            return wingspan
+    return 80
 
 
 def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -136,6 +165,7 @@ class NavData:
         self._runway_sql_checked = False
         self._runway_count_cache: int | None = None
         self._prime_runway_units()
+        self._prime_runway_widths()
         self.airac, self.navdata_version = self._load_meta()
         self._coverage: CoverageIndex | None = None
         self._limits: dict[str, tuple[float, float] | None] = {}
@@ -157,8 +187,10 @@ class NavData:
         cols = self._columns("airport")
         if not {"ident", "laty", "lonx"} <= cols:
             raise NavDataError("navdata 缺少 airport(ident/laty/lonx)")
+        self._airport_cols = cols
         optional = [c for c in (
             "name", "iata", "city", "country", "iso_country", "longest_runway_length",
+            "longest_runway_width", "is_military",
             "altitude", "transition_altitude", "has_procedures",
         ) if c in cols]
         sql = "select ident, laty, lonx" + ("".join(f", {c}" for c in optional)) + " from airport where ident is not null"
@@ -182,6 +214,12 @@ class NavData:
                 "longest_runway_raw": row.get("longest_runway_length"),
                 "longest_runway_m": None,
                 "longest_runway_ft": None,
+                # 跑道宽度 → 翼展上限；缺列/缺数据时为 None（不限制），详见 _prime_runway_widths
+                "runway_width_raw": row.get("longest_runway_width"),
+                "runway_width_m": None,
+                "max_wingspan_m": None,
+                # 军用机场：优先 is_military 列，缺列时退化为名称关键词
+                "military": _military_flag(row.get("is_military"), row.get("name")),
                 "has_procedures": bool(row.get("has_procedures")) if "has_procedures" in row else None,
             }
 
@@ -198,10 +236,12 @@ class NavData:
         ils_expr = "r.has_ils" if "has_ils" in rcols else ("r.ils" if "ils" in rcols else "null")
         # 内移入口（displaced threshold）：Little Navmap 的 runway_end.offset_threshold（英尺）
         offset_expr = "re.offset_threshold" if "offset_threshold" in ecols else "null"
+        # 跑道宽度（单位同长度字段，Little Navmap / Navigraph 用英尺）
+        width_expr = "r.width" if "width" in rcols else "null"
         self._runway_sql = (
             "select a.ident as airport, re.name as name, re.heading as heading, re.laty as lat, "
             f"re.lonx as lon, re.altitude as elev, {length_expr} as length, {ils_expr} as ils, "
-            f"{offset_expr} as offset_threshold "
+            f"{offset_expr} as offset_threshold, {width_expr} as width "
             "from runway r join runway_end re "
             "on re.runway_end_id in (r.primary_end_id, r.secondary_end_id) "
             "join airport a on a.airport_id = r.airport_id where a.ident = ?"
@@ -233,18 +273,25 @@ class NavData:
                         "elev_ft": row["elev"],
                         "length_raw": row["length"],
                         "offset_threshold_raw": row["offset_threshold"],
+                        "width_raw": row["width"],
                         "ils": bool(row["ils"]) if row["ils"] is not None else None,
                     })
-                # 跑道长度：优先 runway.length，否则由反向跑道端反推；内移入口按同一单位口径换算
+                # 跑道长度：优先 runway.length，否则由反向跑道端反推；内移入口/宽度按同一单位口径换算
                 for end in ends:
                     end["length_m"] = self._runway_length_m(end, ends)
                     end["displaced_threshold_m"] = self._displaced_threshold_m(end, ends)
+                    end["width_m"] = self._runway_width_m(end, ends)
             self._runways[key] = ends
             derived = max((e["length_m"] for e in ends if e.get("length_m")), default=None)
             info = self.airports.get(key)
             if info is not None and derived:
                 info["longest_runway_m"] = round(derived, 1)
                 info["longest_runway_ft"] = round(derived * FT_PER_M, 1)
+            widths = [e["width_m"] for e in ends if e.get("width_m")]
+            if info is not None and widths:
+                # 同一机场跑道宽度可能不统一（如 ZGGG 60/45 m）：翼展上限取最宽的那条
+                info["runway_width_m"] = round(max(widths), 1)
+                info["max_wingspan_m"] = max_wingspan_for_width(info["runway_width_m"])
             return ends
 
     def _raw_length_is_feet(self, end: dict, ends: list[dict]) -> bool | None:
@@ -290,6 +337,20 @@ class NavData:
         if feet is None:
             feet = value > 500  # 内移入口极少超过 500m
         return round(value / FT_PER_M if feet else value, 1)
+
+    def _runway_width_m(self, end: dict, ends: list[dict]) -> float | None:
+        """跑道宽度（米）。缺失列 / 0 / 明显越界一律返回 None（前端用 45 m 兜底）。"""
+        try:
+            value = float(end.get("width_raw") or 0)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        feet = self._raw_length_is_feet(end, ends)
+        if feet is None:
+            feet = value > 80  # 60 m 以上的"宽度"只可能是英尺（45 m ≈ 148 ft）
+        width = value / FT_PER_M if feet else value
+        return round(width, 1) if 15.0 <= width <= 80.0 else None
 
     def _runway_geo_length_m(self, end: dict, ends: list[dict]) -> float | None:
         recip = reciprocal_name(end["name"])
@@ -352,6 +413,73 @@ class NavData:
                 meters = value / FT_PER_M if feet else value
             a["longest_runway_m"] = round(meters, 1) if meters else None
             a["longest_runway_ft"] = round(meters * FT_PER_M, 1) if meters else None
+
+    def _width_m(self, raw: object, feet: bool | None) -> float | None:
+        """跑道宽度原始值 → 米；单位不明时按「>80 必是英尺」兜底。越界一律 None。"""
+        try:
+            value = float(raw or 0)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if feet is None:
+            feet = value > 80
+        width = value / FT_PER_M if feet else value
+        return round(width, 1) if 15.0 <= width <= 80.0 else None
+
+    def _prime_runway_widths(self) -> None:
+        """回填每座机场的跑道宽度与翼展上限（docs/TODO §26）。
+
+        宽度只用来给翼展上界，不能据此定飞行区等级：45 m 既可能是 4D 也可能是 4E，
+        所以 45–60 m 区间保守按 52 m（D）处理。优先读 `airport.longest_runway_width`
+        （一列一次读完）；缺列时对 runway 表做一次 `max(width)` 分组，避免逐机场懒加载。
+        """
+        feet = self._length_unit_is_feet()
+        widths: dict[str, float] = {}
+        if "longest_runway_width" in getattr(self, "_airport_cols", set()):
+            for ident, info in self.airports.items():
+                width = self._width_m(info.get("runway_width_raw"), feet)
+                if width is not None:
+                    widths[ident] = width
+        elif "width" in self._columns("runway"):
+            try:
+                rows = self._con.execute(
+                    "select a.ident as ident, max(r.width) as width from runway r "
+                    "join airport a on a.airport_id = r.airport_id "
+                    "where a.ident is not null and r.width is not null group by a.ident").fetchall()
+            except sqlite3.Error:
+                rows = []
+            for ident, raw in rows:
+                width = self._width_m(raw, feet)
+                if width is not None and ident:
+                    widths[str(ident).upper()] = width
+        for ident, width in widths.items():
+            info = self.airports.get(ident)
+            if info is None:
+                continue
+            info["runway_width_m"] = width
+            info["max_wingspan_m"] = max_wingspan_for_width(width)
+
+    def _length_unit_is_feet(self) -> bool | None:
+        """该库的长度/宽度类字段是否以英尺存储（用几何长度抽样校准）。"""
+        scale = self._sample_length_scale(sample=60)
+        if scale is None:
+            return None
+        if 2.5 <= scale <= 4.5:
+            return True
+        if 0.8 <= scale <= 1.25:
+            return False
+        return None
+
+    def max_wingspan_m(self, ident: str | None) -> int | None:
+        """机场可接受的最大翼展（米）；None = 无宽度数据，不做限制。"""
+        info = self.airport(ident)
+        if not info:
+            return None
+        if info.get("max_wingspan_m") is None and info.get("runway_width_m") is None:
+            # 宽度列存在但该机场为空：读一次跑道端（有 width_m 就精确化，没有仍为 None）
+            self.runways(info["ident"])
+        return info.get("max_wingspan_m")
 
     def _load_meta(self) -> tuple[str, str]:
         try:

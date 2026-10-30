@@ -46,6 +46,7 @@ import { MapPage } from "./pages/MapPage";
 import { Stats } from "./pages/Stats";
 import { SettingsPage } from "./pages/Settings";
 import { opsStateMeta } from "./ops";
+import { simlinkState } from "./simlink";
 import type { Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings } from "./types";
 import { fmtHms } from "./utils";
 
@@ -107,6 +108,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
   ];
   const flatItems = [...personalItems, ...opsItems];
   const statusMeta = opsStateMeta(opsStatus);
+  const sim = simlinkState(recording);
   const statusDetail = [
     opsStatus?.callsign,
     opsStatus?.dep_icao && opsStatus?.arr_icao ? `${opsStatus.dep_icao}→${opsStatus.arr_icao}` : null,
@@ -156,9 +158,9 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
                 {navdata.available ? `AIRAC ${navdata.airac || "—"}` : tr("navdata 未导入", "navdata missing")}
               </Tag>
             </Tooltip>
-            <Tag color={recording.simlink_connected ? "green" : "default"}>
-              {recording.simlink_connected ? tr("SimLink 已连接", "SimLink online") : tr("SimLink 离线", "SimLink offline")}
-            </Tag>
+            <Tooltip title={`${tr(sim.zh, sim.en)}${sim.source ? ` · source=${sim.source}` : ""}`}>
+              <Tag color={sim.color}>{tr(sim.zh, sim.en)}</Tag>
+            </Tooltip>
             <Tooltip title={`${tr("当前状态，点击进入对应页面", "Current state — click to open")}${statusDetail ? `（${statusDetail}）` : ""}`}>
               <Button
                 size="small"
@@ -220,19 +222,42 @@ export default function App() {
 
   useEffect(() => {
     if (!bootstrap) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const [rec, status] = await Promise.all([
-          api<RecordingStatus>("/local/recording/status"),
-          api<OpsStatus>("/local/ops/status").catch(() => null),
-        ]);
-        setRecording(rec);
-        setOpsStatus(status);
-      } catch {
-        /* core may be restarting */
+    // 合并成一条 /local/ui/pulse：少一半请求与后端序列化；页面在后台时暂停轮询。
+    // 有任务/录制时 2s（状态条与计时跟手），空闲时 5s（没人看变化，省唤醒）。
+    const ACTIVE_MS = 2000;
+    const IDLE_MS = 5000;
+    const active = { current: false };
+    let timer = 0;
+    let stopped = false;
+    const tick = async () => {
+      if (!document.hidden) {
+        try {
+          const pulse = await api<{ recording: RecordingStatus; ops: OpsStatus | null }>(
+            "/local/ui/pulse");
+          setRecording(pulse.recording);
+          setOpsStatus(pulse.ops);
+          active.current = Boolean(pulse.recording?.active)
+            || (pulse.ops?.state ?? "IDLE") !== "IDLE";
+        } catch {
+          /* core may be restarting */
+        }
       }
-    }, 2000);
-    return () => window.clearInterval(timer);
+      if (!stopped) {
+        timer = window.setTimeout(() => void tick(), active.current ? ACTIVE_MS : IDLE_MS);
+      }
+    };
+    const onVisible = () => {
+      if (document.hidden) return;
+      window.clearTimeout(timer);
+      void tick();
+    };
+    timer = window.setTimeout(() => void tick(), ACTIVE_MS);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [bootstrap]);
 
   const refresh = useCallback(async () => {

@@ -14,6 +14,14 @@ public interface ISimSource : IDisposable
     /// false 表示 T 是真实秒，Engine 累计模拟时间时要乘以 `sim_rate`。
     /// </summary>
     bool ClockIsSimTime => false;
+    /// <summary>连续连接失败次数（只有 simconnect 源有意义，其余恒为 0）。</summary>
+    int ReconnectAttempts => 0;
+    /// <summary>最近一次连接模拟器失败的原始错误（异常类型 + message）。</summary>
+    string? LastConnectError => null;
+    /// <summary>立刻重建连接（手动触发；后台循环本来也会按 5s 退避重试）。</summary>
+    void Reconnect() { }
+    /// <summary>连接状态变化：true=已连上模拟器。</summary>
+    event Action<bool>? ConnectionChanged { add { } remove { } }
     event Action<Sample>? Frame;
     void Start();
     void Stop();
@@ -68,7 +76,8 @@ public sealed class DemoSource : ISimSource
         bool onGround;
         if (t < takeoff)
         {
-            alt = elev; agl = 0; vs = 0; gs = t < 20 ? 8 : 25; onGround = true;
+            // 起飞前：先停 5s，再以 12kt / 25kt 滑行 —— 自动开录要在这一段就触发（§27）
+            alt = elev; agl = 0; vs = 0; gs = t < 5 ? 0 : (t < 25 ? 12 : 25); onGround = true;
         }
         else if (t < 60)
         {
@@ -92,15 +101,22 @@ public sealed class DemoSource : ISimSource
         }
         else
         {
+            // 落地后：减速到 15kt 滑行 → 中途停车 20s（旧判据会在这里误收尾）→ 滑到机位停稳
             alt = elev; agl = 0;
             vs = t < touchdown + 1.0 ? -150 : 0;
-            var k = Math.Min(1.0, (t - touchdown) / 12.0);
-            gs = 125 * (1 - k); onGround = true;
+            if (t < touchdown + 8) gs = 125 - (125 - 15) * ((t - touchdown) / 8.0);
+            else if (t < touchdown + 28) gs = 15;
+            else if (t < touchdown + 48) gs = 0;
+            else if (t < touchdown + 63) gs = 10;
+            else gs = 0;
+            onGround = true;
         }
         double g = t >= touchdown && t < touchdown + 1.0 ? 1.42 : (t > touchdown + 1 ? 1.02 : 1.0);
         double fuelKg = Math.Max(1200, 8000 - (t / 255.0) * 6200);
-        // 演示机：20s 起动发动机、落地后 10s 关车；载荷按 14t 固定，ZFW = 总重 − 燃油
-        bool engineOn = t >= 20 && t < touchdown + 10;
+        // 演示机：10s 起动发动机（自动开录从这一刻+10s 起算）、滑到机位后才关车；
+        // 停机刹车在到位时置位，配合关车触发自动收尾（§30）
+        bool engineOn = t >= 10 && t < touchdown + 63;
+        bool parkingBrake = t >= touchdown + 63;
         double rpm = engineOn ? 2400 : 0;
         return new Sample
         {
@@ -110,6 +126,7 @@ public sealed class DemoSource : ISimSource
             BankDeg = 0, OnGround = onGround, FuelKg = fuelKg,
             TotalWeightKg = 42000 + 14000 + fuelKg, FuelWeightKg = fuelKg,
             EngRpm = new[] { rpm, rpm, 0, 0 }, EngN1 = new double[4], EngCombustion = new double[4],
+            ParkingBrake = parkingBrake,
             G = g, Gear = t < 20 || t > 215 ? 1 : 0,
             Flaps = t < 15 ? 0 : (t < takeoff ? 1 : (t > 205 ? 3 : 0)),
             Paused = false, SimRate = speed,

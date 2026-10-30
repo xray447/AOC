@@ -1,14 +1,77 @@
 # TODO
 
-> 更新：2026-10-22 文档变更（运营模式 · 飞行执行 / SimBrief）已全部落地——代码 + 测试 + 文档同步，
-> 下面只剩需要真人/干净机才能完成的验收项。
+> 更新：2026-10-30 §23–§30（军用机场、候选多样性、随机航班号、翼展、自动开录/收尾、机型识别、落地报告）已全部落地，
+> 代码 + 测试 + 文档同步（证据见 `10` §3）。仍需真人/干净机（低配机内存、安装包、签名）的验收项在下方。
+
+## 已完成（2026-10-30，功能改进 §23–§30）
+
+> 细节见 `01` P-04/P-05/P-06/C-02/C-04、`02` §5.3/§7.4、`03` 接口表、`04` §2.2/§2.4/§2.5/§7.1、`07` §3、`09` §5-8、`10` §3。
+
+### 23. 抽班不选军用机场
+
+- `aoc_navdata` 读可选列 `is_military`（缺列按名称关键词 `AIR FORCE`/`AFB`/`AAF`/`NAVAL`/`ARMY`/`MILITARY`/`AB`），机场对象与 `AirportOut` 透出 `military`。
+- `_airport_pool()` 丢掉军用机场（出发机场不拦）；抽班表单「不含军用机场」默认开（`exclude_military`）。
+
+### 24. top3 候选不再雷同
+
+- `candidate_score()` 重写：新机场按绝对数、亏损扣分、单段 balance 基准 0.6、单独给段数加分 → 478 min 亏钱单段不再压过 464 min 三段链。
+- 遵循航线也按航线形状跨机去重；`_select_top()` 保证同机最多 1 条、形状互不相同；虚拟航段首段起飞时刻按飞机错开 0–120 min。
+
+### 25. 虚拟航段随机航班号
+
+- `_virtual_flight_number()` 用 `random.SystemRandom` 随机 3 位（最多 50 次），撞号退回顺序号、顺序号用满退回 uuid 后缀；同 roster 不复用、`(号, 起飞时刻)` 不冲突；不受抽班种子影响。
+
+### 26. 翼展 / 跑道宽度
+
+- `aircraft_type.wingspan_m`（内置机型真实值；0/留空按最短跑道推断 36/52/60.3/65 m），`TYPE_FIELDS`/校验/机型抽屉同步。
+- `aoc_navdata` 读 `airport.longest_runway_width`（缺列时一次 `max(runway.width)` 分组），`max_wingspan_m` = <45 m → 36、45–60 m → 52、≥60 m → 80，无数据不限制。
+- `_airport_pool()` 与 `_can_operate()` 加翼展过滤，`_no_candidate_reason()` 提示，候选卡片标「翼展上限 xx m（按跑道宽度推断）」；抽班表单「考虑跑道宽度（翼展）」默认开（`consider_wingspan`）。
+
+### 27. 自动开录提前到发动机启动
+
+- `auto_start_on = engine|taxi|takeoff`（默认 engine：发动机运转 10s；taxi：滑行 10s；takeoff 保留旧行为），随 `/status` 透出并由 core 下发。
+- 预录改 1 Hz / 10 min 且**含地面帧**，`block_off` 取预录首帧、`_hasTakeoff` 由状态机在真正离地时置位。
+- 发动机计时不随开录归零（未录制也累计，可从预录回溯），只有退化判定才 `engine_estimated=true`；`flight_record.engine_seconds` / `engine_estimated` 落库（老库自动补列），日志详情展示。
+- demo 源改为 10s 起动发动机、起飞前滑行 12/25 kt，覆盖 `TAXI` 段。
+
+### 28. 无任务录制的机型识别
+
+- 建档优先级「任务上下文 → `aircraft_title` 匹配（自定义 `title_keyword` 优先，内置 `specs.TITLE_KEYWORDS` + ICAO）→ 设置默认机型」。
+- 收尾的 `evaluate()` / `add_flown_leg()` 统一读记录里已存的机型，事后改「默认机型」不影响旧记录；日志详情显示 `aircraft_title`、发动机时间与已飞时间。
+- 设置页「默认机型」说明改为「仅用于航路规划/推荐；录制按 SimLink 机型标题自动识别」。
+
+### 29. 落地报告改成 report.html 版式
+
+- 新增 `apps/client/src/components/TrendChart.tsx`（`AppendChart` 的 React 版：5 条网格、TD 竖线、2%–98% 分位裁剪、样本不足空态）与 `LandingReport.tsx`（报告头 + 落地行 + 卡片网格 + ALT/VS/G 三曲线 + TDZ；暗色 token 只作用在报告容器）。
+- `LogDetail.tsx` 改「报告优先」：报告 → `TrackMap` → 「详细信息」折叠区（`Descriptions` / 事件表 / 备注），功能不删。
+- `aoc_core/report_html.py` + `export?format=html`（`text/html`）：同版式单文件报告，内联 CSS/SVG、零外部依赖、无脚本；`main.py` 的 `media` 表加 `html`。
+
+### 30. 落地后到机位才收尾
+
+- 判据改为「连续静止（GS < 5kt）达到 `auto_stop_hold_s`（默认 60s，30–300 可调）」，或「停机刹车置位 30s」，或「停机刹车 + 发动机全部关车」；滑行中瞬时低速不再触发。
+- `Sample.parking_brake` 映射 `BRAKE PARKING POSITION`（SimConnect → Sample → core `_norm_sample`）。
+- core 自动收尾后补发 `stop_recording`；轮询到已 COMPLETED 的 `recording_id` 只忽略、不再 `assert`；收尾后的帧照常进日志，`block_on_utc` 取最后一帧。
+- demo 源补滑入（落地后 15kt 滑行、中途停车 20s、到机位停稳 + 停机刹车 + 关车），回归断言 `block_on − landing ≥ 60s`。
 
 ## 待人工验收
 
-- **T-21 / A-32**（安装版 + 便携版）：双击无控制台窗口、托盘出现、安装版直开窗口 / 便携版默认浏览器、关闭窗口最小化到托盘、托盘「退出」后无残留 `aoc-core` / `aoc-simlink`。
 - **T-01 / T-06a**（干净 Windows，无 Python / .NET / Node）：用 `out/AOC-0.1.0-x64-setup.exe` / `*.msi` / `AOC-portable-*-win64.zip` 各跑一次。
 - **体积实测**：自包含改造后 `out/AOC-portable-*-win64.zip`、NSIS/MSI 重新生成，把实测值回填 `08` §2 / §4.4（`aoc-core` onedir 已实测 134 MB）。
 - **Authenticode 签名**：等证书。
+
+## 已通过（人工验收）
+
+- **T-21 / A-32**（安装版 + 便携版，2026-10-24）：双击无控制台窗口、托盘出现、安装版直开窗口 / 便携版默认浏览器、关闭窗口最小化到托盘、托盘「退出」后无残留 `aoc-core` / `aoc-simlink` → **通过**。
+
+## 待人工实测（性能与实机）
+
+- **SimLink 内存（D-26）**：`python tools/simlink_mem_probe.py --minutes 30 --interval 60`；判据：未连接 < 60 MB、连上未录制 < 80 MB、录制稳态 < 100 MB 且趋势 |≤5 MB/h|。
+- **aoc-core 空闲 CPU（D-27）**：代码侧已修（见下方 §22）；`python tools/core_cpu_probe.py --minutes 5` 在开发机上实测空闲平均 **0.130%**、峰值 1.378%（单核，SimLink 在跑未连模拟器）。待低配机复核：空闲 5 分钟平均 < 0.3%（单核），录制中平均 < 1.5%。
+- **SimLink 自动重连（实机）**：先开 AOC 再开 MSFS，10s 内 `sim_connected=true`；飞行中退出模拟器再进，`/events` 有 `sim_disconnected` / `sim_connected`，记录不重复、缺口标记正确。
+
+## 已修复（性能，2026-10-24）
+
+- **aoc-core 空闲 CPU 每 2 秒一次尖峰（D-27 残留）**：根因是 `SimLinkClient` 每次请求都新建 `httpx.AsyncClient`（Windows 上构造要重建 SSL 上下文，实测 **约 0.54s CPU/次**），轮询按 1–2s 打一次 → 常驻高 CPU + 2s 周期尖峰。同一场景实测：修复前 2 分钟空闲平均 **19.9%**、峰值 48%；修复后 5 分钟平均 **0.130%**、峰值 1.378%（只剩取整级别的单 tick），CSV 时间线上不再有 2s 周期。详见 §22。
 
 ## 已完成（代码 + 文档）
 
@@ -89,7 +152,7 @@
 - `tools/make_portable.py`：产物带 `AOC-portable.exe`，`start.bat`/`start.py` 保留为排障入口（会显示控制台，优先用包内 exe）。
 - 顺带修掉冻结版的启动崩溃：`--noconsole` 下 `sys.stdout/stderr is None`，`uvicorn` 的 formatter 会 `AttributeError: 'NoneType' object has no attribute 'isatty'` 并以「Unable to configure formatter 'default'」退出；`main.py::_ensure_streams()` 先把它们接到 `logs/stdout.log`、`logs/stderr.log`。同时捕获 `KeyboardInterrupt` / 其它异常写日志退出，避免冻结版弹 traceback 对话框。
 - 验证：`cargo check --offline`（含 tray-icon）通过；打包版 `aoc-core.exe` 实测 `/local/health` 0.5s 内 200、退出无残留。
-- 待人工：T-21 / A-32。文档：`01` P-11/A-32、`02` §2.1/§13.1、`08` §2/T-01/T-05/T-21、`09` §1/§4/§5、`10` §5、`README` D-29。
+- 人工验收：T-21 / A-32 通过（2026-10-24，安装版 + 便携版）。文档：`01` P-11/A-32、`02` §2.1/§13.1、`08` §2/T-01/T-05/T-21、`09` §1/§4/§5、`10` §5、`README` D-29。
 
 ### 11. 自包含打包（去掉 Python / .NET 依赖）
 
@@ -108,3 +171,84 @@
 - 缓存：pip / npm / cargo（`apps/client/src-tauri`）/ NuGet；artifact `retention-days: 14`。
 - 约束：navdata / `network.pkl` / SimBrief key 不进仓库与产物；签名等有证书再补。
 - 文档：`08` §4.7「CI 构建」、`README` 构建状态徽章。
+
+### 13. SimLink 自动重连（原「启动时模拟器未开启 → 不重试」）
+
+- `apps/simlink/SimConnectSource.cs`：改为后台线程状态机「连接 → 收消息 → 断开 → 5s 退避重连」；`new SimConnect(...)` 失败、`OnRecvQuit`、`ReceiveMessage` 异常都只置 `sim_connected=false` 并重试，握手 10s 超时按失败处理；`Reconnect()` 可立即重试。
+- `ISimSource` 增加 `Reconnect()` / `ReconnectAttempts` / `LastConnectError` / `ConnectionChanged`；`Engine` 在录制中把 `sim_connected` / `sim_disconnected` 写进事件流；`RecordingInfo` 与 `/local/simlink/status` 透出 `reconnect_attempts` / `last_connect_error`；`POST /command {action:"reconnect"}` + `POST /local/simlink/reconnect`，设置页「重新连接」。
+- 验收（实机）：先开 AOC 再开 MSFS，`sim_connected` 10s 内自动 `true`；飞行中退出再进能自动恢复。
+- 文档：`09` §5-12、`08` §3.3、`02` §7.2。
+
+### 14. 自定义机型模板（原「允许玩家自己添加飞机数据」）
+
+- `aircraft_type` 新增 `source`（`BUILTIN`/`CUSTOM`）、`builtin_key`、`title_keyword`（老库自动补列）；内置模板标记 `BUILTIN`，`GET` 带 `source`。
+- `POST/PATCH/DELETE /local/ops/aircraft-types`：`CUSTOM` 可增/改/删；`BUILTIN` 改删返回 `BUILTIN_TYPE_READONLY`（只能「复制为自定义」）；被机队/班期/未完成实例引用时 `AIRCRAFT_TYPE_IN_USE`。
+- 校验：`0 < OEW < MZFW ≤ MTOW`、`MLW ≤ MTOW`、座位数 = 客舱构型合计、油耗 > 0、`cruise_speed_kt` 60–600、`min_runway_m` 0–5000、`range_nm` 1–20000 等，越界 `PARAM_OUT_OF_RANGE`（`details.key` 供前端就地高亮）。
+- 生效面：`generate_load_sheet` / `estimate_block_minutes` / 推荐 / 异常策略 / 结算成本都读同一张表；`CUSTOM` 机型在班期无同名机型时允许「机型替换」（跑道/航程过滤）；新增飞机可留空机型按 `title_keyword` 匹配 SimLink `aircraft_title`；档案 zip 带整库（含 `CUSTOM`）。
+- 前端：机队页「机型模板」抽屉（列表 + 新增 + 复制 + 编辑 + 停用 + 删除），新增飞机的机型下拉随即刷新。
+- 测试：`tests/test_ops.py::test_custom_aircraft_type_feeds_loadsheet_and_settlement` / `::test_custom_type_rejects_invalid_weights` / `::test_delete_custom_type_blocked_when_in_fleet` / `::test_builtin_type_copy_to_custom`；`tools/ui_smoke.py` 断言接口里存在 `CUSTOM`、抽屉可打开。
+- 文档：`01` C-02 注、`04` §7.1、`10` §1/§3。
+
+### 15. 右上角航班信息跳「配载与执行」
+
+- `OpsFly.tsx`：页签先读 `?tab=`（`roster|free|execute`）再回退路径，最后兜底 `roster`；切换页签跳规范路径（`/ops/roster|free|execute`），查询参数随之清掉。
+- `ops.ts::opsStateMeta`：`FLIGHT`、`GROUND` 且有任务、按钮上已有呼号/起降 → `/ops/execute`；完全没有航班信息 → `/ops/roster`。
+- 测试：`tools/ui_smoke.py` 点状态条后断言 URL `/ops/execute` + 页签高亮，再切「抽班」「自由飞行」校验 URL，并验证 `/ops/fly?tab=execute` 深链。
+- 文档：`10` §3。
+
+### 16. 跑道接地区俯视图补跑道标志
+
+- `RunwayTouchdown.tsx`：跑道编号、入口条纹（8 条）、接地区（TDZ）条纹、900 ft 瞄准点、中线（着陆入口实线 + 其余虚线）、自着陆入口起每 300 m 刻度与米数、末端总长、100 m 比例尺与图例（蓝线=滑跑、红点=接地点、斜纹=内移段）；横向放大倍数照旧标注。
+- 宽度：`aoc_navdata` 读取 `runway.width`（英尺/米自动校准，越界回 `None`），`/local/airports/{icao}` 带 `width_m`；缺失时视图按 45 m 兜底。
+- 测试：`tools/ui_smoke.py` 断言跑道 SVG 含 `18`、`300 m`、`100 m`。
+- 文档：`09` §5-8/§5-10、`01` P-06。
+
+### 17. SimLink 未连模拟器的三态提示
+
+- 状态链路：`recording.sim_connected` / `simlink_source` / `last_connect_error` 透传到 `/local/health`、`/local/recording/status`、`/local/simlink/status`。
+- 前端 `simlink.ts::simlinkState()` 三态：「SimLink 未运行」（灰）/「SimLink 在运行 · 模拟器未连接」（橙）/「已连接模拟器（demo/replay）」（绿），tooltip 带 `source`；首页与执行页共用 `components/SimlinkNotice.tsx`（排查步骤 + 原始错误 + 打开日志目录，`POST /local/system/open-logs`）。
+- 拦截：`POST /local/recording/start` 在 `sim_connected=false` 且 `source=simconnect` 时返回 `warnings[]`（不阻断）；执行页「开始记录」先 `Modal.confirm`。
+- 测试：`tests/test_api.py::test_health_reports_simlink_disconnected` / `::test_recording_start_warns_without_sim_connection` / `::test_ui_pulse_and_simlink_reconnect`。
+- 文档：`01` P-10、`09` §5-12、`08` §3.3、`10` §3。
+
+### 18. 结算详情标题不再显示 `— ????→????`
+
+- `OpsService.settlement()` 平铺 `callsign/dep_icao/arr_icao/block_off_utc/block_minutes/touchdown_vs_fpm/landing_rating`（与列表接口同名字段），嵌套 `flight` 保留。
+- `settlementTitle()` 兼容平铺与嵌套、无呼号只显示 `DEP→ARR`、全缺显示「未知航班」（`OpsReview` 复用同函数）。
+- 测试：`tests/test_api.py::test_settlement_detail_flattens_flight_fields`；`tools/ui_smoke.py` 点开一条结算断言标题不含 `????`。
+- 文档：`10` §3。
+
+### 19. 抽班「不遵循航线 / 排除机场 / 每程航时」
+
+- `CONSTRAINT_LIMITS` 增加 `min/max_leg_block_minutes`（5–1440 / 10–1440）；`min > max` 返回 `PARAM_OUT_OF_RANGE`；`_build_chains` 对单段 block 做区间过滤（`max_block_minutes` 仍是合计）。
+- `follow_routes: false`：`_airport_pool()` 从 navdata 机场库按机型 `range_nm × 0.9` / `min_runway_m` / 航时过滤并随机化，`_virtual_chains()` 拼链；候选标 `virtual`，token 带 `virtual_legs`，**确认时**才落一次性 `flight_instance`（`mission_type=FREE`，航班号按航班表内唯一），取消/过期作废不回池。
+- `excluded_airports`：`_available_instances` 与 `_build_chains` 都过滤（中转也算）；`draw()` 返回 `follow_routes` / `excluded_airports` / 无候选 `reason`。
+- 前端：抽班表单加「遵循航线」「排除机场」（多选远程搜索 + 「填入最近去过」）、每程最短/最长航时（就地校验），候选卡片标「虚拟航段」/「已排除 N 个机场」。
+- 测试：`tests/test_ops.py::test_draw_ignores_routes_when_disabled` / `::test_draw_excludes_airports` / `::test_draw_respects_per_leg_block_range` / `::test_draw_min_leg_block_greater_than_max_rejected` / `::test_draw_follow_routes_keeps_legacy_behaviour`。
+- 文档：`01` C-04、`04` §2.2/§2.4、`10` §1/§3。
+
+### 20. SimLink 内存（D-26）
+
+- `AocSimLink.csproj`：`ServerGarbageCollection=false` + 并发 GC（Web SDK 默认 Server GC）。
+- `SimConnectSource`：平时 `SIMCONNECT_PERIOD.SECOND`，跑道窗口（`Engine.InRunwayWindow`）临时切 `SIM_FRAME`；切换失败不影响采样。
+- `Engine`：`_samples` 只保留最近 2 万点（`Samples()` 按 `Seq` 二分）、预录帧 5Hz、逐点写盘改 `Utf8JsonWriter` + 复用缓冲写 `FileStream`（不再每点分配字符串）。
+- 工具：`tools/simlink_mem_probe.py`（WS/PM + `/status` 采样点，CSV + 趋势/峰值摘要）。
+- 文档：`02` §7.2/§7.4/§10.1.1、`08` T-09、`09` §5-12。
+
+### 21. aoc-core 空闲 CPU（D-27）
+
+- `Database`：每线程常驻连接 + 可重入事务（最外层提交），不再每请求 open/close；导入档案改用 `restore_from()`（SQLite 备份 API）。
+- `_poll_loop` 自适应（录制/连上 1s、未连模拟器 2s、失败 5→15s、无 SimLink 15s）；`_watch_simlink` 5s + mtime；`/local/ops/status` 在 HTTP 层 1s TTL；新增 `/local/ui/pulse` 合并前端两条轮询，`document.hidden` 暂停；uvicorn 关 access log。
+- 工具：`tools/core_cpu_probe.py`（Get-Process CPU 增量 → 单核 %，CSV + 均值/峰值）。
+- 文档：`02` §10.1.1、`08` T-09。
+
+### 22. aoc-core 空闲 CPU 2s 尖峰（D-27 残留）
+
+- 根因：`aoc_core/simlink.py` 每个请求都 `httpx.AsyncClient(...)` 上下文管理器新建客户端；Windows 上构造会重建 SSL 上下文，实测 **约 0.54s CPU/次**（`verify=False` 则 0.0007s），而 `_poll_loop` 在「SimLink 在跑但没连模拟器」档是 2s、录制/连上是 1s，`/local/ops/flight-status` 又是 2s → 周期尖峰与常驻高 CPU。不是 `_cached_ops_status()`（实测 `ops_status()` 仅 0.10ms）。
+- 修法：`SimLinkClient` 复用一条客户端（同事件循环；换 loop 或已关闭时重建），`aclose()` 在 `PersonalService.close()` / `set_simlink()` 换配置时调用（旧客户端延后关闭，无循环时交给 GC）。
+- 轮询：未连模拟器档 2s → `POLL_SLOW_S`（5s，仍满足「先开 AOC 再开 MSFS，10s 内 `sim_connected=true`」）。
+- 前端 `App.tsx`：`/local/ui/pulse` 改为自适应——有任务/录制中 2s、空闲 5s，`document.hidden` 暂停、切回前台立即补一次（原来固定 2s）。
+- 实测（Windows 11，源码运行，SimLink 在跑未连模拟器、无前端页面，`tools/core_cpu_probe.py --interval 1 --minutes 5`）：修复前 2 分钟平均 **19.9%**、峰值 48.3%；修复后 5 分钟平均 **0.130%**、峰值 1.378%（单核，已低于 D-27 的 0.3%），CSV 时间线上非零样本不再按 2s 周期出现。
+- 顺带修 `tools/core_cpu_probe.py` / `tools/simlink_mem_probe.py`：PowerShell 脚本里的 `{0}` 占位与 `str.format(pid=...)` 冲突，探针一启动就 `IndexError`，改 `__PID__` 替换。
+- 验证：`tests/test_api.py::test_simlink_client_reuses_connection` / `::test_poll_interval_backs_off_when_sim_not_connected`；`tools/smoke_m1.py`（demo 录制端到端）通过；`pytest` 全绿、`ruff F,E9` 通过。
+- 文档：`02` §10.1.1、`03` §接口表、`08` T-09、`10` §3。

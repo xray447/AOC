@@ -9,7 +9,11 @@ export interface Settings {
   language: "zh" | "en";
   units: Units;
   auto_start: boolean;
+  /** 自动开录起点：engine / taxi / takeoff（旧行为）。 */
+  auto_start_on: "engine" | "taxi" | "takeoff";
   auto_stop: boolean;
+  /** 自动收尾：连续静止/停机刹车保持秒数。 */
+  auto_stop_hold_s: number;
   record_taxi: boolean;
   density: "adaptive" | "fixed_1hz" | "fixed_2hz";
   max_gap_s: number;
@@ -82,6 +86,8 @@ export interface AirportRunway {
   elev_ft?: number | null;
   /** 内移入口（米）：着陆入口 = 物理入口 + 内移；旧库或缺失时为 0。 */
   displaced_threshold_m?: number | null;
+  /** 跑道宽度（米）；旧库没有该列时为 null（视图按 45 m 兜底）。 */
+  width_m?: number | null;
 }
 
 export interface AirportDetail extends Airport {
@@ -231,6 +237,10 @@ export interface FlightRecord {
   bounce_count?: number | null;
   landing_distance_m?: number | null;
   landing_rating?: string | null;
+  /** 发动机运转时间（秒）：从发动机启动算，含起飞前滑行。 */
+  engine_seconds?: number | null;
+  /** 发动机时间是否只能靠 N1/燃烧状态估算。 */
+  engine_estimated?: number | boolean | null;
   track_points?: number | null;
   track_bytes?: number | null;
   track_fidelity_m?: number | null;
@@ -275,6 +285,10 @@ export interface RecordingStatus {
   sim_connected: boolean;
   aircraft_title: string | null;
   last_error: string | null;
+  /** SimLink 数据源（simconnect / demo / replay）。 */
+  simlink_source?: string | null;
+  /** 最近一次连模拟器失败的原始错误。 */
+  last_connect_error?: string | null;
 }
 
 export interface Bootstrap {
@@ -282,6 +296,8 @@ export interface Bootstrap {
   version: string;
   url: string;
   home: string;
+  /** 日志目录（SimLink 连不上时的排查入口）。 */
+  logs?: string;
   db: string;
   navdata: NavdataStatus;
   recording: RecordingStatus;
@@ -356,6 +372,11 @@ export interface OpsAircraftType {
   id: string;
   icao: string;
   variant: string;
+  /** BUILTIN = 内置模板（只读，可复制为 CUSTOM）；CUSTOM = 玩家自定义。 */
+  source?: "BUILTIN" | "CUSTOM" | string;
+  builtin_key?: string | null;
+  /** 可选：用 SimLink 的 aircraft_title 关键字自动匹配机型。 */
+  title_keyword?: string | null;
   name: string | null;
   manufacturer: string | null;
   role: string;
@@ -372,6 +393,8 @@ export interface OpsAircraftType {
   cruise_fl: number;
   fuel_burn_kg_h: number;
   min_runway_m: number;
+  /** 翼展（米）：抽班按「翼展 ≤ 跑道宽度推出的上限」过滤机场。 */
+  wingspan_m: number;
   range_nm: number;
   allow_scheduled: boolean;
   allow_charter: boolean;
@@ -482,7 +505,7 @@ export interface OpsLeg {
 }
 
 export interface OpsCandidateLeg {
-  flight_instance_id: string;
+  flight_instance_id: string | null;
   flight_number: string;
   callsign?: string | null;
   dep: string;
@@ -492,6 +515,10 @@ export interface OpsCandidateLeg {
   block_minutes: number;
   distance_nm: number;
   estimated_revenue: number;
+  /** 到达机场的翼展上限（米，按跑道宽度推断）；null = 无宽度数据、不限制。 */
+  max_wingspan_m?: number | null;
+  /** 关掉「遵循航线」时生成的虚拟航段：确认班表时才落一次性航班实例。 */
+  virtual?: boolean;
 }
 
 export interface OpsCandidate {
@@ -519,6 +546,10 @@ export interface OpsDrawResult {
   constraints: Record<string, number | string | boolean | null>;
   expires_at: string;
   considered: number;
+  follow_routes?: boolean;
+  excluded_airports?: string[];
+  /** 抽不到候选时的原因分类提示。 */
+  reason?: string;
 }
 
 export interface OpsRoster {

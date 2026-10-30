@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ FLIGHT_COLUMNS = [
     "max_g_flight", "max_g_landing", "touchdown_g", "touchdown_vs_fpm",
     "touchdown_lat", "touchdown_lon", "runway_ident", "threshold_distance_m",
     "centerline_offset_m", "bounce_count", "landing_distance_m", "landing_rating",
-    "displaced_threshold_m",
+    "displaced_threshold_m", "engine_seconds", "engine_estimated",
     "track_profile_json", "track_points", "track_bytes", "track_fidelity_m",
     "track_sha256", "data_gap_seconds", "validation_status",
     "validation_notes_json", "anomaly_flags_json", "notes", "created_at", "updated_at",
@@ -138,6 +139,9 @@ CREATE TABLE IF NOT EXISTS flight_record (
     landing_distance_m REAL,
     landing_rating TEXT,
     displaced_threshold_m REAL,
+    -- 发动机运转时间（秒）与是否估算：§27 要求落库，日志详情/结算可核对
+    engine_seconds INTEGER,
+    engine_estimated INTEGER,
     track_profile_json TEXT,
     track_points INTEGER,
     track_bytes INTEGER,
@@ -200,34 +204,56 @@ class Database:
     def __init__(self, paths: AppPaths):
         self.paths = paths
         self.path = paths.db
+        # 每线程一条常驻连接：空闲轮询/列表接口不再每次 open/close（含两条 PRAGMA）
+        self._local = threading.local()
 
     def connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(str(self.path), timeout=15.0)
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys=ON")
-        con.execute("PRAGMA busy_timeout=5000")
+        con = getattr(self._local, "con", None)
+        if con is None:
+            con = sqlite3.connect(str(self.path), timeout=15.0)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA busy_timeout=5000")
+            self._local.con = con
+            self._local.depth = 0
         return con
+
+    def close(self) -> None:
+        """关闭当前线程的连接（进程退出/导入档案时用；其它线程各自退出即可）。"""
+        con = getattr(self._local, "con", None)
+        self._local.con = None
+        self._local.depth = 0
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
 
     @contextmanager
     def session(self):
-        """连接 + 事务 + **一定关闭**（sqlite3 的 with 不会 close，长跑会泄漏锁）。"""
+        """事务：最外层提交/回滚，内层复用同一连接（同一线程可重入，不会提前提交）。"""
         con = self.connect()
+        depth = getattr(self._local, "depth", 0)
+        self._local.depth = depth + 1
         try:
-            with con:
+            if depth == 0:
+                try:
+                    yield con
+                    con.commit()
+                except BaseException:
+                    con.rollback()
+                    raise
+            else:
                 yield con
         finally:
-            con.close()
+            self._local.depth = depth
 
     def init(self) -> None:
-        con = self.connect()
-        try:
+        with self.session() as con:
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(SCHEMA)
             con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
                         (str(SCHEMA_VERSION),))
-            con.commit()
-        finally:
-            con.close()
         self._ensure_columns()
         self._backfill_volanta_flights()
 
@@ -240,7 +266,8 @@ class Database:
                     con.execute(f"alter table volanta_flight add column {name} {ddl}")
             flight_cols = {r["name"] for r in con.execute("pragma table_info(flight_record)")}
             for name, ddl in (("actual_zfw_kg", "REAL"), ("zfw_delta_kg", "REAL"),
-                              ("displaced_threshold_m", "REAL")):
+                              ("displaced_threshold_m", "REAL"),
+                              ("engine_seconds", "INTEGER"), ("engine_estimated", "INTEGER")):
                 if name not in flight_cols:
                     con.execute(f"alter table flight_record add column {name} {ddl}")
 
@@ -634,6 +661,20 @@ class Database:
                 "select * from flight_record where status in ('COMPLETED','DIVERTED') "
                 "order by coalesce(block_off_utc, created_at)").fetchall()
         return [self._flight_row(r) for r in rows]
+
+    def restore_from(self, source: Path) -> None:
+        """用 SQLite 备份 API 把 `source` 整库覆盖进当前库。
+
+        直接 `shutil.copy2` 覆盖文件在 Windows 上会和常驻连接打架（句柄指向旧文件），
+        走备份 API 则所有线程的连接都能立刻看到新数据。
+        """
+        src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            with self.session() as con:
+                src.backup(con)
+                con.execute("PRAGMA journal_mode=WAL")
+        finally:
+            src.close()
 
     def backup(self, target: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)

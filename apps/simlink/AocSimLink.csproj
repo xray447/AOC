@@ -10,6 +10,11 @@
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <!-- 生产启动不得弹控制台（P-11）：stdout/stderr 由父进程重定向到 logs\simlink.log -->
     <OutputType>WinExe</OutputType>
+    <!-- 内存（D-26）：Web SDK 默认 Server GC（每核一个堆 + 不主动还内存），
+         单进程采集器用 Workstation 并发 GC 峰值可以低一个数量级。 -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
   </PropertyGroup>
 
   <!-- SimConnect SDK：优先使用 spike 里已经验证过的托管 DLL，其次 MSFS SDK 默认路径。 -->

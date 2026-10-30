@@ -117,6 +117,7 @@ def airport_meta(nav: Any, icao: str | None) -> dict[str, Any]:
     if not info:
         return {"icao": (icao or "").upper(), "size_class": "medium", "known": False,
                 **SIZE_CLASS["medium"], "lat": None, "lon": None, "runway_m": None,
+                "runway_width_m": None, "max_wingspan_m": None, "military": False,
                 "name": None, "country": None}
     longest = info.get("longest_runway_m")
     runway_m = round(float(longest)) if longest else None
@@ -131,6 +132,10 @@ def airport_meta(nav: Any, icao: str | None) -> dict[str, Any]:
     return {
         "icao": info["ident"], "size_class": size, "known": True, **SIZE_CLASS[size],
         "lat": info.get("lat"), "lon": info.get("lon"), "runway_m": runway_m,
+        # 跑道宽度 → 翼展上限；缺数据时 max_wingspan_m 为 None（不限制）
+        "runway_width_m": info.get("runway_width_m"),
+        "max_wingspan_m": info.get("max_wingspan_m"),
+        "military": bool(info.get("military")),
         "name": info.get("name"), "country": info.get("country"),
     }
 

@@ -87,6 +87,30 @@ def build_navdata(path: Path) -> Path:
     return path
 
 
+def add_airport_flags(path: Path, *, military: tuple[str, ...] = (),
+                      width_ft: dict[str, float] | None = None) -> Path:
+    """给 fixture 库补 `is_military` / `longest_runway_width` / `runway.width`（§23/§26）。"""
+    con = sqlite3.connect(path)
+    cols = {r[1] for r in con.execute("pragma table_info(airport)")}
+    if "is_military" not in cols:
+        con.execute("alter table airport add column is_military INTEGER DEFAULT 0")
+    if "longest_runway_width" not in cols:
+        con.execute("alter table airport add column longest_runway_width REAL")
+    rcols = {r[1] for r in con.execute("pragma table_info(runway)")}
+    if "width" not in rcols:
+        con.execute("alter table runway add column width REAL")
+    for ident in military:
+        con.execute("update airport set is_military=1 where ident=?", (ident,))
+    for ident, width in (width_ft or {}).items():
+        con.execute("update airport set longest_runway_width=? where ident=?", (width, ident))
+        con.execute(
+            "update runway set width=? where airport_id=(select airport_id from airport where ident=?)",
+            (width, ident))
+    con.commit()
+    con.close()
+    return path
+
+
 @pytest.fixture()
 def navdata_path(tmp_path: Path) -> Path:
     return build_navdata(tmp_path / "navdata.sqlite")

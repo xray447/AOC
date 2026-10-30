@@ -81,10 +81,13 @@ class PersonalService:
         self._simlink_client: SimLinkClient | None = None
         self._evt_seq = -1
         self._auto_start_sent: bool | None = None
+        self._auto_start_mode_sent: str | None = None
+        self._auto_stop_hold_sent: float | None = None
         self._last_persist = 0.0
         self._poller_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_status: dict[str, Any] = {}
+        self._poll_failures = 0
         self._aip_thread: threading.Thread | None = None
         self._graph_thread: threading.Thread | None = None
         # 图对象在 RouteService 重建之间共享，避免后台建完图又被换掉
@@ -93,6 +96,7 @@ class PersonalService:
             self.db, self.paths, lambda: self.nav, lambda: self.settings,
             aircraft_type=lambda: self.settings.get("aircraft_type", "A320"),
             callsign=lambda: self.settings.get("callsign", "AOC001"),
+            type_matcher=self._match_aircraft_type,
         )
         self.flights.resume()
         self._build_route()
@@ -105,6 +109,17 @@ class PersonalService:
     def _wire_ops_hooks(self) -> None:
         self.flights.ops_context = self.ops.context_for_recording
         self.flights.on_finalized = self.ops.on_flight_finalized
+
+    def _match_aircraft_type(self, title: str | None) -> str | None:
+        """按 SimLink 的 aircraft_title 匹配机型（机队/机型模板的 title_keyword）。"""
+        ops = getattr(self, "ops", None)
+        if not title or ops is None:
+            return None
+        try:
+            matched = ops.match_type_by_title(title)
+        except Exception:  # noqa: BLE001
+            return None
+        return (matched or {}).get("icao") or None
 
     # -- settings --------------------------------------------------------
     @property
@@ -376,6 +391,8 @@ class PersonalService:
             icao=a["ident"], iata=a.get("iata"), name=a.get("name"), city=a.get("city"),
             country=a.get("country"), lat=a["lat"], lon=a["lon"], elev_ft=a.get("elev_ft"),
             longest_runway_m=a.get("longest_runway_m"),
+            military=bool(a.get("military")),
+            max_wingspan_m=a.get("max_wingspan_m"),
             visited=a["ident"] in visited,
         ) for a in nav.search_airports(query, limit)]
 
@@ -398,6 +415,8 @@ class PersonalService:
                 "lat": r.get("lat"), "lon": r.get("lon"), "elev_ft": r.get("elev_ft"),
                 # 内移入口（米）；旧库没有该列时为 0
                 "displaced_threshold_m": r.get("displaced_threshold_m") or 0.0,
+                # 跑道宽度（米）；旧库没有该列时为 None（前端用 45 m 兜底）
+                "width_m": r.get("width_m"),
             } for r in runways],
         }
 
@@ -508,9 +527,25 @@ class PersonalService:
 
     # -- recording -------------------------------------------------------
     def set_simlink(self, url: str | None, token: str | None) -> None:
+        old = self._simlink_client
         self._simlink_url, self._simlink_token = url, token
         self._simlink_client = SimLinkClient(url, token) if url and token else None
         self._auto_start_sent = None
+        if old is not None and old is not self._simlink_client:
+            self._close_client_later(old)
+
+    @staticmethod
+    def _close_client_later(client: SimLinkClient) -> None:
+        """丢掉旧客户端的连接池；没有运行中的事件循环时交给 GC。"""
+        closer = getattr(client, "aclose", None)
+        if closer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(closer())
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     def recording_status(self) -> dict:
         st = self.flights.status().model_dump()
@@ -521,6 +556,7 @@ class PersonalService:
     AIRBORNE_PHASES = {"TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "APPROACH", "LANDING"}
 
     def ops_status(self) -> dict:
+        """顶部状态条：空闲 / 地面等待 / 飞行中（API 层按 1s TTL 缓存，见 main.py）。"""
         task = self.ops.active_task()
         roster = self.ops.current_roster() or {}
         free = self.ops.current_free_flight() or {}
@@ -583,8 +619,25 @@ class PersonalService:
         self._evt_seq = -1
         # 推出前 ZFW 校验：偏低只提示，任务照常开始；差异随任务进入 flight_record
         warnings = self.ops.set_actual_zfw(actual_zfw_kg)
+        # 没连上模拟器时只给 warnings、不阻断（demo/replay 源不受影响）
+        warnings = [*warnings, *self.simlink_warnings()]
         self.flights.start(resp.get("recording_id"), resp.get("recording_started_at"), manual=True)
         return {**self.recording_status(), "warnings": warnings}
+
+    def simlink_warnings(self) -> list[str]:
+        """SimLink 在跑但没连上模拟器：这次记录可能 0 个采样点，开始前提示。"""
+        if self.flights.sim_connected:
+            return []
+        if not self.flights.simlink_connected:
+            return []
+        source = (self.flights.simlink_source or self._last_status.get("source") or "").lower()
+        if source and source != "simconnect":
+            return []
+        detail = self.flights.last_connect_error or self._last_status.get("last_connect_error")
+        message = "SimLink 已运行，但没连上模拟器（MSFS）；这次记录可能没有任何采样点"
+        if detail:
+            message += f"：{detail}"
+        return [message]
 
     async def latest_sample(self) -> dict[str, Any] | None:
         client = self._simlink_client
@@ -656,21 +709,24 @@ class PersonalService:
         return {"ok": True, "flight": flight}
 
     # -- simlink polling -------------------------------------------------
-    async def poll_simlink_once(self) -> None:
+    async def poll_simlink_once(self) -> bool:
+        """读一次 SimLink 状态（录制中顺带取采样）。返回本轮是否成功握手。"""
         client = self._simlink_client
         if client is None:
-            return
+            return True
         try:
             status = await client.status()
         except Exception as exc:  # noqa: BLE001
             if self.flights.simlink_connected:
                 self.flights.last_error = f"SimLink 连接中断: {type(exc).__name__}"
             self.flights.simlink_connected = False
-            return
+            return False
         self._last_status = status
         self.flights.simlink_connected = True
         self.flights.simlink_version = status.get("version")
         self.flights.sim_connected = bool(status.get("sim_connected"))
+        self.flights.simlink_source = status.get("source") or self.flights.simlink_source
+        self.flights.last_connect_error = status.get("last_connect_error")
         self.flights.aircraft_title = status.get("aircraft_title") or self.flights.aircraft_title
         # 发动机运转时间 / 已飞行时间由 SimLink 计时，这里只透传给 UI（不进结算）
         try:
@@ -686,6 +742,21 @@ class PersonalService:
                 self._auto_start_sent = desired_auto
             except Exception:  # noqa: BLE001
                 pass
+        # 自动开录起点（§27）与自动收尾保持时间（§30）也下发给 SimLink
+        desired_mode = str(self._settings.get("auto_start_on", "engine") or "engine")
+        if self._auto_start_mode_sent != desired_mode:
+            try:
+                await client.command("set_auto_start_mode", mode=desired_mode)
+                self._auto_start_mode_sent = desired_mode
+            except Exception:  # noqa: BLE001
+                pass
+        desired_hold = float(self._settings.get("auto_stop_hold_s", 60) or 60)
+        if self._auto_stop_hold_sent != desired_hold:
+            try:
+                await client.command("set_auto_stop_hold", seconds=desired_hold)
+                self._auto_stop_hold_sent = desired_hold
+            except Exception:  # noqa: BLE001
+                pass
         recording = bool(status.get("recording"))
         rec = self.flights.recorder
         if recording:
@@ -694,7 +765,9 @@ class PersonalService:
                                    manual=False)
                 self._evt_seq = -1
                 rec = self.flights.recorder
-            assert rec is not None
+            if rec is None:
+                # 该 recording_id 已 COMPLETED（core 自动收尾后 SimLink 还没停）：本轮忽略
+                return True
             samples = await client.samples(rec.last_seq)
             events = await client.events(self._evt_seq)
             for ev in events:
@@ -703,12 +776,20 @@ class PersonalService:
                     self._evt_seq = seq
             self.flights.ingest(samples, events, status.get("recording_id"),
                                 status.get("recording_started_at"))
+            if self.flights.auto_stopped:
+                # core 已按「连续静止/停机刹车」收尾：让 SimLink 也停，避免下一轮空转
+                self.flights.auto_stopped = False
+                try:
+                    await client.command("stop_recording")
+                except Exception:  # noqa: BLE001
+                    pass
             if _time.monotonic() - self._last_persist >= 5.0:
                 self._last_persist = _time.monotonic()
                 self.flights._save_persisted()
         elif rec is not None:
             # SimLink 已停止（自动或外部），把已有数据收尾
             self.flights.stop(abort=False)
+        return True
 
     async def start_polling(self) -> None:
         if self._poller_task is not None:
@@ -716,14 +797,38 @@ class PersonalService:
         self._stop.clear()
         self._poller_task = asyncio.create_task(self._poll_loop())
 
+    POLL_FAST_S = 1.0
+    POLL_SLOW_S = 5.0
+    POLL_IDLE_S = 15.0
+
+    def _poll_interval(self, ok: bool) -> float:
+        """空闲自适应：录制/连上模拟器 1s；SimLink 在跑但没连模拟器 5s；失败 5s→15s。
+
+        未连模拟器时没有任何数据要追，2s 档只会白烧 CPU（D-27 残留）；
+        SimLink 自己会 5s 退避重连，5s 一次 `/status` 足够在 10s 内发现连上
+        （T-13 验收：先开 AOC 再开 MSFS，`sim_connected` 10s 内变 true）。
+        """
+        if self._simlink_client is None:
+            return self.POLL_IDLE_S
+        if self.flights.recorder is not None:
+            return self.POLL_FAST_S
+        if not ok:
+            self._poll_failures += 1
+            return min(self.POLL_IDLE_S,
+                       self.POLL_SLOW_S * (2 ** min(3, self._poll_failures - 1)))
+        self._poll_failures = 0
+        return self.POLL_FAST_S if self.flights.sim_connected else self.POLL_SLOW_S
+
     async def _poll_loop(self) -> None:
         while not self._stop.is_set():
+            ok = True
             try:
-                await self.poll_simlink_once()
+                ok = await self.poll_simlink_once()
             except Exception as exc:  # noqa: BLE001
+                ok = False
                 self.flights.last_error = f"遥测轮询失败: {type(exc).__name__}: {exc}"
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+                await asyncio.wait_for(self._stop.wait(), timeout=self._poll_interval(ok))
             except asyncio.TimeoutError:
                 continue
 
@@ -740,7 +845,17 @@ class PersonalService:
                 self.flights.stop(abort=False)
             except Exception:  # noqa: BLE001
                 pass
+        client = self._simlink_client
+        if client is not None:
+            closer = getattr(client, "aclose", None)
+            if closer is not None:
+                try:
+                    await closer()
+                except Exception:  # noqa: BLE001
+                    pass
         self._close_nav()
+        # 只关当前线程（事件循环线程）的常驻连接；其它线程随进程退出
+        self.db.close()
 
     # -- flown legs / volanta -------------------------------------------
     def add_flown_leg(self, leg: FlownLegIn) -> FlownLegOut | None:
@@ -842,9 +957,36 @@ class PersonalService:
             return _gpx(flight, points, start), f"{flight_id}.gpx"
         if fmt == "csv":
             return _csv(points), f"{flight_id}.csv"
+        if fmt == "html":
+            # 单文件落地报告：内联 CSS/SVG，离线可看（版式对齐探针 report.html）
+            from .report_html import build_report_html
+
+            arr = (flight.get("arr_icao") or "").upper() or None
+            info = self.nav.airport(arr) if (self.nav is not None and arr) else None
+            return build_report_html(
+                flight=flight, points=points,
+                events=self.db.list_events(flight_id),
+                runway=self._flight_runway(flight),
+                arr_elev_ft=(info or {}).get("elev_ft"),
+            ), f"{flight_id}.html"
         payload = {"flight": flight, "points": points,
                    "events": self.db.list_events(flight_id)}
         return json.dumps(payload, ensure_ascii=False, default=str), f"{flight_id}.json"
+
+    def _flight_runway(self, flight: dict) -> dict | None:
+        """记录用的跑道几何（报告里的接地区俯视图）：先按跑道号，再按接地点就近找。"""
+        nav = self.nav
+        if nav is None:
+            return None
+        arr = (flight.get("arr_icao") or "").upper()
+        ident = (flight.get("runway_ident") or "").strip().upper()
+        for runway in nav.runways(arr):
+            if ident and (runway.get("name") or "").strip().upper() == ident:
+                return runway
+        lat, lon = flight.get("touchdown_lat"), flight.get("touchdown_lon")
+        if lat is None or lon is None:
+            return None
+        return nav.find_runway(float(lat), float(lon), 0.0, max_nm=5.0, max_hdg_diff=180.0)
 
     def export_pln(self, dep: str, arr: str, cruise_fl: int = 350) -> str:
         result = self.generate_route(dep, arr, cruise_fl)
@@ -885,7 +1027,8 @@ class PersonalService:
             if self.flights.recorder is not None:
                 self.flights.stop(abort=True)
             self._close_nav()
-            shutil.copy2(db_file, self.paths.db)
+            # 常驻连接下不能直接覆盖 .db 文件：用备份 API 覆盖（其它线程的连接同样生效）
+            self.db.restore_from(db_file)
             tracks = tmp_path / "tracks"
             if tracks.exists():
                 shutil.rmtree(self.paths.tracks, ignore_errors=True)
@@ -894,7 +1037,8 @@ class PersonalService:
         self.flights = FlightService(
             self.db, self.paths, lambda: self.nav, lambda: self.settings,
             aircraft_type=lambda: self.settings.get("aircraft_type", "A320"),
-            callsign=lambda: self.settings.get("callsign", "AOC001"))
+            callsign=lambda: self.settings.get("callsign", "AOC001"),
+            type_matcher=self._match_aircraft_type)
         self.flights.resume()
         self._build_route()
         self.ops = OpsService(self.db, lambda: self.nav, self.catalog)

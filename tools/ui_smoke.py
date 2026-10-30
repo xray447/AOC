@@ -1,4 +1,8 @@
-"""浏览器冒烟：启动 aoc-core（静态 SPA）+ Playwright 打开各页面，抓 JS 异常并截图。"""
+"""浏览器冒烟：启动 aoc-core（静态 SPA）+ Playwright 打开各页面，抓 JS 异常并截图。
+
+用 `AOC_NO_NET=1` 关掉日本 AIP 在线同步：否则同步后的 jp-routes 缓存会盖掉
+仓库自带的 AIP 样例，ZBAA→ZSSS 变成「无本地航路」，断言随网络时好时坏。
+"""
 from __future__ import annotations
 
 import json
@@ -64,6 +68,30 @@ def main() -> int:
         "raw": {"id": "va-track-1"},
         "track": [[139.78, 35.55], [139.95, 35.62], [140.15, 35.70], [140.39, 35.76]],
     })
+    # 运营数据 + 一条完整结算：财务 →「结算」抽屉标题不再出现「— ????→????」
+    service.ops.seed_demo()
+    draw = service.ops.draw({"max_legs": 1, "max_block_minutes": 480, "window_hours": 168,
+                             "min_turnaround_min": 45, "max_turnaround_min": 360})
+    settled_roster = service.ops.confirm_roster(draw["candidates"][0]["candidate_token"], 0)
+    task = service.ops.start_leg(settled_roster["id"], 1)["task"]
+    settled_flight = service.db.insert_flight({
+        "id": task["flight_record_id"], "status": "COMPLETED", "callsign": task["callsign"],
+        "dep_icao": task["dep_icao"], "arr_icao": task["arr_icao"],
+        "distance_nm": 612.4, "block_minutes": 131.2, "fuel_used_kg": 5210,
+        "scheduled_dep_utc": task.get("scheduled_dep_utc"),
+        "takeoff_utc": task["started_at"], "landing_utc": task["started_at"],
+        "block_off_utc": task["started_at"], "block_on_utc": task["started_at"],
+    })
+    service.ops.on_flight_finalized(settled_flight)
+    # 自定义机型模板：机队页「机型模板」抽屉里应能看到「自定义」
+    service.ops.create_type({
+        "icao": "XWJ", "variant": "WIDE", "name": "Homebuilt Widebody",
+        "manufacturer": "Homebuilt", "role": "AIRLINER", "pax_capacity": 300,
+        "cabin_config_json": {"first": 8, "business": 42, "premium_economy": 24, "economy": 226},
+        "oew_kg": 150000, "mzfw_kg": 200000, "mlw_kg": 210000, "mtow_kg": 280000,
+        "fuel_capacity_kg": 110000, "fuel_burn_kg_h": 6000, "cruise_speed_kt": 470,
+        "cruise_fl": 370, "min_runway_m": 2400, "range_nm": 6000, "lease_per_hour": 9000,
+    })
     import asyncio
     asyncio.run(service.close())
 
@@ -74,7 +102,7 @@ def main() -> int:
     proc = subprocess.Popen([sys.executable, "-X", "utf8", str(ROOT / "apps" / "aoc-core" / "main.py"),
                              "--port", str(port), "--token", token, "--home", str(home),
                              "--static-dir", str(ROOT / "apps" / "client" / "dist")],
-                            env={**os.environ, "AOC_HOME": str(home)},
+                            env={**os.environ, "AOC_HOME": str(home), "AOC_NO_NET": "1"},
                             stdout=log, stderr=subprocess.STDOUT)
     errors: list[str] = []
     try:
@@ -86,6 +114,12 @@ def main() -> int:
         seed_req = Request(f"{base}/local/ops/seed", method="POST", data=b"{}",
                            headers={"X-AOC-Token": token, "Content-Type": "application/json"})
         print("ops seed:", urlopen(seed_req, timeout=30).read().decode()[:200])
+
+        # 自定义机型模板：接口必须标 CUSTOM（界面上按 ICAO 排序，可能被翻页挡住）
+        types_req = Request(f"{base}/local/ops/aircraft-types", headers={"X-AOC-Token": token})
+        type_items = json.loads(urlopen(types_req, timeout=10).read())["items"]
+        assert any(t.get("source") == "CUSTOM" for t in type_items), "自定义机型模板未生效"
+        assert all(t.get("source") in ("BUILTIN", "CUSTOM") for t in type_items)
 
         from playwright.sync_api import sync_playwright
 
@@ -125,9 +159,23 @@ def main() -> int:
                 print("ERRORS:", *errors[:10], sep="\n  ")
                 print("BODY:", page.locator("body").inner_text()[:1500])
                 raise
+            # 落地报告（§29）：报告头 + 卡片 + 三张曲线（含折线与 TD 竖线）
+            page.wait_for_selector("text=LANDING REPORT", timeout=10000)
+            report = page.locator("[data-testid='landing-report']").first
+            report_text = report.inner_text()
+            for needle in ("V/S", "G-FORCE", "接地区", "TD DEV",
+                           "ALT PROFILE", "VERTICAL SPEED", "G FORCE"):
+                assert needle in report_text, f"落地报告缺少「{needle}」"
+            assert report.locator("polyline").count() >= 2, "曲线应为折线"
+            assert report.locator("svg text:text-is('TD')").count() >= 1, "曲线缺少 TD 竖线"
             page.locator(".track-controls button").first.click(timeout=10000)
             page.wait_for_timeout(800)
             page.locator(".track-controls button").first.click()
+            # 跑道接地区俯视图要有跑道标志：编号、每 300 m 刻度、100 m 比例尺
+            runway_svg = page.eval_on_selector(
+                "svg[aria-label='Runway touchdown view']", "el => el.textContent || ''")
+            for needle in ("18", "300 m", "100 m"):
+                assert needle in runway_svg, f"跑道图缺少「{needle}」：{runway_svg[:200]}"
             page.screenshot(path=str(ROOT / "out" / "m1_log_detail.png"), full_page=True)
 
             page.goto(f"{base}/map", wait_until="domcontentloaded")
@@ -244,6 +292,10 @@ def main() -> int:
 
             page.goto(f"{base}/settings", wait_until="networkidle")
             page.wait_for_selector("text=数据源")
+            # §27/§28/§30：录制策略的说明与选项
+            assert page.locator("text=录制按 SimLink 的机型标题自动识别").count() > 0
+            assert page.locator("text=连续静止或停机刹车保持").count() > 0
+            assert page.locator("text=发动机启动").count() > 0
 
             # ---- M2 单机运营模式 ----
             page.goto(f"{base}/ops", wait_until="networkidle")
@@ -263,6 +315,13 @@ def main() -> int:
             page.goto(f"{base}/ops/fleet", wait_until="networkidle")
             page.wait_for_selector("text=逐机档案", timeout=15000)
             assert page.locator("text=B-1671").count() > 0
+            # 机型模板抽屉：内置只读说明 + 新增按钮（自定义机型靠接口断言，列表可能翻页）
+            page.click("button:has-text('机型模板')")
+            page.wait_for_selector("text=内置模板只读", timeout=10000)
+            assert page.locator("button:has-text('新增机型')").count() > 0
+            page.screenshot(path=str(ROOT / "out" / "m2_ops_types.png"), full_page=True)
+            page.locator(".ant-drawer-close").first.click()
+            page.wait_for_timeout(300)
 
             page.goto(f"{base}/ops/network", wait_until="networkidle")
             page.wait_for_selector("text=航线与班期", timeout=15000)
@@ -271,6 +330,9 @@ def main() -> int:
 
             page.goto(f"{base}/ops/roster", wait_until="networkidle")
             page.wait_for_selector("text=抽班条件", timeout=15000)
+            # §23/§26：默认排除军用机场、按跑道宽度校验翼展
+            assert page.locator("text=不含军用机场").count() > 0
+            assert page.locator("text=考虑跑道宽度（翼展）").count() > 0
             page.click("button:has-text('抽班')")
             page.wait_for_selector("text=确认这个班", timeout=20000)
             page.screenshot(path=str(ROOT / "out" / "m2_ops_roster.png"), full_page=True)
@@ -306,11 +368,22 @@ def main() -> int:
             for name in ("自由飞行", "配载与执行", "抽班"):
                 assert page.get_by_role("tab", name=name).count() > 0, name
 
-            # 顶部状态条：锁定班表 = 地面等待，点击回到对应页面
+            # 顶部状态条：锁定班表 = 地面等待，点击直接进「配载与执行」页签
             page.wait_for_selector(".app-header button:has-text('地面等待')", timeout=15000)
             page.screenshot(path=str(ROOT / "out" / "m2_ops_status.png"), full_page=True)
             page.locator(".app-header button:has-text('地面等待')").first.click()
-            page.wait_for_selector("text=抽班条件", timeout=15000)
+            page.wait_for_url("**/ops/execute", timeout=15000)
+            page.wait_for_selector(".ant-tabs-tab-active:has-text('配载与执行')", timeout=15000)
+            # 三个页签手工切换后 URL 与高亮一致
+            page.get_by_role("tab", name="抽班").click()
+            page.wait_for_url("**/ops/roster", timeout=10000)
+            page.wait_for_selector(".ant-tabs-tab-active:has-text('抽班')", timeout=10000)
+            page.get_by_role("tab", name="自由飞行").click()
+            page.wait_for_url("**/ops/free", timeout=10000)
+            page.wait_for_selector(".ant-tabs-tab-active:has-text('自由飞行')", timeout=10000)
+            # 深链 ?tab=execute 也能直接落到「配载与执行」
+            page.goto(f"{base}/ops/fly?tab=execute", wait_until="networkidle")
+            page.wait_for_selector(".ant-tabs-tab-active:has-text('配载与执行')", timeout=15000)
 
             page.goto(f"{base}/ops/execute", wait_until="networkidle")
             page.wait_for_selector("text=配载与执行", timeout=15000)
@@ -318,6 +391,16 @@ def main() -> int:
 
             page.goto(f"{base}/ops/settlements", wait_until="networkidle")
             page.wait_for_selector("text=结算", timeout=15000)
+            # 结算详情标题：显示「呼号 DEP→ARR」，不再是「— ????→????」
+            # 财务页顶部还有「周期统计」「近 6 个月」两张表，必须点在结算页签的表格上
+            settle_pane = page.locator(".ant-tabs-tabpane-active").last
+            settle_pane.locator("tbody tr.ant-table-row").first.click()
+            page.wait_for_selector(".ant-drawer-title", timeout=15000)
+            drawer_title = page.locator(".ant-drawer-title").first.inner_text()
+            assert "????" not in drawer_title, drawer_title
+            assert "AOC" in drawer_title and "→" in drawer_title, drawer_title
+            page.locator(".ant-drawer-close").first.click()
+            page.wait_for_timeout(300)
 
             page.goto(f"{base}/ops/finance", wait_until="networkidle")
             page.wait_for_selector("text=总计利润", timeout=15000)

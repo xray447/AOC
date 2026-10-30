@@ -8,9 +8,11 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api";
 import { SimBriefButton } from "../../components/SimBriefButton";
+import { SimlinkNotice } from "../../components/SimlinkNotice";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { fmtBlock, fmtUtc, money, policyAction, settlementStatus } from "../../ops";
+import { simlinkState } from "../../simlink";
 import type {
   FlightStatus, OpsFreeFlight, OpsLoadSheet, OpsRoster, OpsSettlement, OpsTask,
 } from "../../types";
@@ -35,6 +37,7 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
   const navigate = useNavigate();
   const { refresh, recording } = useApp();
+  const sim = simlinkState(recording);
   const [active, setActive] = useState<ActiveResponse | null>(null);
   const [load, setLoad] = useState<OpsLoadSheet | null>(null);
   const [settlement, setSettlement] = useState<OpsSettlement | null>(null);
@@ -86,6 +89,24 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
 
   /** 推出前 ZFW 校验：实际 ZFW 低于配载单时提示「可能漏装旅客/货物」，确认后继续。 */
   const startWithZfwCheck = async () => {
+    // SimLink 在跑但没连上模拟器：这次记录不会有采样点，先确认
+    if (sim.level === "no-sim") {
+      const proceed = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: tr("没连上模拟器", "Simulator not connected"),
+          content: tr(
+            "SimLink 在运行，但没连上 MSFS：这次记录不会有采样点，落地后也无法结算。仍要开始吗？",
+            "SimLink is running but not connected to MSFS: this recording will have no samples and cannot be settled. Start anyway?",
+          ),
+          okText: tr("仍然开始", "Start anyway"),
+          okButtonProps: { danger: true },
+          cancelText: tr("返回", "Back"),
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!proceed) return;
+    }
     let actual = flightStatus?.actual_zfw_kg ?? null;
     if (actual === null) {
       try {
@@ -176,6 +197,7 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     }
     let alive = true;
     const tick = async () => {
+      if (document.hidden) return;   // 页面在后台时不轮询，省 CPU
       try {
         const status = await api<FlightStatus>("/local/ops/flight-status");
         if (alive) setFlightStatus(status);
@@ -275,15 +297,21 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                   <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void startWithZfwCheck()}>
                     {tr("开始记录", "Start recording")}
                   </Button>
-                  <Text type="secondary">
-                    {recording.simlink_connected
-                      ? tr("SimLink 在线：起飞后也会自动开始", "SimLink online: recording also starts automatically after takeoff")
-                      : tr("SimLink 离线：先启动 aoc-simlink 才能采集遥测", "SimLink offline: start aoc-simlink to capture telemetry")}
+                  <Text type={sim.level === "online" ? "secondary" : "warning"}>
+                    {sim.level === "online"
+                      ? tr("SimLink 已连上模拟器：起飞后也会自动开始", "SimLink is connected: recording also starts automatically after takeoff")
+                      : sim.level === "no-sim"
+                        ? tr("SimLink 在运行但没连上模拟器：这次记录可能没有采样点",
+                          "SimLink runs but the simulator is not connected: this recording may have no samples")
+                        : tr("SimLink 未运行：先启动 aoc-simlink 才能采集遥测",
+                          "SimLink is not running: start aoc-simlink to capture telemetry")}
                   </Text>
                 </>
               )}
             </Space>
           </Card>
+
+          <SimlinkNotice style={{ marginTop: 16 }} />
 
           <Card
             className="panel"

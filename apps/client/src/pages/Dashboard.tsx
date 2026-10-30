@@ -12,8 +12,10 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { MetricCard } from "../components/MetricCard";
+import { SimlinkNotice } from "../components/SimlinkNotice";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
+import { simlinkState } from "../simlink";
 import type { FlightList, FlightRecord, Stats } from "../types";
 import { flightTitle, fmtDate, fmtDistance, fmtHms, fmtMinutes, ratingLabels, statusLabels } from "../utils";
 
@@ -28,6 +30,7 @@ export function Dashboard() {
   const [volanta, setVolanta] = useState<{ flown_legs: number; last_sync?: { synced_at: string } | null } | null>(null);
   const [busy, setBusy] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const sim = simlinkState(recording);
 
   const load = useCallback(async () => {
     const [s, f, v] = await Promise.all([
@@ -154,9 +157,11 @@ export function Dashboard() {
             <>
               <div className="hero-title">{tr("准备下一次飞行", "Ready for the next flight")}</div>
               <div className="hero-sub">
-                {recording.simlink_connected
-                  ? tr("SimLink 已连接，起飞后会自动开始记录；也可手动开始。", "SimLink is online — recording starts automatically after takeoff, or manually now.")
-                  : tr("SimLink 离线。请启动 aoc-simlink（或 Tauri 客户端），否则没有遥测可记录。", "SimLink is offline. Start aoc-simlink (or the Tauri client) to record telemetry.")}
+                {sim.level === "online"
+                  ? tr("SimLink 已连上模拟器，起飞后会自动开始记录；也可手动开始。", "SimLink is connected to the simulator — recording starts automatically after takeoff, or manually now.")
+                  : sim.level === "no-sim"
+                    ? tr("SimLink 在运行，但没连上模拟器：先启动 MSFS（见下方排查步骤）。", "SimLink is running but the simulator is not connected — start MSFS (steps below).")
+                    : tr("SimLink 未运行。请启动 aoc-simlink（或 Tauri 客户端），否则没有遥测可记录。", "SimLink is not running. Start aoc-simlink (or the Tauri client) to record telemetry.")}
               </div>
               <Space wrap>
                 <Button type="primary" size="large" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void start()}>
@@ -167,6 +172,7 @@ export function Dashboard() {
               </Space>
             </>
           )}
+          <SimlinkNotice style={{ marginTop: 16 }} />
           {!navdata.available ? (
             <Alert
               style={{ marginTop: 16 }}
@@ -190,8 +196,17 @@ export function Dashboard() {
               <div className="source-value">{navdata.available ? `${navdata.airports.toLocaleString()} ${tr("机场", "airports")} · ${navdata.airways.toLocaleString()} ${tr("航路", "airways")}` : navdata.error}</div>
             </div>
             <div className="source-card">
-              <div className="source-title">SimLink<Tag color={recording.simlink_connected ? "green" : "default"}>{recording.simlink_connected ? tr("在线", "online") : tr("离线", "offline")}</Tag></div>
-              <div className="source-value">{recording.sim_connected ? `${tr("模拟器已连接", "Sim connected")} · ${recording.simlink_version || ""}` : tr("等待模拟器 / demo 源", "Waiting for simulator / demo source")}</div>
+              <div className="source-title">
+                SimLink
+                <Tag color={sim.color}>{tr(sim.zh, sim.en)}</Tag>
+              </div>
+              <div className="source-value">
+                {sim.level === "online"
+                  ? `${sim.source || "simconnect"} · ${recording.simlink_version || ""}${recording.aircraft_title ? ` · ${recording.aircraft_title}` : ""}`
+                  : sim.level === "no-sim"
+                    ? `${tr("模拟器未连接", "Simulator not connected")}${recording.last_connect_error ? ` · ${recording.last_connect_error}` : ""}`
+                    : tr("SimLink 进程未运行", "SimLink process not running")}
+              </div>
             </div>
             <div className="source-card">
               <div className="source-title">Volanta<Tag color={settings.volanta_enabled ? "cyan" : "default"}>{settings.volanta_enabled ? tr("已启用", "enabled") : tr("关闭", "off")}</Tag></div>

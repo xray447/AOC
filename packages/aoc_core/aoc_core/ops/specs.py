@@ -104,6 +104,54 @@ SPEC_OVERRIDES: dict[str, dict[str, Any]] = {
              "fuel_capacity_kg": 126000, "fuel_burn_kg_h": 5600, "lease_per_hour": 8500},
 }
 
+# 翼展（米，docs/TODO §26）：抽班按「翼展 ≤ 跑道宽度推出的上限」过滤机场。
+# 目录里不写翼展，按 category 兜底；常用机型写近似真值。
+WINGSPAN_BY_CATEGORY = {"ga": 15.0, "regional": 28.0, "narrow": 36.0, "wide": 65.0}
+WINGSPAN_OVERRIDES: dict[str, float] = {
+    "C172": 11.0, "B350": 17.7, "C25C": 15.5, "AT76": 27.1, "E190": 28.7, "CRJ9": 24.9,
+    "A319": 35.8, "A320": 35.8, "A321": 35.8, "B738": 35.9, "B39M": 35.9, "B752": 38.0,
+    "A332": 60.3, "A333": 60.3, "A343": 60.3, "A359": 64.8, "A388": 79.8,
+    "B77W": 64.8, "B789": 60.1,
+}
+
+# SimLink `aircraft_title` 的常见写法（MSFS 里的机型名）：只用于自动识别机型。
+# 自定义机型优先用 `title_keyword`；内置机型靠这张表 + ICAO 兜底（法：最长匹配）。
+TITLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "C172": ("CESSNA 172", "SKYHAWK", "C172"),
+    "B350": ("KING AIR", "B350"),
+    "C25C": ("CITATION", "CJ4", "C25C"),
+    "AT76": ("ATR 72", "ATR-72", "AT76"),
+    "E190": ("EMBRAER 190", "E190"),
+    "CRJ9": ("CRJ-900", "CRJ9"),
+    "A319": ("A319",),
+    "A320": ("A320",),
+    "A321": ("A321",),
+    "B738": ("737-800", "737 800", "B738"),
+    "B39M": ("737 MAX", "737MAX", "B39M"),
+    "B752": ("757", "B752"),
+    "A332": ("A330-200", "A332"),
+    "A333": ("A330-300", "A330", "A333"),
+    "A343": ("A340", "A343"),
+    "A359": ("A350-900", "A350", "A359"),
+    "A388": ("A380", "A388"),
+    "B77W": ("777-300", "777", "B77W"),
+    "B789": ("787-9", "787", "B789"),
+}
+
+
+def title_keywords(item: dict[str, Any]) -> tuple[str, ...]:
+    """机型可用于标题匹配的关键词（去重、大写、最长匹配优先由调用方处理）。"""
+    values: list[str] = []
+    custom = str(item.get("title_keyword") or "").strip().upper()
+    if custom:
+        values.append(custom)
+    icao = str(item.get("icao") or "").upper()
+    values.extend(TITLE_KEYWORDS.get(icao, ()))
+    if icao:
+        values.append(icao)
+    return tuple(dict.fromkeys(v for v in values if v))
+
+
 # 公务机变体：与干线同 ICAO，唯一键 (icao, variant)
 EXTRA_VARIANTS: list[dict[str, Any]] = [
     {
@@ -238,6 +286,8 @@ def build_aircraft_types(catalog_items: list[dict[str, Any]], now: str | None = 
         cabin = base.pop("cabin")
         row = {
             "id": new_id(), "icao": icao, "variant": "STANDARD",
+            # 内置模板的标记：不可编辑/删除，只能「复制为自定义」
+            "source": "BUILTIN", "builtin_key": f"{icao}:STANDARD",
             "name": item.get("name") or icao, "manufacturer": item.get("manufacturer"),
             "cabin_config_json": cabin,
             "cruise_speed_kt": item.get("cruise_speed_kt") or 440,
@@ -245,6 +295,8 @@ def build_aircraft_types(catalog_items: list[dict[str, Any]], now: str | None = 
             "min_runway_m": item.get("min_runway_m") or 1600,
             "range_nm": item.get("range_nm") or 3000,
             "pax_capacity": sum(int(v or 0) for v in cabin.values()),
+            "wingspan_m": WINGSPAN_OVERRIDES.get(
+                icao, WINGSPAN_BY_CATEGORY.get(category, 36.0)),
             "engine_count": 2, "engine_type": "JET",
             "wake_category": "M" if category in ("narrow", "regional") else ("H" if category == "wide" else "L"),
             "fare_multiplier": 1.0,
@@ -267,6 +319,8 @@ def build_aircraft_types(catalog_items: list[dict[str, Any]], now: str | None = 
             continue
         row = dict(template)
         row.update({k: v for k, v in variant.items() if k != "cabin"})
+        row["source"] = "BUILTIN"
+        row["builtin_key"] = f"{variant['icao']}:{variant['variant']}"
         cabin = variant.get("cabin") or template["cabin_config_json"]
         row["cabin_config_json"] = cabin
         row["pax_capacity"] = sum(int(v or 0) for v in cabin.values())

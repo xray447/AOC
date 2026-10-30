@@ -28,6 +28,8 @@ public sealed class Sample
     [JsonPropertyName("eng_n1")] public double[] EngN1 { get; set; } = new double[4];
     /// <summary>四台发动机燃烧状态（0/1），退化判定用。</summary>
     [JsonPropertyName("eng_combustion")] public double[] EngCombustion { get; set; } = new double[4];
+    /// <summary>停机刹车（`BRAKE PARKING POSITION`）：自动收尾的硬信号（§30）。</summary>
+    [JsonPropertyName("parking_brake")] public bool ParkingBrake { get; set; }
     [JsonPropertyName("g")] public double G { get; set; } = 1.0;
     [JsonPropertyName("gear")] public int Gear { get; set; }
     [JsonPropertyName("flaps")] public int Flaps { get; set; }
@@ -66,6 +68,12 @@ public sealed class RecordingInfo
     [JsonPropertyName("version")] public string Version { get; set; } = "0.1.0";
     [JsonPropertyName("source")] public string Source { get; set; } = "";
     [JsonPropertyName("auto_start")] public bool AutoStart { get; set; } = true;
+    /// <summary>自动开录起点：engine（默认）/ taxi / takeoff。</summary>
+    [JsonPropertyName("auto_start_mode")] public string AutoStartMode { get; set; } = "engine";
+    /// <summary>连续重连失败次数（simconnect 源）：0 = 当前连接正常或从未失败。</summary>
+    [JsonPropertyName("reconnect_attempts")] public int ReconnectAttempts { get; set; }
+    /// <summary>最近一次连模拟器失败的原始错误（异常类型 + message），供界面折叠展示。</summary>
+    [JsonPropertyName("last_connect_error")] public string? LastConnectError { get; set; }
 }
 
 public sealed class RuntimeInfo

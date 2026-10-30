@@ -18,6 +18,12 @@ export function getBootstrap(): Bootstrap | null {
   return bootstrapData;
 }
 
+/** 后端错误：`code` 对应 OpsError.code，`details` 里可能带 `key`（前端就地高亮字段）。 */
+export interface ApiError extends Error {
+  code?: string;
+  details?: Record<string, unknown>;
+}
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("X-AOC-Token", token);
@@ -25,13 +31,27 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${coreBase}${path}`, { ...init, headers });
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
+    let code: string | undefined;
+    let details: Record<string, unknown> | undefined;
     try {
       const data = await res.json();
-      message = data?.message || data?.detail?.message || data?.detail || message;
+      const detail = data?.detail;
+      if (detail && typeof detail === "object") {
+        code = typeof detail.code === "string" ? detail.code : undefined;
+        details = typeof detail.details === "object" && detail.details ? detail.details : detail;
+        message = detail.message || data?.message || message;
+      } else if (typeof detail === "string") {
+        message = detail;
+      } else if (data?.message) {
+        message = data.message;
+      }
     } catch {
       /* keep status text */
     }
-    throw new Error(message);
+    const error: ApiError = new Error(message);
+    error.code = code;
+    error.details = details;
+    throw error;
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;

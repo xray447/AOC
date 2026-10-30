@@ -6,6 +6,7 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api";
+import { AirportMultiSelect } from "../../components/AirportMultiSelect";
 import { AirportSelect } from "../../components/AirportSelect";
 import { SimBriefButton } from "../../components/SimBriefButton";
 import { useI18n } from "../../i18n";
@@ -17,10 +18,18 @@ const { Text } = Typography;
 const DEFAULTS = {
   window_hours: 24,
   max_legs: 3,
+  // 合计航时（整条班表）与每程航时区间是两个维度，表单里分开标注
   max_block_minutes: 480,
+  min_leg_block_minutes: 30,
+  max_leg_block_minutes: 480,
   min_turnaround_min: 45,
   max_turnaround_min: 360,
   prefer_new_airports: true,
+  follow_routes: true,
+  // 默认排除军用机场、按跑道宽度校验翼展（关掉回到旧行为）
+  exclude_military: true,
+  consider_wingspan: true,
+  excluded_airports: [] as string[],
   aircraft_type_id: undefined as string | undefined,
   base_airport: undefined as string | undefined,
 };
@@ -64,6 +73,22 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
       message.error((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  /** 排除机场快捷填充：最近 20 条日志里出现过的机场（只取 ICAO，去重后最多 12 个）。 */
+  const fillRecentAirports = async () => {
+    try {
+      const res = await api<{ items: { dep_icao?: string | null; arr_icao?: string | null }[] }>(
+        "/local/flights?limit=20");
+      const recent = Array.from(new Set(res.items
+        .flatMap((f) => [f.dep_icao, f.arr_icao])
+        .filter((v): v is string => Boolean(v))));
+      const current = (form.getFieldValue("excluded_airports") as string[] | undefined) || [];
+      form.setFieldValue("excluded_airports",
+        Array.from(new Set([...current, ...recent])).slice(0, 12));
+    } catch (e) {
+      message.error((e as Error).message);
     }
   };
 
@@ -172,7 +197,12 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
               {fmtUtc(roster.locked_at)} → {fmtUtc(roster.expires_at)}
             </Descriptions.Item>
             <Descriptions.Item label={tr("约束", "Constraints")}>
-              {tr("最多", "max")} {String(roster.constraints.max_legs ?? "—")} {tr("段 · 总航时", "legs · block")} {String(roster.constraints.max_block_minutes ?? "—")}min
+              {tr("最多", "max")} {String(roster.constraints.max_legs ?? "—")}
+              {tr(" 段 · 每程 ", " legs · per leg ")}
+              {String(roster.constraints.min_leg_block_minutes ?? "—")}–{String(roster.constraints.max_leg_block_minutes ?? "—")}min
+              {tr(" · 合计 ", " · total ")}
+              {String(roster.constraints.max_block_minutes ?? "—")}min
+              {roster.constraints.follow_routes === false ? tr(" · 任意机场对", " · any airport pair") : ""}
             </Descriptions.Item>
           </Descriptions>
           <Progress percent={Math.round((completed / Math.max(1, roster.legs.length)) * 100)} size="small" />
@@ -261,8 +291,46 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                   </Form.Item>
                 </Col>
                 <Col span={12}>
-                  <Form.Item name="max_block_minutes" label={tr("总飞行时间（min）", "Total block (min)")}>
+                  <Form.Item name="max_block_minutes" label={tr("合计飞行时间（min）", "Total block (min)")}>
                     <InputNumber min={30} max={1440} step={30} style={{ width: "100%" }} />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item
+                    name="min_leg_block_minutes"
+                    label={tr("每程最短航时（min）", "Min per-leg block")}
+                    dependencies={["max_leg_block_minutes"]}
+                    rules={[({ getFieldValue }) => ({
+                      validator: (_rule, value) => {
+                        const max = getFieldValue("max_leg_block_minutes");
+                        if (value == null || max == null || Number(value) <= Number(max)) {
+                          return Promise.resolve();
+                        }
+                        return Promise.reject(new Error(tr(
+                          "不能大于每程最长航时", "Must not exceed max per-leg block")));
+                      },
+                    })]}
+                  >
+                    <InputNumber min={5} max={1440} step={5} style={{ width: "100%" }} />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item
+                    name="max_leg_block_minutes"
+                    label={tr("每程最长航时（min）", "Max per-leg block")}
+                    dependencies={["min_leg_block_minutes"]}
+                    rules={[({ getFieldValue }) => ({
+                      validator: (_rule, value) => {
+                        const min = getFieldValue("min_leg_block_minutes");
+                        if (value == null || min == null || Number(value) >= Number(min)) {
+                          return Promise.resolve();
+                        }
+                        return Promise.reject(new Error(tr(
+                          "不能小于每程最短航时", "Must not be below min per-leg block")));
+                      },
+                    })]}
+                  >
+                    <InputNumber min={10} max={1440} step={30} style={{ width: "100%" }} />
                   </Form.Item>
                 </Col>
                 <Col span={12}>
@@ -276,8 +344,49 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                   </Form.Item>
                 </Col>
                 <Col span={12}>
+                  <Form.Item name="follow_routes" valuePropName="checked"
+                    label={tr("遵循航线", "Follow routes")}
+                    tooltip={tr("关掉后不依赖航线/班期，用 navdata 机场库任意组合起降",
+                      "Turn off to ignore routes/schedules and pair any navdata airports")}>
+                    <Switch />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
                   <Form.Item name="prefer_new_airports" label={tr("优先未飞机场", "Prefer new airports")} valuePropName="checked">
                     <Switch />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item name="exclude_military" valuePropName="checked"
+                    label={tr("不含军用机场", "Exclude military")}
+                    tooltip={tr("navdata 标记的军用机场不进候选（出发机场不受影响）",
+                      "Military airports from navdata are skipped (departure airport is unaffected)")}>
+                    <Switch />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item name="consider_wingspan" valuePropName="checked"
+                    label={tr("考虑跑道宽度（翼展）", "Check wingspan")}
+                    tooltip={tr("按跑道宽度推断翼展上限（45 m → 52 m），近似值，未含 AIP 飞行区等级",
+                      "Wingspan limit is inferred from runway width (45 m → 52 m); approximate, no AIP code letter")}>
+                    <Switch />
+                  </Form.Item>
+                </Col>
+                <Col span={24}>
+                  <Form.Item
+                    name="excluded_airports"
+                    label={tr("排除机场", "Excluded airports")}
+                    extra={(
+                      <span className="muted" style={{ fontSize: 12 }}>
+                        {tr("出发/到达/中转过站都算；留空表示不排除。",
+                          "Departure, arrival and intermediate stops all count; empty = no exclusions.")}
+                        <Button type="link" size="small" onClick={() => void fillRecentAirports()}>
+                          {tr("填入最近去过", "Fill recent")}
+                        </Button>
+                      </span>
+                    )}
+                  >
+                    <AirportMultiSelect placeholder={tr("输入 ICAO 或机场名搜索", "Search ICAO or airport")} />
                   </Form.Item>
                 </Col>
               </Row>
@@ -292,7 +401,17 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
         </Col>
         <Col xs={24} lg={15}>
           <Card className="panel" variant="borderless" title={tr("候选", "Candidates")}
-            extra={draw ? <Text type="secondary">{tr("共评估", "considered")} {draw.considered}</Text> : null}>
+            extra={draw ? (
+              <Space size={8}>
+                {draw.excluded_airports?.length ? (
+                  <Tag color="volcano">
+                    {tr("已排除", "Excluded")} {draw.excluded_airports.length} {tr("个机场", "airports")}
+                  </Tag>
+                ) : null}
+                {draw.follow_routes === false ? <Tag color="cyan">{tr("任意机场对", "Any airport pair")}</Tag> : null}
+                <Text type="secondary">{tr("共评估", "considered")} {draw.considered}</Text>
+              </Space>
+            ) : null}>
             {draw?.candidates.length ? (
               <Space direction="vertical" size={12} style={{ width: "100%" }}>
                 {draw.candidates.map((candidate, index) => (
@@ -305,6 +424,14 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                         <Tag color="blue">{candidate.legs.length} {tr("段", "legs")}</Tag>
                         <Tag>{fmtBlock(candidate.total_block_minutes)}</Tag>
                         <Tag>{Math.round(candidate.total_distance_nm)} NM</Tag>
+                        {candidate.legs.some((l) => l.virtual) ? (
+                          <Tag color="cyan">{tr("虚拟航段", "Virtual leg")}</Tag>
+                        ) : null}
+                        {typeof candidate.legs[0]?.max_wingspan_m === "number" ? (
+                          <Tag color="purple">
+                            {tr("翼展上限", "Wingspan max")} {candidate.legs[0].max_wingspan_m} m
+                          </Tag>
+                        ) : null}
                       </Space>
                     )}
                     extra={(
@@ -349,7 +476,7 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                 ))}
               </Space>
             ) : (
-              <Empty description={tr("设置条件后点「抽班」", "Set constraints and draw")} />
+              <Empty description={draw?.reason || tr("设置条件后点「抽班」", "Set constraints and draw")} />
             )}
           </Card>
         </Col>

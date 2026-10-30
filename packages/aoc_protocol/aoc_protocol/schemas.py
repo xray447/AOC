@@ -51,7 +51,11 @@ class Settings(Model):
     language: Language = "zh"
     units: Units = Field(default_factory=Units)
     auto_start: bool = True
+    # 自动开录起点：engine（发动机运转 10s，含起飞前滑行）/ taxi（滑行 10s）/ takeoff（离地 5s，旧行为）
+    auto_start_on: Literal["engine", "taxi", "takeoff"] = "engine"
     auto_stop: bool = True
+    # 自动收尾的连续静止/停机刹车保持时间（秒）
+    auto_stop_hold_s: int = Field(default=60, ge=30, le=300)
     record_taxi: bool = True
     density: Density = "adaptive"
     max_gap_s: int = Field(default=45, ge=5, le=120)
@@ -189,6 +193,10 @@ class AirportOut(Model):
     lon: float
     elev_ft: float | None = None
     longest_runway_m: float | None = None
+    # 军用机场（navdata is_military，缺列时按名称关键词）：抽班默认排除
+    military: bool = False
+    # 按跑道宽度推断的翼展上限（米）：None = 无数据、不做限制
+    max_wingspan_m: int | None = None
     visited: bool = False
 
 
@@ -404,6 +412,10 @@ class RecordingStatus(Model):
     sim_connected: bool = False
     aircraft_title: str | None = None
     last_error: str | None = None
+    # SimLink 数据源（simconnect / demo / replay）与最近一次连模拟器的错误，
+    # 用来区分「SimLink 没起」和「SimLink 起了但没连上 MSFS」。
+    simlink_source: str | None = None
+    last_connect_error: str | None = None
 
 
 # --------------------------------------------------------------------------

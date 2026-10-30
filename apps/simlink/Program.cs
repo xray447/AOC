@@ -14,6 +14,10 @@ internal static class Program
         [JsonPropertyName("action")] public string Action { get; set; } = "";
         [JsonPropertyName("hz")] public double? Hz { get; set; }
         [JsonPropertyName("enabled")] public bool? Enabled { get; set; }
+        /// <summary>`set_auto_start_mode`：engine / taxi / takeoff。</summary>
+        [JsonPropertyName("mode")] public string? Mode { get; set; }
+        /// <summary>`set_auto_stop_hold`：连续静止/停机刹车保持秒数。</summary>
+        [JsonPropertyName("seconds")] public double? Seconds { get; set; }
     }
 
     private static async Task<int> Main(string[] args)
@@ -88,6 +92,21 @@ internal static class Program
                     return Results.Json(engine.Status());
                 case "set_auto_start":
                     engine.AutoStart = cmd.Enabled ?? true;
+                    return Results.Json(engine.Status());
+                case "set_auto_start_mode":
+                    engine.AutoStartMode = (cmd.Mode ?? "engine").ToLowerInvariant() switch
+                    {
+                        "taxi" => "taxi",
+                        "takeoff" => "takeoff",
+                        _ => "engine",
+                    };
+                    return Results.Json(engine.Status());
+                case "set_auto_stop_hold":
+                    engine.AutoStopHoldS = Math.Clamp(cmd.Seconds ?? 60.0, 30.0, 300.0);
+                    return Results.Json(engine.Status());
+                case "reconnect":
+                    // 立即重建 SimConnect；后台循环本来也会按 5s 退避重试
+                    engine.ReconnectSource();
                     return Results.Json(engine.Status());
                 default:
                     return Results.Json(new { ok = false, error = $"unknown action: {cmd.Action}" });

@@ -16,6 +16,10 @@ def test_a02_auto_start_and_stop(app_client, navdata_path):
                            recording_started_at="2026-10-20T01:00:00Z")
     flight = service.db.get_flight("auto-flight")
     assert flight is not None
+    # §30：接地后只静止约 25s，未达到连续静止 hold（60s）→ 不应提前收尾
+    assert flight["status"] == "RECORDING"
+    service.flights.ingest([p for p in make_points(total=175) if p["t"] > 135])
+    flight = service.db.get_flight("auto-flight")
     assert flight["status"] == "COMPLETED"
     assert flight["block_off_utc"]
     assert flight["takeoff_utc"] and flight["landing_utc"]

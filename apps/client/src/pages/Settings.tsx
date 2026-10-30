@@ -1,4 +1,5 @@
 import {
+  ApiOutlined,
   CloudDownloadOutlined,
   DatabaseOutlined,
   ExportOutlined,
@@ -16,6 +17,7 @@ import { AirportSelect } from "../components/AirportSelect";
 import { VolantaImport } from "../components/VolantaImport";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
+import { openLogFolder, simlinkState } from "../simlink";
 import type { AircraftType, Settings } from "../types";
 import { deepEqual } from "../utils";
 
@@ -32,6 +34,29 @@ export function SettingsPage() {
   const [archivePath, setArchivePath] = useState("");
   const [importPath, setImportPath] = useState("");
   const [archiveBusy, setArchiveBusy] = useState(false);
+  const [reconnectBusy, setReconnectBusy] = useState(false);
+  const sim = simlinkState(recording);
+
+  /** 让 SimLink 立刻重建 SimConnect（否则后台每 5s 自动重试一次）。 */
+  const reconnect = async () => {
+    setReconnectBusy(true);
+    try {
+      await api("/local/simlink/reconnect", { method: "POST" });
+      await refresh();
+      message.success(tr("已请求重新连接，几秒后看状态", "Reconnect requested — check the status in a few seconds"));
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setReconnectBusy(false);
+    }
+  };
+
+  const openLogs = async () => {
+    const ok = await openLogFolder();
+    if (!ok) {
+      message.info(`${tr("日志目录", "Log folder")}: ${bootstrap.logs || `${bootstrap.home}/logs`}`);
+    }
+  };
 
   useEffect(() => { setDraft(settings); }, [settings]);
   useEffect(() => {
@@ -143,9 +168,33 @@ export function SettingsPage() {
               <div className="setting-row">
                 <div>
                   <div className="label">SimLink</div>
-                  <div className="hint">{recording.simlink_connected ? `${tr("已连接", "connected")} · ${recording.simlink_version || ""}` : tr("未连接：启动 aoc-simlink.exe（或 Tauri 客户端）", "Offline: start aoc-simlink.exe (or the Tauri client)")}</div>
+                  <div className="hint">
+                    {tr(sim.zh, sim.en)}
+                    {sim.level === "online" ? ` · ${recording.simlink_version || ""}` : ""}
+                    {sim.source ? ` · source=${sim.source}` : ""}
+                  </div>
+                  {sim.level === "no-sim" && sim.error ? (
+                    <div className="hint" style={{ opacity: 0.75 }}>{sim.error}</div>
+                  ) : null}
+                  {sim.level === "offline" ? (
+                    <div className="hint">
+                      {tr("启动 aoc-simlink.exe（或 Tauri 客户端）后会自动发现。",
+                        "Start aoc-simlink.exe (or the Tauri client) and it is picked up automatically.")}
+                    </div>
+                  ) : null}
                 </div>
-                <Button size="small" icon={<ReloadOutlined />} onClick={() => void refresh()}>{tr("刷新", "Refresh")}</Button>
+                <Space size={6} wrap>
+                  <Button size="small" icon={<ReloadOutlined />} onClick={() => void refresh()}>
+                    {tr("刷新", "Refresh")}
+                  </Button>
+                  <Button size="small" icon={<ApiOutlined />} loading={reconnectBusy}
+                    disabled={!recording.simlink_connected} onClick={() => void reconnect()}>
+                    {tr("重新连接", "Reconnect")}
+                  </Button>
+                  <Button size="small" icon={<FolderOpenOutlined />} onClick={() => void openLogs()}>
+                    {tr("日志目录", "Logs")}
+                  </Button>
+                </Space>
               </div>
               <div className="setting-row">
                 <div>
@@ -168,12 +217,47 @@ export function SettingsPage() {
           <Card className="panel" variant="borderless" title={tr("记录策略", "Recording")}>
             <Space direction="vertical" style={{ width: "100%" }} size={4}>
               <div className="setting-row">
-                <div><div className="label">{tr("自动开始记录", "Auto start")}</div><div className="hint">{tr("离地 >50ft 且 GS>40kt 持续 5s", "Airborne >50ft and GS>40kt for 5s")}</div></div>
-                <Switch checked={draft.auto_start} onChange={(v) => patch({ auto_start: v })} />
+                <div>
+                  <div className="label">{tr("自动开始记录", "Auto start")}</div>
+                  <div className="hint">
+                    {draft.auto_start_on === "takeoff"
+                      ? tr("离地 5s 后开始（旧行为，会丢掉起飞前滑行）", "Starts 5s after liftoff (legacy: loses taxi-out)")
+                      : tr("发动机/滑行满足条件 10s 后开始，含起飞前滑行", "Starts 10s after engine start/taxi, includes taxi-out")}
+                  </div>
+                </div>
+                <Space size={8}>
+                  <Select
+                    value={draft.auto_start_on}
+                    onChange={(v) => patch({ auto_start_on: v })}
+                    style={{ width: 150 }}
+                    options={[
+                      { value: "engine", label: tr("发动机启动", "Engine start") },
+                      { value: "taxi", label: tr("开始滑行", "Taxi") },
+                      { value: "takeoff", label: tr("离地后", "Takeoff") },
+                    ]}
+                  />
+                  <Switch checked={draft.auto_start} onChange={(v) => patch({ auto_start: v })} />
+                </Space>
               </div>
               <div className="setting-row">
-                <div><div className="label">{tr("自动结束记录", "Auto stop")}</div><div className="hint">{tr("接地后 GS<5kt 持续 30s", "On ground, GS<5kt for 30s")}</div></div>
-                <Switch checked={draft.auto_stop} onChange={(v) => patch({ auto_stop: v })} />
+                <div>
+                  <div className="label">{tr("自动结束记录", "Auto stop")}</div>
+                  <div className="hint">
+                    {tr("连续静止或停机刹车保持；到机位才收尾", "Continuous stop or parking brake; stops at the gate")}
+                  </div>
+                </div>
+                <Space size={8}>
+                  <InputNumber
+                    value={draft.auto_stop_hold_s}
+                    min={30}
+                    max={300}
+                    step={10}
+                    style={{ width: 100 }}
+                    addonAfter={tr("秒", "s")}
+                    onChange={(v) => patch({ auto_stop_hold_s: Number(v) || 60 })}
+                  />
+                  <Switch checked={draft.auto_stop} onChange={(v) => patch({ auto_stop: v })} />
+                </Space>
               </div>
               <div className="setting-row">
                 <div><div className="label">{tr("记录滑行段", "Record taxi")}</div><div className="hint">{tr("M1 固定记录滑行（用于滑跑距离），M2 可裁剪", "M1 always records taxi for landing roll; trim in M2")}</div></div>
@@ -247,7 +331,13 @@ export function SettingsPage() {
                 <Input value={draft.callsign} onChange={(e) => patch({ callsign: e.target.value })} style={{ width: 150 }} />
               </div>
               <div className="setting-row">
-                <div><div className="label">{tr("默认机型", "Default aircraft")}</div></div>
+                <div>
+                  <div className="label">{tr("默认机型", "Default aircraft")}</div>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    {tr("仅用于航路规划/推荐；录制按 SimLink 的机型标题自动识别，识别不到才用它",
+                      "Used for route planning/recommendations only; recordings detect the type from SimLink's aircraft title and fall back to this")}
+                  </div>
+                </div>
                 <Select
                   value={draft.aircraft_type}
                   onChange={(v) => patch({ aircraft_type: v })}

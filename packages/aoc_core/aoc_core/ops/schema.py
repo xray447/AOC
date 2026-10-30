@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS aircraft_type (
     id TEXT PRIMARY KEY,
     icao TEXT NOT NULL,
     variant TEXT NOT NULL DEFAULT 'STANDARD',
+    -- BUILTIN = 程序内置模板（不可改/删，只能复制为 CUSTOM）；CUSTOM = 玩家自己加的机型
+    source TEXT NOT NULL DEFAULT 'BUILTIN',
+    builtin_key TEXT,
+    -- 可选：用 SimLink /status 的 aircraft_title 关键字自动匹配机型
+    title_keyword TEXT,
     name TEXT,
     manufacturer TEXT,
     role TEXT NOT NULL DEFAULT 'AIRLINER',
@@ -44,6 +49,8 @@ CREATE TABLE IF NOT EXISTS aircraft_type (
     cruise_fl INTEGER NOT NULL DEFAULT 350,
     fuel_burn_kg_h REAL NOT NULL DEFAULT 2400,
     min_runway_m INTEGER NOT NULL DEFAULT 1600,
+    -- 翼展（米）：抽班/机型替换按「翼展 ≤ 跑道宽度推出的上限」过滤（docs/TODO §26）
+    wingspan_m REAL NOT NULL DEFAULT 0,
     range_nm REAL NOT NULL DEFAULT 3000,
     engine_count INTEGER NOT NULL DEFAULT 2,
     engine_type TEXT,
@@ -323,3 +330,19 @@ def ensure_schema(db: Database) -> None:
         for name in ("flight_prefix",):
             if name not in existing:
                 con.execute(f"alter table ops_profile add column {name} TEXT")
+        # 机型模板：老库补 source/builtin_key/title_keyword（内置模板统一标 BUILTIN）
+        type_cols = {row["name"] for row in con.execute("pragma table_info(aircraft_type)")}
+        for name, ddl in (("source", "TEXT NOT NULL DEFAULT 'BUILTIN'"),
+                          ("builtin_key", "TEXT"), ("title_keyword", "TEXT"),
+                          ("wingspan_m", "REAL NOT NULL DEFAULT 0")):
+            if name not in type_cols:
+                con.execute(f"alter table aircraft_type add column {name} {ddl}")
+        con.execute("update aircraft_type set source='BUILTIN' where source is null or source=''")
+        # 老库没有翼展：按最短跑道给一个保守值（36/52/60.3/65 m），内置模板随后可被覆盖
+        con.execute(
+            "update aircraft_type set wingspan_m = case "
+            "when min_runway_m < 1800 then 36 when min_runway_m < 2500 then 52 "
+            "when min_runway_m < 3200 then 60.3 else 65 end "
+            "where wingspan_m is null or wingspan_m <= 0")
+        con.execute("update aircraft_type set builtin_key = upper(icao) || ':' || upper(variant) "
+                    "where builtin_key is null and source='BUILTIN'")

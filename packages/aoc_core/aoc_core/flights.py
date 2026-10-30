@@ -24,7 +24,9 @@ ACTIVE_KEY = "active_recording"
 AUTO_TAKEOFF_AGL_FT = 50.0
 AUTO_TAKEOFF_GS_KT = 40.0
 AUTO_STOP_GS_KT = 5.0
-AUTO_STOP_HOLD_S = 30.0
+# 自动收尾（§30）：必须「连续静止」达到 hold，或停机刹车保持；旧口径是「接地后任意一帧低速」
+AUTO_STOP_HOLD_S = 60.0
+PARKING_BRAKE_HOLD_S = 30.0
 FRAME_GAP_S = 3.0
 # 内存里最多保留的原始采样条数（1Hz ≈ 30 分钟）。采样逐条写进 raw.jsonl.gz，
 # 到量就丢掉内存里的列表，落地评估时再从文件读回来，避免长航线越飞越占内存。
@@ -72,6 +74,7 @@ def _norm_sample(raw: dict[str, Any]) -> dict[str, Any] | None:
         "sim_rate": num("sim_rate", default=1.0),
         "gear": raw.get("gear"),
         "flaps": raw.get("flaps"),
+        "parking_brake": bool(raw.get("parking_brake")),
         "mode": raw.get("mode"),
     }
 
@@ -90,6 +93,9 @@ class FlightRecorder:
         self.airborne_since: float | None = None
         self.touchdown_t: float | None = None
         self.on_ground_since: float | None = None
+        # 连续静止 / 停机刹车计时（§30）：起飞后 GS<5 起表、≥5 清零；刹车同理
+        self.stopped_since: float | None = None
+        self.parking_brake_since: float | None = None
         self.phase = Phase.PREFLIGHT
         self.seen_airborne = False
         self._last_state: dict[str, Any] | None = None
@@ -164,6 +170,18 @@ class FlightRecorder:
             if abs(float(prev.get("sim_rate") or 1) - float(s.get("sim_rate") or 1)) > 0.01:
                 self.add_event(t, "sim_rate", {"from": prev.get("sim_rate"), "to": s.get("sim_rate")})
 
+        # 连续静止 / 停机刹车：任何一帧超过阈值就清零，避免滑行中减速被当成「停稳」
+        if float(s.get("gs_kt") or 0) < AUTO_STOP_GS_KT:
+            if self.stopped_since is None:
+                self.stopped_since = t
+        else:
+            self.stopped_since = None
+        if s.get("parking_brake"):
+            if self.parking_brake_since is None:
+                self.parking_brake_since = t
+        else:
+            self.parking_brake_since = None
+
         if not s["on_ground"]:
             self.seen_airborne = True
         if s["on_ground"]:
@@ -196,15 +214,23 @@ class FlightRecorder:
             if float(s.get("gs_kt") or 0) < 5:
                 self.phase = Phase.TAXI_IN
 
-    def should_auto_stop(self, auto_stop: bool) -> bool:
-        if not auto_stop or self.airborne_since is not None or self.on_ground_since is None:
-            return False
-        if self._last_state is None:
-            return False
-        if float(self._last_state.get("gs_kt") or 0) >= AUTO_STOP_GS_KT:
+    def should_auto_stop(self, auto_stop: bool, hold_s: float = AUTO_STOP_HOLD_S) -> bool:
+        """自动收尾（§30）：连续静止达到 hold，或停机刹车保持（≤30s）。
+
+        旧口径 `t - on_ground_since >= 30` 里的 `on_ground_since` 是接地时刻，等价于
+        「接地 30s 后只要出现一帧 GS<5 就停」——滑行减速必触发，滑入段被截断。
+        """
+        if not auto_stop or self.airborne_since is not None or self._last_state is None:
             return False
         # 记录器可能是在起飞后才接入（SimLink 自动开始），用「见过空中状态」代替 takeoff 事件
-        return self.seen_airborne and float(self._last_state["t"]) - self.on_ground_since >= AUTO_STOP_HOLD_S
+        if not self.seen_airborne:
+            return False
+        t = float(self._last_state["t"])
+        hold = max(10.0, float(hold_s or AUTO_STOP_HOLD_S))
+        if self.stopped_since is not None and t - self.stopped_since >= hold:
+            return True
+        return (self.parking_brake_since is not None
+                and t - self.parking_brake_since >= min(hold, PARKING_BRAKE_HOLD_S))
 
     @property
     def raw_points(self) -> int:
@@ -222,13 +248,15 @@ class FlightService:
                  nav_provider: Callable[[], NavData | None],
                  settings_provider: Callable[[], dict[str, Any]],
                  aircraft_type: Callable[[], str] | None = None,
-                 callsign: Callable[[], str] | None = None):
+                 callsign: Callable[[], str] | None = None,
+                 type_matcher: Callable[[str | None], str | None] | None = None):
         self.db = db
         self.paths = paths
         self._nav = nav_provider
         self._settings = settings_provider
         self._aircraft_type = aircraft_type or (lambda: "A320")
         self._callsign = callsign or (lambda: "AOC001")
+        self.type_matcher = type_matcher
         self.recorder: FlightRecorder | None = None
         # M2 运营模式钩子：开始录制时读取任务上下文（班表航段/自由飞），落地后交给结算
         self.ops_context: Callable[[], dict[str, Any] | None] | None = None
@@ -238,10 +266,15 @@ class FlightService:
         self.simlink_version: str | None = None
         self.aircraft_title: str | None = None
         self.last_error: str | None = None
+        # 数据源与连模拟器的错误：三态提示（未运行 / 运行但没连上 / 已连接）用
+        self.simlink_source: str | None = None
+        self.last_connect_error: str | None = None
         # 记录状态展示用的计时（口径见 P-04），由 SimLink 下发、只展示不结算
         self.engine_seconds = 0
         self.flight_seconds = 0
         self.engine_estimated = False
+        # core 自己判定收尾后，要让 PersonalService 通知 SimLink 也停下（§30）
+        self.auto_stopped = False
         self._persisted = self._load_persisted()
 
     # -- 持久化 -----------------------------------------------------------
@@ -312,6 +345,7 @@ class FlightService:
             # SimLink 已收尾或重复轮询，不要重复建档
             return self.status()
         self.recorder = FlightRecorder(fid, started, self.paths)
+        self.auto_stopped = False
         self.recorder.add_event(0.0, "recording_started", {"manual": manual})
         actual_zfw = (ctx or {}).get("actual_zfw_kg")
         zfw_delta = (ctx or {}).get("zfw_delta_kg")
@@ -321,9 +355,17 @@ class FlightService:
                 "actual_zfw_kg": actual_zfw, "delta_kg": zfw_delta,
             })
         if existing is None:
+            # 机型优先级：任务上下文 → SimLink 标题匹配（机队/机型模板 keyword）→ 设置默认值
+            aircraft_type = (ctx or {}).get("aircraft_type") or ""
+            if not aircraft_type and self.type_matcher is not None:
+                try:
+                    aircraft_type = self.type_matcher(self.aircraft_title) or ""
+                except Exception:  # noqa: BLE001
+                    aircraft_type = ""
+            aircraft_type = aircraft_type or self._aircraft_type()
             record: dict[str, Any] = {
                 "id": fid, "mode": "PERSONAL", "status": "RECORDING",
-                "callsign": self._callsign(), "aircraft_type": self._aircraft_type(),
+                "callsign": self._callsign(), "aircraft_type": aircraft_type,
                 "aircraft_title": self.aircraft_title, "block_off_utc": started,
                 "created_at": started,
             }
@@ -392,8 +434,11 @@ class FlightService:
             self.recorder.ingest(raw)
         if self.recorder.sample_count:
             settings = self._settings()
-            if self.recorder.should_auto_stop(bool(settings.get("auto_stop", True))):
+            hold = float(settings.get("auto_stop_hold_s", AUTO_STOP_HOLD_S) or AUTO_STOP_HOLD_S)
+            if self.recorder.should_auto_stop(bool(settings.get("auto_stop", True)), hold):
                 self.auto_stop()
+                # 让 PersonalService 顺手通知 SimLink 收尾（否则 core 停了、SimLink 还在录）
+                self.auto_stopped = True
 
     # -- 完成 -------------------------------------------------------------
     def _anomalies(self, samples: list[dict[str, Any]]) -> list[str]:
@@ -428,7 +473,10 @@ class FlightService:
             return None
         settings = self._settings()
         nav = self._nav()
-        result = evaluate(points, nav, rating_thresholds(settings), self._aircraft_type())
+        # 收尾统一用建档时已存的机型：事后改「默认机型」不会让旧记录前后不一致
+        stored = self.db.get_flight(rec.flight_id) or {}
+        aircraft_type = stored.get("aircraft_type") or self._aircraft_type()
+        result = evaluate(points, nav, rating_thresholds(settings), aircraft_type)
         takeoff_idx = result.get("takeoff_index")
         landing_idx = result.get("landing_index")
         if takeoff_idx is None:
@@ -504,6 +552,9 @@ class FlightService:
             "track_fidelity_m": fidelity_m(points, saved),
             "track_sha256": hashlib.sha256(
                 "".join(c["sha256"] for c in chunks).encode()).hexdigest() if chunks else None,
+            # 发动机运转时间（§27）：SimLink 从发动机启动开始计，含起飞前滑行
+            "engine_seconds": int(self.engine_seconds or 0) or None,
+            "engine_estimated": 1 if self.engine_estimated else 0,
             "data_gap_seconds": result.get("data_gap_seconds"),
             "validation_status": "SUSPECT" if anomalies else "VALID",
             "anomaly_flags_json": anomalies,
@@ -514,7 +565,7 @@ class FlightService:
             self.db.add_flown_leg({
                 "dep_icao": dep, "arr_icao": arr,
                 "flight_date": (block_off or "")[:10] or None,
-                "aircraft_type": self._aircraft_type(),
+                "aircraft_type": aircraft_type,
                 "duration_min": int(round(block_minutes)),
                 "landing_rate_fpm": metrics.get("touchdown_vs_fpm"),
                 "source": "AOC", "external_id": rec.flight_id,
@@ -543,4 +594,6 @@ class FlightService:
             sim_connected=self.sim_connected,
             aircraft_title=self.aircraft_title,
             last_error=self.last_error,
+            simlink_source=self.simlink_source,
+            last_connect_error=self.last_connect_error,
         )

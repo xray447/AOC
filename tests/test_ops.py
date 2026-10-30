@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -9,10 +11,12 @@ import pytest
 
 from aoc_core.lock import InstanceLocked, SingleInstance
 from aoc_core.paths import AppPaths
+from aoc_core.ops import service as ops_service
 from aoc_core.ops.economy import parse_utc
-from aoc_core.ops.service import OpsError
+from aoc_core.ops.service import OpsError, candidate_score
 from aoc_core.service import PersonalService
 from aoc_route.simbrief import split_callsign
+from tests.conftest import add_airport_flags
 
 
 @pytest.fixture()
@@ -673,3 +677,472 @@ def test_recording_start_persists_actual_zfw_and_timers(ops: PersonalService):
     flight = ops.db.get_flight(status["flight_id"])
     assert flight["actual_zfw_kg"] == pytest.approx(5000)
     assert flight["zfw_delta_kg"] is not None and flight["zfw_delta_kg"] < 0
+
+
+# ------------------------------------------------------- 抽班：不遵循航线/排除/每程航时
+CUSTOM_TYPE = {
+    "icao": "XWJ", "variant": "WIDE", "name": "Homebuilt Widebody", "manufacturer": "Homebuilt",
+    "role": "AIRLINER", "pax_capacity": 300,
+    "cabin_config_json": {"first": 8, "business": 42, "premium_economy": 24, "economy": 226},
+    "cargo_capacity_kg": 18000,
+    "oew_kg": 150000, "mzfw_kg": 200000, "mlw_kg": 210000, "mtow_kg": 280000,
+    "fuel_capacity_kg": 110000, "fuel_burn_kg_h": 6000, "cruise_speed_kt": 470,
+    "cruise_fl": 370, "min_runway_m": 2400, "range_nm": 6000,
+    "lease_per_hour": 9000, "title_keyword": "Homebuilt Widebody",
+}
+
+
+def test_draw_ignores_routes_when_disabled(ops: PersonalService):
+    """关掉「遵循航线」后不依赖航线/班期：用 navdata 机场库生成虚拟航段，确认后能开始。"""
+    with ops.ops._tx() as con:
+        con.execute("delete from schedule_template")
+        con.execute("delete from flight_instance")
+        con.execute("delete from ops_route")
+    result = _draw(ops, follow_routes=False, max_legs=2)
+    assert result["follow_routes"] is False
+    assert len(result["candidates"]) == 3, "关掉航线后仍应抽出 3 个候选"
+    for candidate in result["candidates"]:
+        assert candidate["legs"] and all(leg["virtual"] for leg in candidate["legs"])
+        assert candidate["legs"][0]["dep"]  # 首段从飞机当前位置出发
+    shapes = {tuple((leg["dep"], leg["arr"]) for leg in c["legs"]) for c in result["candidates"]}
+    assert len(shapes) == 3, "三个候选应是不同的机场对"
+
+    roster = ops.ops.confirm_roster(result["candidates"][0]["candidate_token"], 0)
+    assert roster["status"] == "LOCKED"
+    assert all(leg["callsign"] for leg in roster["legs"])
+    started = ops.ops.start_leg(roster["id"], 1)
+    assert started["load_sheet"]["distance_nm"] > 0
+    # 取消班表时虚拟航段作废，不再回到候选池
+    ops.ops.cancel_roster(roster["id"], "测试")
+    instances = ops.ops.list_instances(status="CANCELLED", days=30)
+    assert any(i["mission_type"] == "FREE" for i in instances)
+
+
+def test_draw_excludes_airports(ops: PersonalService):
+    """排除机场：出发/到达/中转过站都不再出现（遵循航线与不遵循航线都生效）。"""
+    result = _draw(ops, follow_routes=True, excluded_airports=["ZSSS"])
+    assert result["excluded_airports"] == ["ZSSS"]
+    assert result["candidates"]
+    for candidate in result["candidates"]:
+        for leg in candidate["legs"]:
+            assert "ZSSS" not in (leg["dep"], leg["arr"])
+
+    virtual = _draw(ops, follow_routes=False, excluded_airports=["zsss"])
+    assert virtual["excluded_airports"] == ["ZSSS"]
+    for candidate in virtual["candidates"]:
+        for leg in candidate["legs"]:
+            assert "ZSSS" not in (leg["dep"], leg["arr"])
+
+
+def test_draw_respects_per_leg_block_range(ops: PersonalService):
+    """每程航时区间：单段 block 必须落在 [min, max]，与「合计」max_block 互不影响。"""
+    result = _draw(ops, follow_routes=False, min_leg_block_minutes=60,
+                   max_leg_block_minutes=120, max_block_minutes=480)
+    assert result["candidates"]
+    for candidate in result["candidates"]:
+        for leg in candidate["legs"]:
+            assert 60 <= leg["block_minutes"] <= 120
+    assert result["constraints"]["min_leg_block_minutes"] == 60
+    assert result["constraints"]["max_leg_block_minutes"] == 120
+
+
+def test_draw_min_leg_block_greater_than_max_rejected(ops: PersonalService):
+    with pytest.raises(OpsError) as exc:
+        _draw(ops, min_leg_block_minutes=300, max_leg_block_minutes=120)
+    assert exc.value.code == "PARAM_OUT_OF_RANGE"
+    assert exc.value.details.get("key") == "min_leg_block_minutes"
+
+
+def test_draw_follow_routes_keeps_legacy_behaviour(ops: PersonalService):
+    """默认（遵循航线）与旧行为一致：候选全部来自已有航班实例，没有虚拟航段。"""
+    result = _draw(ops)
+    assert result["follow_routes"] is True
+    assert result["candidates"]
+    for candidate in result["candidates"]:
+        assert all(leg.get("virtual") is False for leg in candidate["legs"])
+        assert all(leg["flight_instance_id"] for leg in candidate["legs"])
+    assert result["constraints"]["excluded_airports"] == []
+
+
+# ------------------------------------------------------- 自定义机型模板（P-07/P-10）
+def test_custom_aircraft_type_feeds_loadsheet_and_settlement(ops: PersonalService):
+    custom = ops.ops.create_type(CUSTOM_TYPE)
+    assert custom["source"] == "CUSTOM" and custom["pax_capacity"] == 300
+    aircraft = ops.ops.add_aircraft({"registration": "B-CST", "base_airport_icao": "ZBAA",
+                                     "type_id": custom["id"]})
+    assert aircraft["type_icao"] == "XWJ"
+
+    roster, _ = _confirm(ops, registration="B-CST", aircraft_type_id=custom["id"])
+    assert roster["aircraft"]["type"] == "XWJ"
+    flight, settlement, started = _fly(ops, roster["id"], 1, fuel_used_kg=5200)
+    sheet = started["load_sheet"]
+    assert sheet["oew_kg"] == pytest.approx(CUSTOM_TYPE["oew_kg"])
+    assert sheet["pax_total"] <= CUSTOM_TYPE["pax_capacity"]
+    assert settlement["status"] == "SETTLED"
+    fuel = next(i for i in settlement["breakdown"]["costs"] if i["type"] == "COST_FUEL")
+    price = ops.ops.economy_params()["fuel_price"]
+    assert fuel["amount"] == pytest.approx(round(5200 * price, 2))
+    assert ops.ops.load_sheet(flight["id"])["aircraft_type_id"] == custom["id"]
+
+
+def test_custom_type_rejects_invalid_weights(ops: PersonalService):
+    cases = [
+        ({"oew_kg": 210000}, "oew_kg"),
+        ({"mzfw_kg": 300000}, "mzfw_kg"),
+        ({"mlw_kg": 300000}, "mlw_kg"),
+        ({"min_runway_m": 9000}, "min_runway_m"),
+        ({"cruise_speed_kt": 20}, "cruise_speed_kt"),
+        ({"pax_capacity": 100}, "pax_capacity"),
+    ]
+    for patch, key in cases:
+        with pytest.raises(OpsError) as exc:
+            ops.ops.create_type({**CUSTOM_TYPE, **patch})
+        assert exc.value.code == "PARAM_OUT_OF_RANGE", patch
+        assert exc.value.details.get("key") == key, patch
+
+
+def test_delete_custom_type_blocked_when_in_fleet(ops: PersonalService):
+    custom = ops.ops.create_type(CUSTOM_TYPE)
+    aircraft = ops.ops.add_aircraft({"registration": "B-CST", "base_airport_icao": "ZBAA",
+                                     "type_id": custom["id"]})
+    with pytest.raises(OpsError) as exc:
+        ops.ops.delete_type(custom["id"])
+    assert exc.value.code == "AIRCRAFT_TYPE_IN_USE"
+    assert exc.value.details.get("in_fleet") == 1
+
+    with ops.ops._tx() as con:
+        con.execute("delete from aircraft where id=?", (aircraft["id"],))
+    assert ops.ops.delete_type(custom["id"]) is True
+    assert ops.ops.get_type(custom["id"]) is None
+
+
+def test_builtin_type_copy_to_custom(ops: PersonalService):
+    builtin = next(t for t in ops.ops.list_types() if t["source"] == "BUILTIN")
+    with pytest.raises(OpsError) as exc:
+        ops.ops.update_type(builtin["id"], {"oew_kg": 1000})
+    assert exc.value.code == "BUILTIN_TYPE_READONLY"
+    with pytest.raises(OpsError) as exc:
+        ops.ops.delete_type(builtin["id"])
+    assert exc.value.code == "BUILTIN_TYPE_READONLY"
+
+    copy = ops.ops.create_type({**builtin, "variant": "CUSTOM", "name": "Copied"})
+    assert copy["source"] == "CUSTOM"
+    assert (copy["icao"], copy["variant"]) == (builtin["icao"], "CUSTOM")
+    # 复制出来的可以改参数
+    edited = ops.ops.update_type(copy["id"], {"fuel_burn_kg_h": 2500})
+    assert edited["fuel_burn_kg_h"] == pytest.approx(2500)
+    # 内置的那条不受影响
+    assert ops.ops.get_type(builtin["id"])["source"] == "BUILTIN"
+
+
+# --------------------------------------------------------- §23 军用机场
+def _flagged_ops(tmp_path: Path, navdata_path: Path, **flags) -> PersonalService:
+    """带 is_military / 跑道宽度的 navdata + 演示机队（§23/§26 用例共用）。"""
+    add_airport_flags(navdata_path, **flags)
+    service = PersonalService(AppPaths.create(tmp_path / "home-flagged"))
+    service.update_settings({"navdata_path": str(navdata_path)})
+    service.ops.seed_demo()
+    return service
+
+
+def _standard_type(service: PersonalService, icao: str) -> dict:
+    return next(t for t in service.ops.list_types()
+                if t["icao"] == icao and t["variant"] == "STANDARD")
+
+
+def _pool(service: PersonalService, icao: str, **constraints) -> list[str]:
+    constraints.setdefault("follow_routes", False)
+    cfg = service.ops._constraints(constraints)
+    pool = service.ops._airport_pool("ZBAA", _standard_type(service, icao), cfg, random.Random(7))
+    return [item["icao"] for item in pool]
+
+
+def test_airport_pool_excludes_military_airports(tmp_path: Path, navdata_path: Path):
+    """navdata 标记的军用机场不进候选；关掉开关才回来。出发机场不受影响。"""
+    service = _flagged_ops(tmp_path, navdata_path, military=("ZBTJ", "ZBSJ"))
+    assert service.nav.airport("ZBTJ")["military"] is True
+
+    pool = _pool(service, "B738")
+    assert pool, "民用机场应还在池里"
+    assert "ZBTJ" not in pool and "ZBSJ" not in pool
+    assert "ZBAA" not in pool  # 出发机场本身不重复出现
+
+    off = _pool(service, "B738", exclude_military=False)
+    assert {"ZBTJ", "ZBSJ"} & set(off), "关掉开关后旧行为应恢复"
+
+    # 搜索接口也透出 military 标记（前端「排除军用机场」提示用）
+    found = {a.icao: a for a in service.search_airports("Tianjin")}
+    assert found["ZBTJ"].military is True
+
+
+def test_military_falls_back_to_name_keyword(navdata_path: Path):
+    """缺 is_military 列时按名称关键词判断，默认仍按民用处理。"""
+    import sqlite3
+
+    from aoc_navdata import NavData
+
+    con = sqlite3.connect(navdata_path)
+    con.execute("update airport set name='Beale Air Force Base' where ident='RJAA'")
+    con.execute("update airport set name='Naval Air Station' where ident='LROP'")
+    con.commit()
+    con.close()
+    nav = NavData(navdata_path)
+    try:
+        assert nav.airport("RJAA")["military"] is True
+        assert nav.airport("LROP")["military"] is True
+        assert nav.airport("ZSSS")["military"] is False
+    finally:
+        nav.close()
+
+
+# --------------------------------------------------------- §26 翼展 / 跑道宽度
+def test_draw_respects_runway_width_for_wingspan(tmp_path: Path, navdata_path: Path):
+    """45 m 宽（148 ft）只放行 D 类（52 m）：A330 不行；60 m 放行宽体；开关关掉回旧行为。"""
+    service = _flagged_ops(tmp_path, navdata_path,
+                           width_ft={"ZSHC": 98.0, "ZSNJ": 148.0, "ZSPD": 197.0})
+    assert service.nav.airport("ZSHC")["runway_width_m"] == pytest.approx(29.9, abs=0.1)
+    assert service.nav.airport("ZSNJ")["max_wingspan_m"] == 52
+    assert service.nav.airport("ZSPD")["max_wingspan_m"] == 80
+
+    wide = _pool(service, "A333")          # 60.3 m
+    assert "ZSHC" not in wide              # 30 m → 36 m 上限
+    assert "ZSNJ" not in wide              # 45 m → 52 m 上限
+    assert "ZSPD" in wide                  # 60 m → 80 m 上限
+
+    narrow = _pool(service, "B738")        # 35.9 m：30 m 宽度刚好放行
+    assert "ZSHC" in narrow
+    assert "ZSNJ" in narrow
+
+    long_body = _pool(service, "B752")     # 38.0 m：30 m 不行、45 m 可以
+    assert "ZSHC" not in long_body
+    assert "ZSNJ" in long_body
+
+    off = _pool(service, "A333", consider_wingspan=False)
+    assert {"ZSHC", "ZSNJ"} <= set(off), "关掉开关后应回到旧行为"
+
+    # 机型替换同样要过翼展
+    inst = {"dep_icao": "ZBAA", "arr_icao": "ZSNJ", "route_id": None}
+    assert service.ops._can_operate(inst, _standard_type(service, "A333")) is False
+    assert service.ops._can_operate(inst, _standard_type(service, "B738")) is True
+
+
+def test_missing_width_column_means_no_limit(navdata_path: Path):
+    """navdata 没有宽度数据时不做翼展限制（max_wingspan_m = None）。"""
+    from aoc_navdata import NavData
+
+    nav = NavData(navdata_path)
+    try:
+        assert nav.airport("ZSSS")["max_wingspan_m"] is None
+        assert nav.max_wingspan_m("ZSSS") is None
+    finally:
+        nav.close()
+
+
+def test_aircraft_type_wingspan_defaults_and_validation(ops: PersonalService):
+    """机型模板带 wingspan_m：缺省按最短跑道推断，复制为自定义后可改。"""
+    narrow = _standard_type(ops, "A320")
+    assert narrow["wingspan_m"] == pytest.approx(35.8)
+    custom = ops.ops.create_type({**CUSTOM_TYPE, "wingspan_m": 66.0})
+    assert custom["wingspan_m"] == pytest.approx(66.0)
+    with pytest.raises(OpsError) as exc:
+        ops.ops.update_type(custom["id"], {"wingspan_m": 200})
+    assert exc.value.code == "PARAM_OUT_OF_RANGE"
+    assert exc.value.details.get("key") == "wingspan_m"
+
+    # 留空（0）→ 按 min_runway_m 推保守值
+    generated = ops.ops.create_type({k: v for k, v in CUSTOM_TYPE.items()
+                                     if k not in ("icao",)} | {"icao": "XW2", "wingspan_m": 0})
+    assert generated["wingspan_m"] == pytest.approx(52.0)
+
+
+# --------------------------------------------------------- §24 候选多样性
+def test_candidate_score_no_longer_favours_one_long_loss_leg():
+    """478 min 单段亏钱航线不应压过 464 min 三段链（旧口径下的实测现象）。"""
+    single = candidate_score(utilization=478 / 480, new_airports=2, profit=-56901,
+                             block_minutes=[478], leg_count=1, max_legs=3,
+                             random_part=0.5, prefer_new_airports=True)
+    multi = candidate_score(utilization=464 / 480, new_airports=3, profit=1000,
+                            block_minutes=[140, 150, 174], leg_count=3, max_legs=3,
+                            random_part=0.5, prefer_new_airports=True)
+    assert multi > single
+
+
+def test_draw_top3_uses_distinct_aircraft_and_routes(ops: PersonalService):
+    """top3 不再出现「同一架飞机 + 同一航线形状」的重复候选（遵循/不遵循航线都算）。"""
+    for follow in (True, False):
+        result = _draw(ops, follow_routes=follow, max_legs=2)
+        candidates = result["candidates"]
+        assert candidates
+        aircraft_ids = [c["aircraft"]["id"] for c in candidates]
+        assert len(aircraft_ids) == len(set(aircraft_ids))
+        shapes = [tuple((leg["dep"], leg["arr"]) for leg in c["legs"]) for c in candidates]
+        assert len(shapes) == len(set(shapes))
+        if not follow:
+            deps = {c["legs"][0]["scheduled_dep_utc"] for c in candidates}
+            assert len(deps) >= 2, "虚拟航段的首段起飞时刻应错开"
+
+
+def test_select_top_drops_same_aircraft_and_shape():
+    def candidate(aircraft: str, legs: list[tuple[str, str]]) -> dict:
+        return {"aircraft": {"id": aircraft},
+                "legs": [{"dep": d, "arr": a} for d, a in legs]}
+
+    items = [
+        candidate("AC1", [("ZBAA", "ZSSS"), ("ZSSS", "ZBAA")]),
+        candidate("AC1", [("ZBAA", "ZLXY")]),
+        candidate("AC2", [("ZBAA", "ZSSS"), ("ZSSS", "ZBAA")]),
+        candidate("AC3", [("ZBAA", "ZPPP")]),
+        candidate("AC4", [("ZBAA", "ZGGG")]),
+    ]
+    top = ops_service.OpsService._select_top(items, 3)
+    assert [c["aircraft"]["id"] for c in top] == ["AC1", "AC3", "AC4"]
+
+
+# --------------------------------------------------------- §27/§30 自动开录/收尾
+def _frame(t: float, *, gs: float = 0.0, on_ground: bool = True,
+           parking_brake: bool = False) -> dict:
+    return {"t": t, "lat": 31.1979, "lon": 121.3363, "gs_kt": gs,
+            "on_ground": on_ground, "parking_brake": parking_brake}
+
+
+def _record(tmp_path: Path, frames: list[dict]):
+    from aoc_core.flights import FlightRecorder
+
+    rec = FlightRecorder("test-flight", "2026-01-01T00:00:00Z", AppPaths.create(tmp_path / "h"))
+    for seq, frame in enumerate(frames):
+        rec.ingest({**frame, "seq": seq})
+    return rec
+
+
+def test_auto_stop_ignores_transient_low_speed_during_taxi(tmp_path: Path):
+    """接地 30s 后 GS 掉到 4kt 又回升到 15kt：不该收尾（旧判据会在这里误停）。"""
+    frames = [_frame(t, gs=200, on_ground=False) for t in range(0, 11)]
+    frames += [_frame(11, gs=120)]
+    frames += [_frame(41, gs=4)]        # 接地满 30s 的瞬时低速
+    frames += [_frame(t, gs=15) for t in range(42, 61)]
+    rec = _record(tmp_path, frames)
+    try:
+        assert rec.seen_airborne
+        assert rec.should_auto_stop(True, 60) is False
+    finally:
+        rec.close()
+
+
+def test_auto_stop_requires_continuous_stop(tmp_path: Path):
+    frames = [_frame(t, gs=200, on_ground=False) for t in range(0, 11)]
+    frames += [_frame(t, gs=4) for t in range(11, 90)]
+    rec = _record(tmp_path, frames)
+    try:
+        assert rec.should_auto_stop(True, 60) is True
+    finally:
+        rec.close()
+
+
+def test_auto_stop_parking_brake_signal(tmp_path: Path):
+    frames = [_frame(t, gs=200, on_ground=False) for t in range(0, 11)]
+    frames += [_frame(t, gs=12) for t in range(11, 51)]
+    frames += [_frame(t, gs=0, parking_brake=True) for t in range(51, 82)]
+    rec = _record(tmp_path, frames)
+    try:
+        assert rec.parking_brake_since == 51
+        assert rec.should_auto_stop(True, 60) is True
+    finally:
+        rec.close()
+
+
+def test_auto_stop_never_fires_in_flight(tmp_path: Path):
+    frames = [_frame(t, gs=0, on_ground=False) for t in range(0, 120)]
+    rec = _record(tmp_path, frames)
+    try:
+        assert rec.should_auto_stop(True, 60) is False
+    finally:
+        rec.close()
+
+
+# --------------------------------------------------------- §28 机型按标题识别
+def test_recording_detects_aircraft_type_from_title(ops: PersonalService):
+    """无任务录制：按 SimLink 的 aircraft_title 匹配内置机型，而不是永远记 A320。"""
+    from tests.conftest import make_points
+
+    ops.update_settings({"aircraft_type": "A320"})
+    ops.flights.aircraft_title = "Boeing 737-800 PMDG"
+    ops.flights.start()
+    flight_id = ops.flights.recorder.flight_id
+    assert ops.db.get_flight(flight_id)["aircraft_type"] == "B738"
+
+    # 事后改「默认机型」不影响这条记录（评估/统计都读建档时存的机型）
+    ops.update_settings({"aircraft_type": "A359"})
+    ops.flights.ingest(make_points(step=1.0), auto_ingest=False)
+    flight = ops.flights.stop()
+    assert flight["aircraft_type"] == "B738"
+    assert flight["aircraft_title"] == "Boeing 737-800 PMDG"
+    leg = ops.db.list_flown_legs()[0]
+    assert leg["aircraft_type"] == "B738"
+
+
+def test_recording_type_custom_keyword_wins_and_default_falls_back(ops: PersonalService):
+    custom = ops.ops.create_type({
+        **CUSTOM_TYPE, "icao": "XW4", "title_keyword": "BOEING 737-800 BBJ",
+    })
+    assert custom["source"] == "CUSTOM"
+    matched = ops.ops.match_type_by_title("Boeing 737-800 BBJ Livery")
+    assert matched["id"] == custom["id"], "自定义 title_keyword 更长，应优先命中"
+
+    ops.update_settings({"aircraft_type": "A320"})
+    ops.flights.aircraft_title = "Some Unknown Kit Plane"
+    ops.flights.start()
+    assert ops.db.get_flight(ops.flights.recorder.flight_id)["aircraft_type"] == "A320"
+
+
+# --------------------------------------------------------- §25 随机航班号
+class _FixedRandom:
+    """替换 random.SystemRandom：按给定顺序返回 3 位数字，用于确定性断言。"""
+
+    def __init__(self, values: list[int]):
+        self.values = list(values)
+
+    def randint(self, low: int, high: int) -> int:  # noqa: ARG002
+        value = self.values.pop(0) if self.values else 137
+        return max(low, min(high, value))
+
+
+def test_virtual_flight_numbers_are_random_and_unique(ops: PersonalService, monkeypatch):
+    monkeypatch.setattr(ops_service.random, "SystemRandom", lambda: _FixedRandom([137, 402, 137]))
+    dep = "2026-11-01T08:00:00Z"
+    with ops.ops._tx() as con:
+        used: set[str] = set()
+        first = ops.ops._virtual_flight_number(con, "OVO", dep, used)
+        second = ops.ops._virtual_flight_number(con, "OVO", dep, used)
+    assert (first, second) == ("OVO137", "OVO402")
+    assert first != second  # 同一班表内不复用
+
+
+def test_virtual_flight_number_skips_existing_and_falls_back(ops: PersonalService, monkeypatch):
+    dep = "2026-11-02T08:00:00Z"
+    stamp = "2026-11-02T00:00:00Z"
+    with ops.ops._tx() as con:
+        con.execute(
+            "insert into flight_instance(id, flight_number, dep_icao, arr_icao, scheduled_dep_utc, "
+            "scheduled_arr_utc, mission_type, status, created_at, updated_at) "
+            "values('x1','OVO137','ZBAA','ZSSS',?,?,'FREE','SCHEDULED',?,?)",
+            (dep, dep, stamp, stamp))
+    monkeypatch.setattr(ops_service.random, "SystemRandom", lambda: _FixedRandom([137, 402]))
+    with ops.ops._tx() as con:
+        number = ops.ops._virtual_flight_number(con, "OVO", dep)
+    assert number == "OVO402", "同号 + 同时刻冲突时换号"
+
+    # 随机 50 次全撞号 + 3 位顺序号用满 → 退回带随机的号（保证唯一性）
+    with ops.ops._tx() as con:
+        for n in range(1, 1000):
+            if n == 137:
+                continue   # 上面已经插过
+            con.execute(
+                "insert into flight_instance(id, flight_number, dep_icao, arr_icao, scheduled_dep_utc, "
+                "scheduled_arr_utc, mission_type, status, created_at, updated_at) "
+                "values(?,?,'ZBAA','ZSSS',?,?,'FREE','SCHEDULED',?,?)",
+                (f"id{n}", f"OVO{n:03d}", dep, dep, stamp, stamp))
+    monkeypatch.setattr(ops_service.random, "SystemRandom", lambda: _FixedRandom([137] * 50))
+    with ops.ops._tx() as con:
+        fallback = ops.ops._virtual_flight_number(con, "OVO", dep)
+    assert fallback.startswith("OVO") and len(fallback) > 3
+    assert re.fullmatch(r"OVO[A-Z0-9]{3}", fallback)

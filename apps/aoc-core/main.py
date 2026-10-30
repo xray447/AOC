@@ -17,6 +17,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import webbrowser
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -104,16 +105,38 @@ def create_app(config: CoreConfig) -> FastAPI:
     token = config.token or secrets.token_urlsafe(24)
     started_at = _now()
 
+    # 顶部状态条 1s TTL：前端 2s 轮询（pulse / ops/status 都会读它）时不必每次重查班表与任务
+    _ops_cache: dict[str, Any] = {"at": 0.0, "data": None}
+
+    def _cached_ops_status() -> dict[str, Any]:
+        now = time.monotonic()
+        cached = _ops_cache.get("data")
+        if cached is not None and now - float(_ops_cache.get("at") or 0.0) < 1.0:
+            return cached  # type: ignore[return-value]
+        data = service.ops_status()
+        _ops_cache["at"] = now
+        _ops_cache["data"] = data
+        return data
+
     async def _watch_simlink() -> None:
+        """发现 SimLink 运行时文件：只在 mtime 变化时读盘/改配置（5s 一次，省 CPU 与 IO）。"""
         last: str | None = None
+        last_mtime: int | None = None
+        runtime_path = paths.home / "simlink-runtime.json"
         while True:
-            runtime = _read_json(paths.home / "simlink-runtime.json")
-            if runtime and runtime.get("url") and runtime.get("token"):
-                key = f"{runtime['url']}|{runtime['token']}"
-                if key != last:
-                    service.set_simlink(runtime["url"], runtime["token"])
-                    last = key
-            await asyncio.sleep(2.0)
+            try:
+                mtime = runtime_path.stat().st_mtime_ns
+            except OSError:
+                mtime = None
+            if mtime is not None and mtime != last_mtime:
+                last_mtime = mtime
+                runtime = _read_json(runtime_path)
+                if runtime and runtime.get("url") and runtime.get("token"):
+                    key = f"{runtime['url']}|{runtime['token']}"
+                    if key != last:
+                        service.set_simlink(runtime["url"], runtime["token"])
+                        last = key
+            await asyncio.sleep(5.0)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -169,6 +192,7 @@ def create_app(config: CoreConfig) -> FastAPI:
 
     OPS_CONFLICT = {"AIRCRAFT_LOCKED", "INVALID_STATE", "TASK_IN_PROGRESS", "INSTANCE_UNAVAILABLE",
                     "CANDIDATE_EXPIRED", "LOCK_EXPIRED", "DUPLICATE_REGISTRATION", "DUPLICATE_ROUTE",
+                    "DUPLICATE_TYPE", "AIRCRAFT_TYPE_IN_USE",
                     "CONFIG_VERSION_CONFLICT", "VERSION_CONFLICT", "INVALID_TOKEN"}
 
     @app.exception_handler(OpsError)
@@ -196,6 +220,7 @@ def create_app(config: CoreConfig) -> FastAPI:
             "version": __version__,
             "url": f"http://127.0.0.1:{config.port}",
             "home": str(paths.home),
+            "logs": str(paths.logs),
             "db": str(paths.db),
             "navdata": service.navdata_status().model_dump(),
             "recording": service.recording_status(),
@@ -234,6 +259,22 @@ def create_app(config: CoreConfig) -> FastAPI:
             log.warning("open-external failed: %s", exc)
             opened = False
         return {"ok": opened, "url": url}
+
+    @app.post("/local/system/open-logs")
+    def open_logs():
+        """打开日志目录（SimLink 连不上时的排查入口）；纯浏览器形态前端降级为显示路径。"""
+        target = paths.logs
+        opened = False
+        try:
+            starter = getattr(os, "startfile", None)  # 仅 Windows
+            if starter is not None:
+                starter(str(target))
+                opened = True
+            else:
+                opened = bool(webbrowser.open(target.as_uri()))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("open-logs failed: %s", exc)
+        return {"ok": opened, "path": str(target)}
 
     # ---------------- 设置 ----------------
     @app.get("/local/settings")
@@ -359,7 +400,8 @@ def create_app(config: CoreConfig) -> FastAPI:
             text, filename = service.export_track_text(flight_id, format)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": str(exc)}) from exc
-        media = {"gpx": "application/gpx+xml", "csv": "text/csv", "json": "application/json"}.get(format, "text/plain")
+        media = {"gpx": "application/gpx+xml", "csv": "text/csv", "json": "application/json",
+                 "html": "text/html"}.get(format, "text/plain")
         return Response(content=text, media_type=media,
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -435,6 +477,26 @@ def create_app(config: CoreConfig) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             return {"configured": True, "connected": False, "error": type(exc).__name__}
 
+    @app.post("/local/simlink/reconnect")
+    async def simlink_reconnect():
+        """让 SimLink 立刻重建 SimConnect（默认是 5s 退避的后台重连，这里是手动触发）。"""
+        client = service._simlink_client
+        if client is None:
+            raise HTTPException(status_code=503, detail={
+                "code": "SIMLINK_UNAVAILABLE", "message": "SimLink 未运行，请先启动 aoc-simlink.exe"})
+        try:
+            status = await client.command("reconnect")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail={
+                "code": "SIMLINK_UNAVAILABLE",
+                "message": f"SimLink 未响应: {type(exc).__name__}"}) from exc
+        return {"ok": True, "status": status}
+
+    @app.get("/local/ui/pulse")
+    def ui_pulse():
+        """前端 2s 轮询合并成一条：录制状态 + 运营状态（少一半请求与序列化）。"""
+        return {"recording": service.recording_status(), "ops": _cached_ops_status()}
+
     # ---------------- 档案 ----------------
     @app.post("/local/export")
     def export_archive():
@@ -478,13 +540,31 @@ def create_app(config: CoreConfig) -> FastAPI:
     def ops_aircraft_types():
         return {"items": service.ops.list_types()}
 
+    @app.post("/local/ops/aircraft-types")
+    def ops_aircraft_type_add(body: dict[str, Any]):
+        """新增自定义机型模板（CUSTOM）；参数非法返回 PARAM_OUT_OF_RANGE（带 key）。"""
+        return service.ops.create_type(body)
+
+    @app.patch("/local/ops/aircraft-types/{type_id}")
+    def ops_aircraft_type_update(type_id: str, body: dict[str, Any]):
+        """修改自定义机型；内置（BUILTIN）只允许「复制为自定义」后再改。"""
+        return service.ops.update_type(type_id, body)
+
+    @app.delete("/local/ops/aircraft-types/{type_id}")
+    def ops_aircraft_type_delete(type_id: str):
+        return {"ok": service.ops.delete_type(type_id)}
+
     @app.get("/local/ops/fleet")
     def ops_fleet():
         return {"items": service.ops.list_fleet()}
 
     @app.post("/local/ops/fleet")
     def ops_fleet_add(body: dict[str, Any]):
-        return service.ops.add_aircraft(body)
+        # 没指定机型时用当前模拟器机模标题做自动匹配（自定义机型可填 title_keyword）
+        payload = dict(body)
+        if not payload.get("type_id") and not payload.get("aircraft_title"):
+            payload["aircraft_title"] = service.flights.aircraft_title
+        return service.ops.add_aircraft(payload)
 
     @app.get("/local/ops/fleet/{aircraft_id}")
     def ops_fleet_item(aircraft_id: str):
@@ -625,7 +705,7 @@ def create_app(config: CoreConfig) -> FastAPI:
 
     @app.get("/local/ops/status")
     def ops_status():
-        return service.ops_status()
+        return _cached_ops_status()
 
     @app.get("/local/ops/flight-status")
     async def ops_flight_status():
@@ -843,7 +923,9 @@ def main() -> int:
         return 2
     log.info("AOC core %s listening on http://127.0.0.1:%s (home=%s)", __version__, port, paths.home)
     try:
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+        # access log 默认会为每条请求写一行：前端轮询下每秒都在追加，
+        # 空闲/录制时都只保留 WARN 以上（排障看 logs/aoc-core.log）。
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)
     except KeyboardInterrupt:
         # 退出（Ctrl+C / 父进程关闭窗口）不是错误：PyInstaller --noconsole 版
         # 未捕获的 KeyboardInterrupt 会弹一个 traceback 对话框。

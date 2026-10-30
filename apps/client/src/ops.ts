@@ -11,20 +11,26 @@ export interface OpsStateMeta {
 /** 当前状态 → 文案、颜色与跳转目标（空闲 / 地面等待 / 飞行中）。 */
 export function opsStateMeta(status: OpsStatus | null | undefined): OpsStateMeta {
   const state = status?.state ?? "IDLE";
+  const path = opsStatePath(status);
   if (state === "FLIGHT") {
-    return { state, zh: "飞行中", en: "In flight", color: "blue", path: "/ops/fly?tab=execute" };
+    return { state, zh: "飞行中", en: "In flight", color: "blue", path };
   }
   if (state === "GROUND") {
-    return { state, zh: "地面等待", en: "On ground", color: "gold", path: opsGroundPath(status) };
+    return { state, zh: "地面等待", en: "On ground", color: "gold", path };
   }
-  return { state, zh: "空闲", en: "Idle", color: "default", path: "/ops/fly" };
+  return { state, zh: "空闲", en: "Idle", color: "default", path };
 }
 
-function opsGroundPath(status: OpsStatus | null | undefined): string {
-  if (status?.task_kind) return "/ops/fly?tab=execute";
-  if (status?.free_flight_status === "LOCKED") return "/ops/fly?tab=free";
-  if (status?.roster_status === "LOCKED") return "/ops/fly?tab=roster";
-  return "/ops/fly";
+/**
+ * 顶部状态按钮的落点：按钮上既然显示着航班信息（呼号 / 起降），
+ * 就应该直接进「配载与执行」；只有完全没有航班信息时才回「抽班」。
+ */
+function opsStatePath(status: OpsStatus | null | undefined): string {
+  if (!status) return "/ops/roster";
+  if (status.state === "FLIGHT") return "/ops/execute";
+  if (status.state === "GROUND" && status.task_kind) return "/ops/execute";
+  const hasFlight = Boolean(status.callsign || (status.dep_icao && status.arr_icao));
+  return hasFlight ? "/ops/execute" : "/ops/roster";
 }
 
 export function money(value: number | null | undefined, currency = "USD"): string {
@@ -154,9 +160,19 @@ export function typeLabel(type: OpsAircraftType): string {
   return `${type.icao}${variant} · ${type.name || ""}${role ? `（${role}）` : ""}`;
 }
 
+/**
+ * 结算一行的标题：列表接口平铺了呼号/起降，详情接口历史上只嵌套 `flight`，
+ * 这里两处都兼容，缺字段时逐级退化（不再出现 `????`）。
+ */
 export function settlementTitle(row: OpsSettlement): string {
-  const dep = row.dep_icao || "????";
-  const arr = row.arr_icao || "????";
-  return `${row.callsign || "—"} ${dep}→${arr}`;
+  const flight: Partial<OpsSettlement> = row.flight || {};
+  const callsign = row.callsign || flight.callsign || "";
+  const dep = row.dep_icao || flight.dep_icao || "";
+  const arr = row.arr_icao || flight.arr_icao || "";
+  const route = dep && arr ? `${dep}→${arr}` : (dep || arr);
+  if (callsign && route) return `${callsign} ${route}`;
+  if (route) return route;
+  if (callsign) return callsign;
+  return "未知航班";
 }
 
