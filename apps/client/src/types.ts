@@ -284,6 +284,9 @@ export interface RecordingStatus {
   simlink_version: string | null;
   sim_connected: boolean;
   aircraft_title: string | null;
+  /** aircraft.cfg 的 atc_model / atc_type（机型识别辅助，如 "A350-900" / "A359"）。 */
+  aircraft_atc_model?: string | null;
+  aircraft_atc_type?: string | null;
   last_error: string | null;
   /** SimLink 数据源（simconnect / demo / replay）。 */
   simlink_source?: string | null;

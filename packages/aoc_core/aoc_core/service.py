@@ -728,6 +728,8 @@ class PersonalService:
         self.flights.simlink_source = status.get("source") or self.flights.simlink_source
         self.flights.last_connect_error = status.get("last_connect_error")
         self.flights.aircraft_title = status.get("aircraft_title") or self.flights.aircraft_title
+        self.flights.aircraft_atc_model = status.get("aircraft_atc_model") or self.flights.aircraft_atc_model
+        self.flights.aircraft_atc_type = status.get("aircraft_atc_type") or self.flights.aircraft_atc_type
         # 发动机运转时间 / 已飞行时间由 SimLink 计时，这里只透传给 UI（不进结算）
         try:
             self.flights.engine_seconds = int(status.get("engine_seconds") or 0)

@@ -15,8 +15,24 @@ namespace AocSimLink;
 /// </summary>
 public sealed class SimConnectSource : ISimSource
 {
-    private enum Definitions { State }
-    private enum Requests { State }
+    private enum Definitions { State, Info }
+    private enum Requests { State, Info }
+
+    /// <summary>
+    /// 机型识别用（TODO §28）：`TITLE` 是 aircraft.cfg `[FLTSIM.0] title`，
+    /// `ATC MODEL` / `ATC TYPE` 是 aircraft.cfg 里 atc_model / atc_type 字段，
+    /// 插件机（iniBuilds / Fenix / PMDG）通常三者至少有一个带真实机型号。
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1)]
+    private struct InfoData
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string Title;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string AtcModel;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string AtcType;
+    }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     private struct StateData
@@ -75,11 +91,16 @@ public sealed class SimConnectSource : ISimSource
     private double _createdAtT;
     private string _version = "";
     private string _title = "";
+    private string _atcModel = "";
+    private string _atcType = "";
 
     public string Name => "simconnect";
     public bool Connected => _connected;
     public string? SimVersion => _version;
-    public string? AircraftTitle => _title;
+    /// <summary>机模标题；有的插件 `TITLE` 为空，退到 `ATC MODEL` 兜底。</summary>
+    public string? AircraftTitle => _title.Length > 0 ? _title : _atcModel;
+    public string? AircraftAtcModel => _atcModel;
+    public string? AircraftAtcType => _atcType;
     public int ReconnectAttempts => Volatile.Read(ref _attempts);
     public string? LastConnectError => _lastError;
     public event Action<Sample>? Frame;
@@ -190,11 +211,12 @@ public sealed class SimConnectSource : ISimSource
             };
             sc.OnRecvException += (_, data) =>
                 Console.Error.WriteLine($"simconnect_exception:{data.dwException}");
-            sc.OnRecvSimobjectData += (_, data) => OnSimObjectData(data.dwData);
+            sc.OnRecvSimobjectData += (_, data) => OnSimObjectData(data.dwRequestID, data.dwData);
 
             AddDefinitions(sc);
             _runwayWindow = false;
             Request(sc, runway: false);
+            RequestInfo(sc);
             _createdAtT = _clock.Elapsed.TotalSeconds;
             _sc = sc;
             Console.Error.WriteLine("simconnect connecting…");
@@ -278,7 +300,18 @@ public sealed class SimConnectSource : ISimSource
         sc.AddToDataDefinition(Definitions.State, "BRAKE PARKING POSITION", "bool", SIMCONNECT_DATATYPE.INT32, 0, SimConnect.SIMCONNECT_UNUSED);
         sc.AddToDataDefinition(Definitions.State, "SIMULATION RATE", "number", SIMCONNECT_DATATYPE.FLOAT64, 0, SimConnect.SIMCONNECT_UNUSED);
         sc.RegisterDataDefineStruct<StateData>(Definitions.State);
+
+        // 机型识别：换机模/重连后标题才变，1 Hz + CHANGED 几乎没有开销
+        sc.AddToDataDefinition(Definitions.Info, "TITLE", null, SIMCONNECT_DATATYPE.STRING256, 0, SimConnect.SIMCONNECT_UNUSED);
+        sc.AddToDataDefinition(Definitions.Info, "ATC MODEL", null, SIMCONNECT_DATATYPE.STRING64, 0, SimConnect.SIMCONNECT_UNUSED);
+        sc.AddToDataDefinition(Definitions.Info, "ATC TYPE", null, SIMCONNECT_DATATYPE.STRING64, 0, SimConnect.SIMCONNECT_UNUSED);
+        sc.RegisterDataDefineStruct<InfoData>(Definitions.Info);
     }
+
+    private void RequestInfo(SimConnect sc) =>
+        sc.RequestDataOnSimObject(Requests.Info, Definitions.Info,
+            SimConnect.SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD.SECOND,
+            SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
 
     /// <summary>跑道窗口用逐帧（0.1s 采样要靠它），其余每秒一次即可。</summary>
     private static SIMCONNECT_PERIOD Period(bool runway) =>
@@ -289,8 +322,17 @@ public sealed class SimConnectSource : ISimSource
             SimConnect.SIMCONNECT_OBJECT_ID_USER, Period(runway),
             SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
 
-    private void OnSimObjectData(object[] dwData)
+    private void OnSimObjectData(uint requestId, object[] dwData)
     {
+        if ((Requests)requestId == Requests.Info)
+        {
+            var info = (InfoData)dwData[0];
+            _title = (info.Title ?? "").Trim();
+            _atcModel = (info.AtcModel ?? "").Trim();
+            _atcType = (info.AtcType ?? "").Trim();
+            return;
+        }
+
         var d = (StateData)dwData[0];
         var fuelKg = d.FuelWeightLb * LbToKg;
         var s = new Sample

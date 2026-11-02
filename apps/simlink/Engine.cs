@@ -96,6 +96,8 @@ public sealed class Engine : IDisposable
                 EngineEstimated = _recording && _engineEstimated,
                 SimConnected = _source.Connected,
                 AircraftTitle = _source.AircraftTitle,
+                AircraftAtcModel = _source.AircraftAtcModel,
+                AircraftAtcType = _source.AircraftAtcType,
                 SimVersion = _source.SimVersion,
                 Source = _source.Name,
                 AutoStart = AutoStart,

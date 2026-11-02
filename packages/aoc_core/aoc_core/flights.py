@@ -265,6 +265,9 @@ class FlightService:
         self.sim_connected = False
         self.simlink_version: str | None = None
         self.aircraft_title: str | None = None
+        # 机型识别辅助：aircraft.cfg 的 atc_model / atc_type（插件机常带真实型号，如 A359）
+        self.aircraft_atc_model: str | None = None
+        self.aircraft_atc_type: str | None = None
         self.last_error: str | None = None
         # 数据源与连模拟器的错误：三态提示（未运行 / 运行但没连上 / 已连接）用
         self.simlink_source: str | None = None
@@ -333,6 +336,16 @@ class FlightService:
             self.db.setting_set(ACTIVE_KEY, None)
 
     # -- 控制 -------------------------------------------------------------
+    def type_hint(self) -> str:
+        """机型识别的输入串：`TITLE` + `ATC MODEL` + `ATC TYPE`。
+
+        插件机（iniBuilds / Fenix / PMDG）三个字段里通常至少一个带真实型号，
+        单独只读 `TITLE` 会漏（如 iniBuilds A350 的标题是 "A350-900 (Default Cabin)"，
+        atc_type 才是标准 ICAO "A359"）。
+        """
+        parts = (self.aircraft_title, self.aircraft_atc_model, self.aircraft_atc_type)
+        return " ".join(p.strip() for p in parts if p and p.strip())
+
     def start(self, flight_id: str | None = None, started_at: str | None = None,
               manual: bool = True) -> RecordingStatus:
         if self.recorder is not None:
@@ -359,7 +372,7 @@ class FlightService:
             aircraft_type = (ctx or {}).get("aircraft_type") or ""
             if not aircraft_type and self.type_matcher is not None:
                 try:
-                    aircraft_type = self.type_matcher(self.aircraft_title) or ""
+                    aircraft_type = self.type_matcher(self.type_hint()) or ""
                 except Exception:  # noqa: BLE001
                     aircraft_type = ""
             aircraft_type = aircraft_type or self._aircraft_type()
@@ -593,6 +606,8 @@ class FlightService:
             simlink_version=self.simlink_version,
             sim_connected=self.sim_connected,
             aircraft_title=self.aircraft_title,
+            aircraft_atc_model=self.aircraft_atc_model,
+            aircraft_atc_type=self.aircraft_atc_type,
             last_error=self.last_error,
             simlink_source=self.simlink_source,
             last_connect_error=self.last_connect_error,

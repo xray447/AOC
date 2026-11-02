@@ -9,6 +9,10 @@ public interface ISimSource : IDisposable
     bool Connected { get; }
     string? SimVersion { get; }
     string? AircraftTitle { get; }
+    /// <summary>aircraft.cfg 的 atc_model（如 "A350-900"）；非 simconnect 源为空。</summary>
+    string? AircraftAtcModel => null;
+    /// <summary>aircraft.cfg 的 atc_type（如 "Airbus"）；非 simconnect 源为空。</summary>
+    string? AircraftAtcType => null;
     /// <summary>
     /// `Sample.T` 是否已经是模拟时间（demo/replay 按倍速推进时钟）。
     /// false 表示 T 是真实秒，Engine 累计模拟时间时要乘以 `sim_rate`。

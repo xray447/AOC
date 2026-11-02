@@ -411,6 +411,9 @@ class RecordingStatus(Model):
     simlink_version: str | None = None
     sim_connected: bool = False
     aircraft_title: str | None = None
+    # 机型识别辅助：aircraft.cfg 的 atc_model / atc_type（如 "A350-900" / "A359"）
+    aircraft_atc_model: str | None = None
+    aircraft_atc_type: str | None = None
     last_error: str | None = None
     # SimLink 数据源（simconnect / demo / replay）与最近一次连模拟器的错误，
     # 用来区分「SimLink 没起」和「SimLink 起了但没连上 MSFS」。

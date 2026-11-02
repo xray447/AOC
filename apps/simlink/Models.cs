@@ -64,6 +64,9 @@ public sealed class RecordingInfo
     [JsonPropertyName("engine_estimated")] public bool EngineEstimated { get; set; }
     [JsonPropertyName("sim_connected")] public bool SimConnected { get; set; }
     [JsonPropertyName("aircraft_title")] public string? AircraftTitle { get; set; }
+    /// <summary>机型识别：aircraft.cfg 的 atc_model / atc_type（插件机常带真实型号）。</summary>
+    [JsonPropertyName("aircraft_atc_model")] public string? AircraftAtcModel { get; set; }
+    [JsonPropertyName("aircraft_atc_type")] public string? AircraftAtcType { get; set; }
     [JsonPropertyName("sim_version")] public string? SimVersion { get; set; }
     [JsonPropertyName("version")] public string Version { get; set; } = "0.1.0";
     [JsonPropertyName("source")] public string Source { get; set; } = "";
