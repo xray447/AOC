@@ -18,6 +18,9 @@ DEFAULT_THRESHOLDS = {
     "g_hard": 2.2,
 }
 RATING_ORDER = ["GREAT", "GOOD", "HARD", "SEVERE"]
+# 起飞门槛（§33）：首点在空中且「持续 ≥60s 或爬升 ≥500ft」才算起飞
+FAKE_AIRBORNE_MIN_S = 60.0
+FAKE_CLIMB_MIN_FT = 500.0
 
 
 def _t(p: dict) -> float:
@@ -69,8 +72,25 @@ def _nearest_airport(nav: NavData | None, lat: float | None, lon: float | None,
     return airport["ident"] if airport else None
 
 
+def _sustained_airborne(points: list[dict], start: int) -> bool:
+    """首点在空中是否「真的起飞了」（§33 第 4 道闸）。
+
+    V-1 实测幽灵帧只持续 **≈1.9s**、AGL 233ft；真起飞会持续 ≥60s 或爬升 ≥500ft。
+    """
+    t0 = _t(points[start])
+    alt0 = float(points[start].get("alt_ft") or 0.0)
+    peak, end = alt0, t0
+    for p in points[start:]:
+        if _on_ground(p):
+            break
+        end, peak = _t(p), max(peak, float(p.get("alt_ft") or 0.0))
+    return (end - t0) >= FAKE_AIRBORNE_MIN_S or (peak - alt0) >= FAKE_CLIMB_MIN_FT
+
+
 def evaluate(points: list[dict], nav: NavData | None = None,
-             thresholds: dict | None = None, aircraft: str | None = None) -> dict[str, Any]:
+             thresholds: dict | None = None, aircraft: str | None = None,
+             partial: bool = False, _allow_trim: bool = True,
+             fuel_start_kg: float | None = None) -> dict[str, Any]:
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     out: dict[str, Any] = {
         "takeoff_index": None, "landing_index": None,
@@ -81,6 +101,17 @@ def evaluate(points: list[dict], nav: NavData | None = None,
     if not points:
         return out
     points = sorted(points, key=_t)
+    # §33 / V-1：开头若是幽灵/加载期空中帧（首点在空中、且不满足「真起飞」门槛），
+    # 先丢掉首个地面点之前的部分再评估，否则里程会把 (0, 90) → 机场的那一跳算进去
+    if _allow_trim and not partial and not _on_ground(points[0]) \
+            and not _sustained_airborne(points, 0):
+        first_ground = next((i for i, p in enumerate(points) if _on_ground(p)), None)
+        if first_ground is not None and 0 < first_ground < len(points) - 1:
+            trimmed = evaluate(points[first_ground:], nav, thresholds, aircraft,
+                               partial=partial, _allow_trim=False,
+                               fuel_start_kg=fuel_start_kg)
+            if trimmed.get("takeoff_index") is not None:
+                return trimmed
     out["distance_nm"] = round(sum(
         haversine_nm(float(a["lat"]), float(a["lon"]), float(b["lat"]), float(b["lon"]))
         for a, b in zip(points, points[1:])), 1)
@@ -94,6 +125,7 @@ def evaluate(points: list[dict], nav: NavData | None = None,
             takeoff = i
             break
     if takeoff is None and not _on_ground(points[0]):
+        # 首点就在空中：空中接入（D-2 partial）或截断后仍无起飞（纯落地段）都按 0 记
         takeoff = 0
     out["takeoff_index"] = takeoff
 
@@ -158,6 +190,9 @@ def evaluate(points: list[dict], nav: NavData | None = None,
             "touchdown_lon": float(td["lon"]),
             "runway_ident": runway["ident"] if runway else None,
             "runway_airport": runway["airport"] if runway else None,
+            # §36：长度/来源跟着实际用的数据源（scenery = 游戏内，navdata = 现实库）
+            "runway_length_m": runway.get("length_m") if runway else None,
+            "runway_source": runway.get("runway_source") if runway else None,
             "threshold_distance_m": round(runway["along_m"] - displaced, 1) if runway else None,
             "displaced_threshold_m": round(displaced, 1) if runway else None,
             "centerline_offset_m": runway["lateral_m"] if runway else None,
@@ -178,7 +213,8 @@ def evaluate(points: list[dict], nav: NavData | None = None,
         }
     out["landing"] = metrics
     out["max_g_flight"] = metrics.get("max_g_flight")
-    out["fuel_start_kg"] = points[0].get("fuel_kg")
+    # §32：起始油量优先取推出定稿值（缺失时回落首帧，demo/replay 源走这条）
+    out["fuel_start_kg"] = fuel_start_kg if fuel_start_kg is not None else points[0].get("fuel_kg")
     out["fuel_end_kg"] = points[-1].get("fuel_kg")
     out["block_off_t"] = _t(points[0])
     out["block_on_t"] = _t(points[-1])

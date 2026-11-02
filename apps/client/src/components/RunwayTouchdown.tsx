@@ -52,6 +52,20 @@ function runwayWidth(runway: AirportRunway): number {
   return Number.isFinite(raw) && raw >= 15 && raw <= 80 ? raw : DEFAULT_RUNWAY_WIDTH_M;
 }
 
+/**
+ * §36：跑道长度与实际数据源不一致时的提示文案（差 >5% 或 >100 m）。
+ * scenery = 游戏内几何；reference 是现实 navdata 的对照长度。
+ */
+function lengthMismatchNote(runway: AirportRunway, length: number): string | null {
+  const reference = Number(runway.length_reference_m);
+  if (!Number.isFinite(reference) || reference <= 200) return null;
+  const diff = Math.abs(length - reference);
+  if (diff <= 100 && diff / reference <= 0.05) return null;
+  const source = runway.source === "scenery" ? "游戏内" : "现实 navdata";
+  const other = runway.source === "scenery" ? "现实" : "游戏内";
+  return `跑道长度 ${source} ${Math.round(length)} m / ${other} ${Math.round(reference)} m（来源 ${runway.source || "navdata"}）`;
+}
+
 /** 内移入口不会超过跑道的一半，脏数据也不至于把图压没。 */
 function displacedLength(runway: AirportRunway, length: number, explicit?: number | null): number {
   const raw = Number(explicit ?? runway.displaced_threshold_m ?? 0);
@@ -244,6 +258,12 @@ export function RunwayTouchdown({
         {runway.ident || "RWY"} {displaced > 0 ? "着陆入口" : "入口"}
         {displaced > 0 ? `（内移 ${Math.round(displaced)} m，物理入口 ${Math.round(length)} m 跑道头）` : ""}
       </text>
+      {/* §36：游戏内长度与现实 navdata 不一致时提示（>5% 或 >100 m），不阻断 */}
+      {lengthMismatchNote(runway, length) ? (
+        <text x={padX} y={tickLabelY + 34} fontSize={12} fill="#faad14">
+          {lengthMismatchNote(runway, length)}
+        </text>
+      ) : null}
 
       {/* 图例 + 比例尺 */}
       <g transform={`translate(${padX}, ${height - 12})`} fontSize={11} fill="currentColor" fillOpacity={0.6}>

@@ -167,6 +167,39 @@ export function SettingsPage() {
               <Divider style={{ margin: "8px 0" }} />
               <div className="setting-row">
                 <div>
+                  <div className="label">
+                    {tr("场景库跑道数据（游戏内）", "Scenery runway data (in-game)")}
+                  </div>
+                  <div className="hint">
+                    {navdata.scenery_available
+                      ? tr(`游戏内跑道几何已启用：${navdata.scenery_path || ""}`,
+                        `In-game runway geometry enabled: ${navdata.scenery_path || ""}`)
+                      : tr("未找到 little_navmap_msfs24.sqlite：跑道几何回落现实 navdata",
+                        "little_navmap_msfs24.sqlite not found — runway geometry falls back to navdata")}
+                  </div>
+                </div>
+                <Tag color={navdata.scenery_available ? "green" : "default"}>
+                  {navdata.runway_data_source || "auto"}
+                </Tag>
+              </div>
+              <Input
+                value={draft.scenery_navdata_path || ""}
+                onChange={(e) => patch({ scenery_navdata_path: e.target.value || null })}
+                placeholder="%APPDATA%\\ABarthel\\little_navmap_db\\little_navmap_msfs24.sqlite"
+                prefix={<FolderOpenOutlined />}
+              />
+              <Select
+                value={draft.runway_data_source || "auto"}
+                onChange={(v) => patch({ runway_data_source: v })}
+                options={[
+                  { value: "auto", label: tr("自动（场景库命中优先）", "Auto (scenery first)") },
+                  { value: "scenery", label: tr("只用场景库（游戏内）", "Scenery only (in-game)") },
+                  { value: "navdata", label: tr("只用现实 navdata", "navdata only") },
+                ]}
+              />
+              <Divider style={{ margin: "8px 0" }} />
+              <div className="setting-row">
+                <div>
                   <div className="label">SimLink</div>
                   <div className="hint">
                     {tr(sim.zh, sim.en)}

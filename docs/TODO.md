@@ -1,9 +1,134 @@
 # TODO
 
-> 更新：2026-10-30 §23–§30（军用机场、候选多样性、随机航班号、翼展、自动开录/收尾、机型识别、落地报告）已全部落地，
-> 代码 + 测试 + 文档同步（证据见 `10` §3）。仍需真人/干净机（低配机内存、安装包、签名）的验收项在下方。
+> 状态（2026-11-02）：代码侧的条目（§31–§36）**全部实现**，当前没有待开发项；
+> `pytest` / `ruff F,E9` / `tsc --noEmit` / `dotnet build` 全绿。
+> 剩下的事都只能**在真机上做**：干净 Windows 安装验收、MSFS 2024 实机复测、低配机性能复核 —— 见「一、待办」。
+>
+> 约定：`§编号`沿用历史编号，不重排（文档、提交记录和历史对话都在引用）；新条目接在最后一个编号之后。
+> 每条实现记录包含「落地（改了什么）」+「背景（为什么/怎么发现的）」+「关联」，实测数据集中在附录 B。
 
-## 已完成（2026-10-30，功能改进 §23–§30）
+## 目录
+
+| 章节 | 内容 |
+|---|---|
+| 一、待办 | 人工验收 / 实机复测 / 性能复核 / 遗留小项 |
+| 二、已完成 · 2026-11-02 | §31–§36（收尾批次：幽灵机、合计航时、推出定稿、SimBrief 单位、快速调机、场景库跑道） |
+| 三、已完成 · 2026-10-30 | §23–§30（功能改进） |
+| 四、已完成 · 2026-10-24 及更早 | §1–§22（含性能修复 D-26/D-27） |
+| 附录 A | 决策记录 D-1～D-7 |
+| 附录 B | 验证记录 V-1～V-5（含探针工具） |
+
+---
+
+## 一、待办
+
+### 1.1 人工验收（干净 Windows，无 Python / .NET / Node）
+
+- [ ] **T-01 / T-06a**：`out/AOC-0.1.0-x64-setup.exe`、`*.msi`、`AOC-portable-*-win64.zip` 各跑一次：双击无控制台窗口、托盘出现、单实例、关闭窗口最小化、托盘「退出」后无残留进程。
+- [ ] **体积回填**：自包含改造后重新生成便携包 / 安装包，把实测值回填 `08` §2 / §4.4（`aoc-core` onedir 已实测 134 MB）。
+- [ ] **Authenticode 签名**：等证书，签 `AOC.exe`、`AOC-portable.exe` 与安装包。
+
+> 已通过：**T-21 / A-32**（2026-10-24，安装版 + 便携版）—— 无控制台、托盘、直开窗口、退出无残留，详见 §10。
+
+### 1.2 实机复测（需 MSFS 2024）
+
+- [ ] **§33 幽灵机 / 瞬移**：
+  ① 冷启动 MSFS → 连上 SimLink → 进飞行瞬移到基地 → 抽班「开始本段」→「开始记录」：应正常停在「记录中」，不再立刻「已完成」；
+  ② 先抽班再进游戏：新记录首帧应落在真实机位（KBFI 幽灵帧被截断），`block_off_source=preroll`；
+  ③ 先开 MSFS 停在出发机场并启动发动机 → 再启动 AOC：10s 内自动开录，`block_off_source=connect`；
+  ④ 已在空中才开 AOC：位置闸拦住并提示，确认后 `partial=1`，结算 `HELD` + `PENDING`、航段不置 `COMPLETED`。
+- [ ] **§33 本段作废重飞**：对一条已 `COMPLETED` 的航段点「作废重飞」→ 航段回 `PLANNED`、`settlement` 置 `VOID`、账本出现反向条目、飞机位置/小时/循环回滚。
+- [ ] **§32 推出快照**：开录 → 推出（GS ≥5kt 持续 3s）→ `/local/recording/status` 的 `zfw_at_pushback`/`fuel_at_pushback` 有值、`pushback` 事件出现；推出前继续加油加货不影响取值；地面已在滑行才开录时 `pushback_source=start`；空中接入为 null。
+- [ ] **§36 场景库**：设置页填 `%APPDATA%/ABarthel/little_navmap_db/little_navmap_msfs24.sqlite` → `GET /local/airports/WMKN` 返回 `runway_source=scenery`、长度 ≈3060 m（现实 navdata 3480 m）、接地区视图出现「游戏内 / 现实」对照提示。
+- [ ] **SimLink 自动重连**：先开 AOC 再开 MSFS，10s 内 `sim_connected=true`；飞行中退出再进，`/events` 有 `sim_disconnected`/`sim_connected`、记录不重复；重连后发动机仍在转时 10s 内自动开录（§33 顺带修复）。
+
+### 1.3 性能复核（需低配机）
+
+- [ ] **SimLink 内存（D-26）**：`python tools/simlink_mem_probe.py --minutes 30 --interval 60`；判据：未连接 <60 MB、连上未录制 <80 MB、录制稳态 <100 MB 且 |趋势| ≤5 MB/h。
+- [ ] **aoc-core 空闲 CPU（D-27）**：开发机已实测空闲平均 **0.130%**、峰值 1.378%（见 §22）；待低配机复核：空闲 5 min 平均 <0.3%（单核）、录制中 <1.5%。`python tools/core_cpu_probe.py --minutes 5`。
+
+### 1.4 遗留小项（可选，不阻塞主流程）
+
+- [ ] **§36 兜底 C（手工覆盖表）**：`airport_runway_override(icao, ident, length_m, width_m, threshold_lat/lon, hdg, updated_at)` + 页面「修正跑道数据」入口，`find_runway()` 优先读；只对「场景库扫不到 / 玩家装了 add-on 机场」有用，未实现。
+- [ ] **§35 收口**：`OpsService.update_aircraft` 仍允许直接改 `current_airport_icao`（免费瞬移、无费用无审计）。建议移出可写字段，或要求 `force=true` 并写 `AIRCRAFT_FIX_POSITION` 审计。
+- [ ] **§32 边界**：推出后再改配载（罕见）不覆盖记录值；`|Δ| > 1000 kg` 时补 `zfw_changed_after_pushback` 事件供人工核对 —— 未实现。
+
+---
+
+## 二、已完成 · 2026-11-02（§31–§36）
+
+> 本批按「止血 → 协议 → 小改 → 新功能 → 大改」排序落地：§33（P0 假起降）→ §34（抽班下限）→ §32（推出定稿）→ §31（单位换算）→ §35（快速调机）→ §36（场景库跑道）。
+> 测试：`pytest` 166 项、`ruff F,E9`、`tsc --noEmit`、`dotnet build` 全绿。
+
+### 31. SimBrief `manualzfw` 换算错误（单位是「吨」不是千磅）
+
+- **落地**：`aoc_route/simbrief.py::_manualzfw` 改为 `ZFW ÷ 1000`（3 位小数），删掉 `KG_TO_LB`；`build_url`/`simbrief_context`/`main.py::route_simbrief`/`tools/ui_smoke.py` 的「千磅」文案改「吨」；`tests/test_route.py` 断言 `6120 kg → 6.120`，`tests/test_ops.py` 两处换算同步；顺带更正 §2 的旧结论（原文「× 2.2046226 ÷ 1000 = 千磅」是错的）。
+- **背景**：配载单 ZFW 166714 kg → 链接生成 `manualzfw=367.542`（按千磅换算），SimBrief 出 195700 kg，差 28986 kg（≈17%）。
+- **结论（V-2）**：`manualzfw` 单位是 ton。`367.542` 被当成 367.542 t 超 A350 MTOW → SimBrief 丢弃并自算 payload。正确值 = `166.714`；补充例：`manualzfw=182.555` = 182555 kg。
+- **关联**：§2（配载改用 `manualzfw`）、`aoc_core/service.py::simbrief_url`。
+
+### 32. 推出后定稿 ZFW / 油量（方案 B）
+
+- **落地**：
+  1. SimLink `Engine.TrackPushback()` 按 V-5 口径（`GS≥5kt` 连续 3s、最近 5 帧中位数、跳变 >10% 继续等）产出 `zfw_at_pushback`/`fuel_at_pushback`/`pushback_utc`/`pushback_source`，随 `/status` 透出并写 `pushback` 事件；地面晚接入取开录首帧（`source=start`），空中接入留 null。
+  2. core `poll_simlink_once()` 读到后调 `OpsService.set_actual_zfw(..., source="pushback", final=True)`：覆盖 `flight_record` 并补 `zfw_check(source=pushback, final=true)` 事件。
+  3. 油量：`landing.evaluate(fuel_start_kg=...)` 改用推出油量；`flights._finalize()` 对「起始−结束 < 0」记 0 并标 `FUEL_ANOMALY`，不生成负燃油成本；`block_off` 仍取首帧，只改油量取点。
+  4. 协议/前端：`POST /local/recording/start` **彻底移除** `actual_zfw_kg`（单一来源）；`/local/ops/flight-status` 加 `planned_zfw_kg`/`planned_fuel_kg`/`fuel_at_pushback`/`zfw_source`/`zfw_state`/`zfw_warnings`；执行页改为实时展示「实际 ZFW（推出后定稿）/ 配载单 / 差异」与「实际滑出油量 / 计划油量」，偏低只在推出时推一次 `message.warning`，不再拦开录。
+- **背景（旧行为的两个坑）**：ZFW 只在点「开始记录」那刻取快照，而开录已提前到发动机启动（§27）→ 记的是半载值（偏低误报漏装、偏高漏报）；`fuel_start_kg` 取首帧油量，推出前加满会让 `fuel_used_kg` 变负 → 负燃油成本，而回写机队的油量又是真实剩余值，两头对不上。
+- **取舍**：曾评估方案 A（滑动中位数 + 推出时重算，保留开录快照），最终选 B —— 单一来源更干净，代价是动 SimLink 协议与录制时序（与 §33 同批只发一次版）。
+- **V-5 实现要点**：① `_pushbackSince` 从候选帧起表、等 `t − since ≥ 3s` 再取值（不能用「3s 窗口内全满足」，实测帧间隔 0.98–2.0s 会漏判）；② 只在 `on_ground && !_hasTakeoff` 计时（空中接入不能把巡航重量当 ZFW）；③ 兜底：地面晚接入取首帧标 `source=start`、空中接入写 null。
+- **测试**：`tests/test_ops.py::test_pushback_zfw_is_final`、`::test_fuel_start_uses_pushback_value_and_never_negative`。
+- **关联**：§4（推出前 ZFW 提示）、§27（开录提前到发动机启动）。
+
+### 33. 抽班点「开始」后直接变「已完成」（KBFI 幽灵机 + 瞬移）
+
+- **落地（四道闸 + 作废重飞）**：
+  1. **开录位置闸**：`PersonalService.position_gate()`（`aoc_core/service.py`）用 navdata 算最新帧到出发机场距离；`poll_simlink_once()` 闸门未过时**不建 recorder、不喂帧**，只推进游标（`_advance_cursor`），开录用 `skip_seq` 一次性跳过闸前帧；手动开录越闸返回 409 `POSITION_GATE`（`PositionGateError`）；出发机场由 `OpsService.recording_departure()` 给出（任务 → 已锁班表首段 → 自由飞）。navdata 缺失 / 查不到机场 → 只做瞬移断点、不拦录制。
+  2. **预录截断**：`Engine.TrimPreRoll()`（`apps/simlink/Engine.cs`）回扫 600s 预录，命中「速度 >900kt / `dt>30s` 且位移 >10NM / 低空且远离出发机场」就只保留最后一次跳变之后的帧；出发机场坐标由 core 用 `set_dep_airport` 下发。
+  3. **瞬移 = 重置**：core `FlightRecorder._reset_after_teleport()` 丢弃跳变前轨迹、重锚 `started_at` 与时间轴（`t_offset`）、重置状态机并写 `teleport` 事件；SimLink 同步清 `_hasTakeoff`/`_landed` 与推出快照。同一处重置也用于 `sim_disconnected`/`sim_connected` 与 `dt>30s`。
+  4. **收尾门槛**：`landing.evaluate()` 丢弃「首点在空中但不满足 ≥60s 或爬升 ≥500ft」的幽灵前缀；`flights._finalize()` 里带 `TELEPORT` 且 block <2min / 距离 <5NM → `ABORTED`，绝不置 `COMPLETED`。
+  5. **本段作废重飞**：`OpsService.void_leg()` + `POST /local/ops/rosters/{id}/legs/{seq}/void` —— 航段退回 `PLANNED` 并清 `flight_record_id`、`settlement` 置 `VOID`、账本按原条目逐条反向（同 `entry_type`、金额取负，仅冲销有 `settlement_id` 的条目）、飞机位置回滚到本段出发机场且小时/循环减回、`flown_leg` 删除、航班记录留档为 `ABORTED`、飞机锁退回 `HELD`、实例回 `SCHEDULED`、班表回 `IN_PROGRESS`；班表页每段都有按钮。
+  6. **前端**：`/local/ops/flight-status` 补 `dep_icao`/`dep_distance_nm`/`position_ok`/`partial_allowed`；位置不符时禁用「开始记录」并提示，已在空中时弹「按部分记录开始」（`partial=true` → `settlement.status=HELD`、`review_status=PENDING`、任务 `finished` 但不置航段 `COMPLETED`）。
+  7. **重连不重置状态机（V-1 顺带发现）**：SimLink 重连/切场景时重置 `_engineRunning`/`_engineOnSince`/`_hasTakeoff`/`_landed` 并重新点亮发动机边沿，修复「发动机在转却不自动开录」。
+- **背景（根因）**：MSFS 启动时先在 **KBFI** 生成幽灵飞机，进飞行才瞬移；采样里出现「空中帧 → 地面帧」的假起降。**旧判据**是「首点不在地面就取 `takeoff_index=0`」（现在要先过 `_sustained_airborne`：空中 ≥60s 或爬升 ≥500ft），之后**任意**地面帧即算落地 → `_finalize()` 判 `COMPLETED` → `settle_flight()` 把 `roster_leg` 置 `COMPLETED`，而 SimLink 还在录 → 界面同时出现「已完成 + 记录中」。`should_auto_stop()` 的 `seen_airborne` 也会被这帧点亮，叠加 §30 的静止/停机刹判定会提前收尾；`TELEPORT` 异常只在收尾扣罚，不影响「是否已完成」。
+- **现场证据（`aoc.db`，2026-11-02）**：污染记录 `e307baee`（VHHH→WMKN）`block_minutes=1.9`、`distance_nm=7493.7`，`settlement` 已 `SETTLED`、`policy_action=REJECT`、`revenue_total=0`、`cost_total=−67,267.73`、`profit=+67,267.73`（**负成本反而白赚**）；`roster_leg 1c06d706` 已是 `COMPLETED` 而 `roster f7c357db` 仍 `IN_PROGRESS`；同一次污染把 `B-1090` 挪到了 KBFI。
+- **测试**：`tests/test_landing.py::test_ghost_airborne_prefix_is_trimmed`、`tests/test_api.py::test_recorder_resets_on_teleport` / `::test_position_gate_blocks_outside_departure`、`tests/test_ops.py::test_void_leg_reverts_settlement_and_position` / `::test_partial_recording_goes_to_review`。
+- **关联**：§27（自动开录）、§30（自动收尾）、§6；`landing.py::evaluate`、`flights.py::_anomalies/_finalize/should_auto_stop`、`ops/service.py::on_flight_finalized/settle_flight`。
+
+### 34. 抽班「合计航时」加下限（默认 上限 − 25%，可填）
+
+- **落地**：`_constraints()` 新增 `min_total_block_minutes`（留空 = `max(30, 上限×0.75)`；手填 30–上限；`0` = 关闭下限，供放宽阶梯与探针用；越界 `PARAM_OUT_OF_RANGE` + `details.key`）。`_build_chains`/`_virtual_chains` 入候选改为 `block_total >= total_min`，并按「剩余航段全取最长也补不到下限」提前剪枝（否则 200/60 条候选上限会被不达标的前缀链占满）。`draw()` 抽出 `_collect_candidates()` + `_relax_attempts()` 阶梯放宽（先只保上限 → 每程最长 ×1.2），每步返回 `warnings[]` + `relaxed`，不静默降级。
+- **前端**：`OpsRoster.tsx` 新增「最少合计航时」输入（占位显示默认值、实时提示「可接受 360–480 min」），约束摘要行改成 `合计 360–480 min`，候选卡片上方展示放宽提示。
+- **背景**：原来 `max_block_minutes` 只做上限判断，而 `walk()` 里每条前缀链都入候选 → 1 段 90 min 也能成候选，与玩家填的「合计 480」不符。
+- **V-4 结论**：真实机队上 480 上限 + 360 下限时遵循航线**达标 0 条（全灭）**，所以「放宽一次 + warnings」是必需路径而非可选项。
+- **兼容**：老班表 `constraints` 无该字段 → 读取时按「上限 × 0.75」推导，不写库、不报错。
+- **测试**：`tests/test_ops.py` 覆盖「合计 480 留空 → 只返回 ≥360」「上限 120 → 默认 90」「上限 30 → 钳到 30」「手填 300 优先」「不达标先放宽并带 warnings」「`follow_routes=false` 同样生效」。
+- **关联**：§19、`ops/service.py::_constraints/_build_chains/_virtual_chains/_no_candidate_reason`、`tools/v4_draw_probe.py`。
+
+### 35. 快速调机（付费把飞机调到别的机场）
+
+- **落地**：`OpsService.fast_ferry(aircraft_id, to_icao, hold=None)` —— 前置校验（`ACTIVE`、未锁、无 `active_task`、班表非 `IN_PROGRESS`、目标 ≠ 当前且 navdata 可查）→ 改 `aircraft.current_airport_icao`、账本记 `COST_FERRY`、审计 `AIRCRAFT_FERRY`（from/to/distance/fee/hold）、返回 `{aircraft, distance_nm, fee, currency, hold, warnings}`。费用 `fixed + 距离 × per_nm`；`default_economy` 新增 `fast_ferry_fee_per_nm=12`/`fast_ferry_fixed_fee=1000`/`fast_ferry_hold=false`（前两个进 `PARAM_SCHEMA`，运营规则页可改）；`fast_ferry_hold` 打开时建 `aircraft_lock(HELD)`，`_expire_locks()` 到点自动释放（含 `aircraft` 状态回 `ACTIVE`）；**允许透支**，不拦负余额。接口 `POST /local/ops/fleet/{id}/ferry`。
+- **前端**：机队页每架可调机的飞机加「快速调机」弹窗（`AirportSelect` + 距离/费用预览 + 「模拟器里不会搬飞机」提示）；班段开始的 `AIRCRAFT_NOT_AT_DEPARTURE` 错误改为弹「去快速调机」。
+- **语义**：只改 AOC 侧位置 + 收费 + 审计；模拟器里不搬飞机，必须提示「请在 MSFS 里于目标机场重新进入飞行」，并由 §33 的位置闸兜底（位置不符不开录）。真实转场仍用自由飞（落地自然更新位置）。
+- **不做**：`mission_type=FERRY`、零客货配载单、调机结算/复核、班表 leg。
+- **测试**：`tests/test_ops.py::test_fast_ferry_moves_aircraft_charges_and_audits` / `::test_fast_ferry_rejects_invalid_cases` / `::test_fast_ferry_hold_expires`。
+- **关联**：§33（位置闸）、§32（真实转场走自由飞时照常按推出定稿油量）、`ops/service.py::update_aircraft/_expire_locks`、`ops/economy.py::default_economy`。
+
+### 36. 跑道信息改用游戏内数据（场景库优先）
+
+- **落地**：
+  1. `NavData(path, scenery_path=..., runway_source=auto|navdata|scenery)` 增加第二数据源（Little Navmap `little_navmap_msfs24.sqlite`）；`runways()` 命中场景库时返回 `source=scenery` 的几何并同步 `longest_runway_m`（影响「跑道够不够长」与 §26 翼展推断）；`navdata_runways()` 提供现实对照；`find_runway()` 带 `runway_source`/`width_m`。
+  2. 设置新增 `scenery_navdata_path` + `runway_data_source`（默认 `auto`；未配置时探测 `%APPDATA%/ABarthel/little_navmap_db`，单测用 `AOC_NO_SCENERY=1` 关掉）；改这两项会重建 `NavData`。
+  3. 接口：`GET /local/navdata/status` 透出 `scenery_path`/`scenery_available`/`runway_data_source`；`GET /local/airports/{icao}` 每条跑道带 `source` 与 `length_reference_m`（现实对照长度）。
+  4. 数据/展示：`flight_record` 新增 `runway_length_m`/`runway_source`（老库自动补列、不回溯老记录）；`RunwayTouchdown` 在长度差 >5% 或 >100 m 时标「跑道长度 游戏内 X m / 现实 Y m（来源 …）」，日志详情加「跑道数据」行；设置页加路径与来源下拉。
+- **背景**：WMKN 现实跑道 3480 m，游戏内只有 3060 m（差 420 m ≈12%）。AOC 用现实 navdata → 接地区俯视图的跑道长度、刻度、内移段、中线偏差全按 3480 m 画，接地点对不上；长度差还会影响「跑道够不够长」与翼展推断。
+- **路线（D-7 改判）**：V-3 证明 SimConnect 设施 API 存在但字段名需官方 `FacilityDataDefinitionFlightsim.csv`（猜的名字全 `DATA_ERROR(20)`），而 LNM 从场景扫出的 msfs24 库 WMKN 正好 10,041 ft = 3060.5 m、入口与 navigraph 差 ~2.2 km → **场景库优先**，缺失回落 navdata，SimConnect 降为后续可选。兜底 C（手工覆盖表）见「1.4 遗留小项」。
+- **测试**：`tests/test_landing.py::test_scenery_runway_geometry_preferred` / `::test_runway_data_source_navdata_ignores_scenery` / `::test_landing_metrics_carry_runway_source_and_length`。
+- **关联**：§7（接地区俯视图）、§9（内移入口）、§16（跑道标志/宽度）、§26（跑道宽度→翼展）、`aoc_navdata/navdata.py::_load_runways_for/_runway_length_m/find_runway`、`aoc_core/landing.py`。
+
+---
+
+## 三、已完成 · 2026-10-30（§23–§30）
 
 > 细节见 `01` P-04/P-05/P-06/C-02/C-04、`02` §5.3/§7.4、`03` 接口表、`04` §2.2/§2.4/§2.5/§7.1、`07` §3、`09` §5-8、`10` §3。
 
@@ -53,27 +178,9 @@
 - core 自动收尾后补发 `stop_recording`；轮询到已 COMPLETED 的 `recording_id` 只忽略、不再 `assert`；收尾后的帧照常进日志，`block_on_utc` 取最后一帧。
 - demo 源补滑入（落地后 15kt 滑行、中途停车 20s、到机位停稳 + 停机刹车 + 关车），回归断言 `block_on − landing ≥ 60s`。
 
-## 待人工验收
+---
 
-- **T-01 / T-06a**（干净 Windows，无 Python / .NET / Node）：用 `out/AOC-0.1.0-x64-setup.exe` / `*.msi` / `AOC-portable-*-win64.zip` 各跑一次。
-- **体积实测**：自包含改造后 `out/AOC-portable-*-win64.zip`、NSIS/MSI 重新生成，把实测值回填 `08` §2 / §4.4（`aoc-core` onedir 已实测 134 MB）。
-- **Authenticode 签名**：等证书。
-
-## 已通过（人工验收）
-
-- **T-21 / A-32**（安装版 + 便携版，2026-10-24）：双击无控制台窗口、托盘出现、安装版直开窗口 / 便携版默认浏览器、关闭窗口最小化到托盘、托盘「退出」后无残留 `aoc-core` / `aoc-simlink` → **通过**。
-
-## 待人工实测（性能与实机）
-
-- **SimLink 内存（D-26）**：`python tools/simlink_mem_probe.py --minutes 30 --interval 60`；判据：未连接 < 60 MB、连上未录制 < 80 MB、录制稳态 < 100 MB 且趋势 |≤5 MB/h|。
-- **aoc-core 空闲 CPU（D-27）**：代码侧已修（见下方 §22）；`python tools/core_cpu_probe.py --minutes 5` 在开发机上实测空闲平均 **0.130%**、峰值 1.378%（单核，SimLink 在跑未连模拟器）。待低配机复核：空闲 5 分钟平均 < 0.3%（单核），录制中平均 < 1.5%。
-- **SimLink 自动重连（实机）**：先开 AOC 再开 MSFS，10s 内 `sim_connected=true`；飞行中退出模拟器再进，`/events` 有 `sim_disconnected` / `sim_connected`，记录不重复、缺口标记正确。
-
-## 已修复（性能，2026-10-24）
-
-- **aoc-core 空闲 CPU 每 2 秒一次尖峰（D-27 残留）**：根因是 `SimLinkClient` 每次请求都新建 `httpx.AsyncClient`（Windows 上构造要重建 SSL 上下文，实测 **约 0.54s CPU/次**），轮询按 1–2s 打一次 → 常驻高 CPU + 2s 周期尖峰。同一场景实测：修复前 2 分钟空闲平均 **19.9%**、峰值 48%；修复后 5 分钟平均 **0.130%**、峰值 1.378%（只剩取整级别的单 tick），CSV 时间线上不再有 2s 周期。详见 §22。
-
-## 已完成（代码 + 文档）
+## 四、已完成 · 2026-10-24 及更早（§1–§22）
 
 ### 1. 自由飞出发机场只允许「有可用飞机」的机场
 
@@ -84,7 +191,7 @@
 
 ### 2. SimBrief 配载改用 `manualzfw`，呼号改 `airline` + `fltnum`
 
-- `aoc_route/simbrief.py`：去掉 `payload`/`callsign`；`manualzfw = ZFW kg × 2.2046226 ÷ 1000`（保留 3 位小数）；呼号按末尾数字拆成 `airline` + `fltnum`（`AOC101` → `airline=AOC&fltnum=101`），无末尾数字时只传 `airline`。
+- `aoc_route/simbrief.py`：去掉 `payload`/`callsign`；`manualzfw = ZFW kg ÷ 1000`（保留 3 位小数，单位**吨**——原文「× 2.2046226 ÷ 1000 = 千磅」已由 §31 / V-2 证明是错的）；呼号按末尾数字拆成 `airline` + `fltnum`（`AOC101` → `airline=AOC&fltnum=101`），无末尾数字时只传 `airline`。
 - 调用链：`RouteService.simbrief(..., zfw_kg=...)`、`PersonalService.simbrief_for_leg`（传配载单 `zfw_kg`）、`GET /local/routes/simbrief` 同步改为 `zfw_kg`。
 - 测试：`tests/test_route.py::test_simbrief_splits_callsign` / `test_simbrief_uses_manualzfw`、`tests/test_ops.py::test_simbrief_preview_carries_frozen_payload`、`tools/ui_smoke.py` 断言 `manualzfw=` + `airline=`/`fltnum=`，且不含 `payload=`/`callsign=`/`pax=`/`cargo=`/`fuel=`/`fl=`。
 
@@ -96,6 +203,8 @@
 - 测试：`tests/test_ops.py::test_free_flight_dep_time_defaults_to_now_plus_50min`。
 
 ### 4. 推出前 ZFW 低于配载单时提示
+
+> §32 已将开录快照改为推出定稿；下表的 `actual_zfw_kg` 入参只有 demo/replay 源还走旧路径。
 
 - SimLink 采样：`SimConnectSource.cs` 增加 `TOTAL WEIGHT`、`FUEL TOTAL QUANTITY WEIGHT`（磅 → kg）、`GENERAL ENG RPM:1..4`、`TURB ENG N1:1..4`、`ENG COMBUSTION:1..4`；`Sample` 增加 `total_weight_kg`、`fuel_weight_kg`、`eng_rpm[]`、`eng_n1[]`、`eng_combustion[]`；demo 源给模拟值。`FUEL TOTAL QUANTITY` 是体积，已不再当燃油重量用（`fuel_kg` 改由重量 SimVar 换算）。
 - SimLink 新增 `GET /latest`（未开始记录也能取最新帧），`SimLinkClient.latest_sample()` 优先用它、退化到 `/samples` 末尾。
@@ -176,7 +285,7 @@
 
 - `apps/simlink/SimConnectSource.cs`：改为后台线程状态机「连接 → 收消息 → 断开 → 5s 退避重连」；`new SimConnect(...)` 失败、`OnRecvQuit`、`ReceiveMessage` 异常都只置 `sim_connected=false` 并重试，握手 10s 超时按失败处理；`Reconnect()` 可立即重试。
 - `ISimSource` 增加 `Reconnect()` / `ReconnectAttempts` / `LastConnectError` / `ConnectionChanged`；`Engine` 在录制中把 `sim_connected` / `sim_disconnected` 写进事件流；`RecordingInfo` 与 `/local/simlink/status` 透出 `reconnect_attempts` / `last_connect_error`；`POST /command {action:"reconnect"}` + `POST /local/simlink/reconnect`，设置页「重新连接」。
-- 验收（实机）：先开 AOC 再开 MSFS，`sim_connected` 10s 内自动 `true`；飞行中退出再进能自动恢复。
+- 验收（实机）：先开 AOC 再开 MSFS，`sim_connected` 10s 内自动 `true`；飞行中退出再进能自动恢复 → 复测项见 1.2。
 - 文档：`09` §5-12、`08` §3.3、`02` §7.2。
 
 ### 14. 自定义机型模板（原「允许玩家自己添加飞机数据」）
@@ -232,7 +341,7 @@
 - `AocSimLink.csproj`：`ServerGarbageCollection=false` + 并发 GC（Web SDK 默认 Server GC）。
 - `SimConnectSource`：平时 `SIMCONNECT_PERIOD.SECOND`，跑道窗口（`Engine.InRunwayWindow`）临时切 `SIM_FRAME`；切换失败不影响采样。
 - `Engine`：`_samples` 只保留最近 2 万点（`Samples()` 按 `Seq` 二分）、预录帧 5Hz、逐点写盘改 `Utf8JsonWriter` + 复用缓冲写 `FileStream`（不再每点分配字符串）。
-- 工具：`tools/simlink_mem_probe.py`（WS/PM + `/status` 采样点，CSV + 趋势/峰值摘要）。
+- 工具：`tools/simlink_mem_probe.py`（WS/PM + `/status` 采样点，CSV + 趋势/峰值摘要）；低配机复核见 1.3。
 - 文档：`02` §7.2/§7.4/§10.1.1、`08` T-09、`09` §5-12。
 
 ### 21. aoc-core 空闲 CPU（D-27）
@@ -252,3 +361,34 @@
 - 顺带修 `tools/core_cpu_probe.py` / `tools/simlink_mem_probe.py`：PowerShell 脚本里的 `{0}` 占位与 `str.format(pid=...)` 冲突，探针一启动就 `IndexError`，改 `__PID__` 替换。
 - 验证：`tests/test_api.py::test_simlink_client_reuses_connection` / `::test_poll_interval_backs_off_when_sim_not_connected`；`tools/smoke_m1.py`（demo 录制端到端）通过；`pytest` 全绿、`ruff F,E9` 通过。
 - 文档：`02` §10.1.1、`03` §接口表、`08` T-09、`10` §3。
+
+---
+
+## 附录 A. 决策记录（2026-11-02 已拍板）
+
+| 编号 | 议题 | 结论 |
+|---|---|---|
+| D-1 | §33 位置闸阈值与降级 | **10 NM**；`on_ground=false` 或距出发机场 >10 NM 才拦；navdata 缺失 / 查不到出发机场 → 只做瞬移断点，仍允许开录 |
+| D-2 | §33 已在空中才开 AOC | 按 `partial=true` 记录并进复核，不自动判 `COMPLETED`、不置航段 `COMPLETED` |
+| D-3 | §33「本段作废重飞」 | 本批就做，含 `settlement` / 账本 / 机队位置冲销 |
+| D-4 | §34 下限口径 | 可填字段，留空按「上限 × 0.75」推导（480 → 360）；填写值优先 |
+| D-5 | §32 方案 B 参数 | `GS ≥ 5kt` 连续 3s、5 帧中位数、跳变 >10% 继续等；`POST /local/recording/start` **彻底移除** `actual_zfw_kg`（单一来源） |
+| D-6 | §35 快速调机参数 | 允许透支（不拦负余额）；`fast_ferry_hold` 默认关；`fast_ferry_fee_per_nm = 12.0`、`fast_ferry_fixed_fee = 1000.0`（运营规则页可改） |
+| D-7 | §36 数据源路线 | **场景库优先**（按 V-3 改判）：跑道几何取 Little Navmap 的 `little_navmap_msfs24.sqlite`，缺失回落 navdata，手工覆盖表兜底（未做，见 1.4）；SimConnect facility 降为后续可选 |
+
+---
+
+## 附录 B. 验证记录（2026-11-02）
+
+> 五条原型验证全部完成，工具在 `tools/`；结论已并入 §31–§36，此处保留原始数据备查。
+
+- **V-1 §33 采样真相**（MSFS 2024 实机，`tools/v1_ghost_probe.py`）：
+  - 幽灵状态：`lat=0.00000 / lon=90.00032`、`on_ground=false`、`alt≈233ft`、`agl≈216ft`、`gs=0`、`parking_brake=false`、发动机在转 —— 出现在菜单/切场景期间，**不是只有 KBFI**。
+  - 进飞行那一刻瞬移到真实机场（本次 RJTT `35.54213 / 139.80199`），`dt=147.7s`（加载期 SimConnect 无回调）、位移 **3,501.5 NM**、推算 **85,365 kt**。历史录制 `ddc31929` 里 4 处跳变，最小 **16,609 kt**、最大 **12,717,282 kt**（WMKN→(0,90)→海口→**KBFI**→RPLL，总里程 14,185 NM）→ **900 kt 阈值足够**，但要叠加「`dt > 30s` 且位移 > 10 NM」（加载期 dt 很大）。
+  - `on_ground` 恰在跳变处 `false`→`true`：假起飞 + 假落地，`evaluate()` 的 `takeoff=0` 兜底必中。
+  - **预录只对自动开录生效**（旧代码）：`Engine.StartRecording` 只在 `!manual` 时写入 600s 预录；实测手动开录首帧就是当前机位、不带历史帧 → 自动开录中招于预录里的空中帧，手动开录中招于「开录瞬间镜像未稳定」。结论：闸必须挡在 core 的 **ingest 之前**，预录截断是自动路径的关键，起飞门槛是最后兜底。
+  - **顺带发现**：重连/切场景后 SimLink 不重置 `_engineRunning`/`_engineOnSince`/`_hasTakeoff`/`_landed` → 「发动机在转却不自动开录」（已在 §33 修复）。
+- **V-2 §31 `manualzfw` 单位**（人工比对四条对照链接，`tools/v2_simbrief_zfw_links.py`）：单位是 **ton**（t = 1000 kg），正确值 = ZFW ÷ 1000（166714 kg → `166.714`；`182.555` = 182555 kg）。按千磅传 `367.542` 会被当成 367.542 t 超 MTOW 而丢弃。
+- **V-3 §36 可行性**（`tools/v3_navdata_compare.py`）：① SimConnect 设施 API 存在（SDK 12.2，MSFS 2024 应用名 `SunRise`），但按猜的字段名（`LENGTH`/`WIDTH`/`HEADING`/`PRIMARY_LATITUDE`…）全返回 `DATA_ERROR(20)`，需官方 `FacilityDataDefinitionFlightsim.csv`；② **LNM 的 `little_navmap_msfs24.sqlite` 就是「游戏库」**：WMKN 10,041 ft = **3,060.5 m**（navigraph 11,417 ft = 3,480 m），入口坐标差 ~2.2 km，与游戏内实测 3060 m 一致 → D-7 改判。
+- **V-4 §34 候选数量**（真实机队 9 架 / 134 实例，`tools/v4_draw_probe.py`）：遵循航线时链只有 7–10 条；上限 480 + 下限 360 → **达标 0 条（全灭）**，上限 360 → 1/10，上限 240 → 2/7；虚拟航段 553 条链里 66% 达标。
+- **V-5 §32 推出判定**（19 段历史录制，`tools/v5_pushback_probe.py`）：7/19 有真实推出可触发、2 段空中接入无推出、其余短录制/幽灵不触发；触发点 15s 内 ZFW 波动 **0 kg（0.00%）**；帧间隔 0.98–2.0s → 必须「候选帧起表，等 `t − since ≥ 3s` 再取值」。

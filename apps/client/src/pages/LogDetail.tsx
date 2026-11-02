@@ -129,6 +129,14 @@ export function LogDetail() {
               {flight.aircraft_title ? <span className="muted"> · {flight.aircraft_title}</span> : null}
               {status ? <Tag style={{ marginLeft: 8 }} color={status.color}>{tr(status.zh, status.en)}</Tag> : null}
               {rating ? <Tag color={rating.color}>{tr(rating.zh, rating.en)}</Tag> : null}
+              {flight.partial ? (
+                <Tag color="orange" title={tr("空中接入，缺地面/起飞段，结算进复核", "Airborne join: no ground/takeoff phase, goes to review")}>
+                  {tr("部分记录", "Partial")}
+                </Tag>
+              ) : null}
+              {flight.late_join && !flight.partial
+                ? <Tag>{tr("中途接入", "Late join")}</Tag>
+                : null}
             </p>
           </div>
         </Space>
@@ -215,6 +223,18 @@ export function LogDetail() {
                         {flight.zfw_delta_kg != null ? (
                           <span className="muted">
                             {" "}({flight.zfw_delta_kg > 0 ? "+" : ""}{Math.round(flight.zfw_delta_kg)} kg)
+                          </span>
+                        ) : null}
+                      </Descriptions.Item>
+                      <Descriptions.Item label={tr("跑道数据", "Runway data")}>
+                        {flight.runway_ident
+                          ? `${flight.runway_ident} · ${flight.runway_length_m ? `${Math.round(flight.runway_length_m)} m` : "—"}`
+                          : "—"}
+                        {flight.runway_source ? (
+                          <span className="muted">
+                            {" "}({flight.runway_source === "scenery"
+                              ? tr("游戏内", "in-game")
+                              : "navdata"})
                           </span>
                         ) : null}
                       </Descriptions.Item>

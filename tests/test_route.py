@@ -170,9 +170,9 @@ def test_simbrief_splits_callsign(service: RouteService):
 
 
 def test_simbrief_uses_manualzfw(service: RouteService):
-    """配载改用 ZFW（千磅、3 位小数）；payload/pax/cargo/fuel 都不是 SimBrief 参数。"""
+    """配载改用 ZFW（吨、3 位小数）；payload/pax/cargo/fuel 都不是 SimBrief 参数。"""
     url = service.simbrief("ZBAA", "ZSSS", 350, "A320", None, "AOC101", 6120, "B-1671")
-    assert "manualzfw=13.492" in url      # 6120 kg × 2.2046226 ÷ 1000
+    assert "manualzfw=6.120" in url      # 6120 kg ÷ 1000（V-2：单位是吨）
     assert "reg=B-1671" in url
     for legacy in ("payload=", "callsign=", "pax=", "cargo=", "fuel=", "fl="):
         assert legacy not in url

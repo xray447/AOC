@@ -35,6 +35,39 @@ def test_no_landing_is_aborted(nav):
 
 
 # --------------------------------------------------------------------------
+# §33：幽灵飞机/瞬移（首点是假空中帧）
+# --------------------------------------------------------------------------
+def _with_ghost_prefix(points: list[dict], seconds: float = 2.0) -> list[dict]:
+    """在真实轨迹前插几帧 (0, 90) 的空中幽灵帧（V-1 实测形态）。"""
+    ghost = [{
+        "t": float(i), "lat": 0.0, "lon": 90.0, "alt_ft": 233.0, "agl_ft": 216.0,
+        "gs_kt": 0.0, "vs_fpm": 0.0, "hdg_true": 0.0, "on_ground": False,
+        "fuel_kg": 8000.0, "g": 1.0,
+    } for i in range(int(seconds) + 1)]
+    shifted = [{**p, "t": p["t"] + seconds} for p in points]
+    return ghost + shifted
+
+
+def test_ghost_airborne_prefix_is_trimmed(nav):
+    """幽灵空中帧不算起飞：丢掉后从真实地面段重新评估（假起降不再把记录判成完成）。"""
+    points = _with_ghost_prefix(make_points())
+    result = evaluate(points, nav)
+    assert result["takeoff_index"] is not None
+    assert result["landing_index"] is not None
+    assert result["dep_icao"] == "ZBAA"
+    # 里程不该把 (0, 90) → ZBAA 的那一跳算进去
+    assert result["distance_nm"] < 700
+
+
+def test_long_airborne_first_point_still_counts_as_takeoff(nav):
+    """真·空中接入（首点在空中且持续够久）仍按首点起飞处理，不丢整段轨迹。"""
+    points = make_points(takeoff=0)
+    result = evaluate(points, nav)
+    assert result["takeoff_index"] == 0
+    assert result["landing_index"] is not None
+
+
+# --------------------------------------------------------------------------
 # 跑道内移入口（displaced threshold）
 # --------------------------------------------------------------------------
 KJFK_LAT, KJFK_LON = 40.6413, -73.7781
@@ -152,5 +185,62 @@ def test_threshold_distance_measured_from_displaced_threshold(tmp_path: Path):
         assert landing["displaced_threshold_m"] == pytest.approx(1000.0, abs=1.0)
         # 接地距物理入口 1200m → 距着陆入口 200m
         assert landing["threshold_distance_m"] == pytest.approx(200.0, abs=40.0)
+    finally:
+        nav.close()
+
+
+# --------------------------------------------------------------------------
+# §36 场景库跑道几何（游戏内数据优先）
+# --------------------------------------------------------------------------
+def _with_runway_length_ft(path: Path, length_ft: float) -> Path:
+    con = sqlite3.connect(path)
+    con.execute("update runway set length=?", (length_ft,))
+    con.commit()
+    con.close()
+    return path
+
+
+def test_scenery_runway_geometry_preferred(tmp_path: Path):
+    main = build_kjfk(tmp_path / "nav.sqlite")
+    scen = _with_runway_length_ft(build_kjfk(tmp_path / "scen.sqlite"), 10041.0)
+    nav = NavData(main, scenery_path=scen, runway_source="auto")
+    try:
+        rwy = next(r for r in nav.runways("KJFK") if r["name"] == "31L")
+        assert rwy["source"] == "scenery"
+        assert rwy["length_m"] == pytest.approx(3060.5, abs=5)   # 游戏内 3060 m
+        # 现实 navdata 的对照长度（4425 m）仍可单独取到
+        ref = next(r for r in nav.navdata_runways("KJFK") if r["name"] == "31L")
+        assert ref["length_m"] == pytest.approx(4425.0, abs=30.0)
+        # 最长跑道也换成游戏内数据（影响「跑道够不够长」）
+        assert nav.airport("KJFK")["longest_runway_m"] == pytest.approx(3060.5, abs=5)
+        found = nav.find_runway(RWY_LAT, RWY_LON, RWY_HDG)
+        assert found and found["runway_source"] == "scenery"
+        assert found["length_m"] == pytest.approx(3060.5, abs=5)
+    finally:
+        nav.close()
+
+
+def test_runway_data_source_navdata_ignores_scenery(tmp_path: Path):
+    main = build_kjfk(tmp_path / "nav.sqlite")
+    scen = _with_runway_length_ft(build_kjfk(tmp_path / "scen.sqlite"), 10041.0)
+    nav = NavData(main, scenery_path=scen, runway_source="navdata")
+    try:
+        rwy = next(r for r in nav.runways("KJFK") if r["name"] == "31L")
+        assert rwy["source"] == "navdata"
+        assert rwy["length_m"] == pytest.approx(4425.0, abs=30.0)
+    finally:
+        nav.close()
+
+
+def test_landing_metrics_carry_runway_source_and_length(tmp_path: Path):
+    main = build_kjfk(tmp_path / "nav.sqlite")
+    scen = _with_runway_length_ft(build_kjfk(tmp_path / "scen.sqlite"), 10041.0)
+    nav = NavData(main, scenery_path=scen, runway_source="auto")
+    try:
+        td_lat, td_lon = _point_along(1200.0)
+        result = evaluate(make_landing_points(td_lat, td_lon), nav)
+        landing = result["landing"]
+        assert landing["runway_source"] == "scenery"
+        assert landing["runway_length_m"] == pytest.approx(3060.5, abs=5)
     finally:
         nav.close()

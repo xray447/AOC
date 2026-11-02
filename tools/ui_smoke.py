@@ -354,7 +354,7 @@ def main() -> int:
             assert posted, "SimBrief 未请求 open-external"
             assert "dispatch.simbrief.com" in posted[0]
             assert "orig=ZBAA" in posted[0]
-            # 配载用 manualzfw（千磅）；呼号拆 airline + fltnum；不预填高度
+            # 配载用 manualzfw（吨）；呼号拆 airline + fltnum；不预填高度
             assert "manualzfw=" in posted[0]
             assert "airline=" in posted[0] and "fltnum=" in posted[0]
             assert "reg=" in posted[0]

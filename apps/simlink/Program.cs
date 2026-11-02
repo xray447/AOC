@@ -18,6 +18,10 @@ internal static class Program
         [JsonPropertyName("mode")] public string? Mode { get; set; }
         /// <summary>`set_auto_stop_hold`：连续静止/停机刹车保持秒数。</summary>
         [JsonPropertyName("seconds")] public double? Seconds { get; set; }
+        /// <summary>`set_dep_airport`：出发机场 ICAO + 坐标（§33 预录截断用）。</summary>
+        [JsonPropertyName("icao")] public string? Icao { get; set; }
+        [JsonPropertyName("lat")] public double? Lat { get; set; }
+        [JsonPropertyName("lon")] public double? Lon { get; set; }
     }
 
     private static async Task<int> Main(string[] args)
@@ -103,6 +107,10 @@ internal static class Program
                     return Results.Json(engine.Status());
                 case "set_auto_stop_hold":
                     engine.AutoStopHoldS = Math.Clamp(cmd.Seconds ?? 60.0, 30.0, 300.0);
+                    return Results.Json(engine.Status());
+                case "set_dep_airport":
+                    // §33：出发机场坐标由 core 下发（SimLink 不读导航库）
+                    engine.SetDeparture(cmd.Icao, cmd.Lat, cmd.Lon);
                     return Results.Json(engine.Status());
                 case "reconnect":
                     // 立即重建 SimConnect；后台循环本来也会按 5s 退避重试

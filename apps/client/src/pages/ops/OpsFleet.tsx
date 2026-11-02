@@ -1,10 +1,11 @@
 import { PlusOutlined, ReloadOutlined, SettingOutlined, UnlockOutlined } from "@ant-design/icons";
 import {
-  Alert, Button, Card, Col, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Row, Select,
-  Space, Switch, Table, Tag, Tooltip, message,
+  Alert, Button, Card, Col, Descriptions, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Row,
+  Select, Space, Switch, Table, Tag, Tooltip, message,
 } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type ApiError } from "../../api";
+import { AirportSelect } from "../../components/AirportSelect";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { aircraftStatus, money, typeLabel } from "../../ops";
@@ -123,13 +124,24 @@ export function OpsFleet() {
   const [typeBusy, setTypeBusy] = useState(false);
   const [typeForm] = Form.useForm<TypeFormValues>();
 
+  // 快速调机（§35）：选目标机场 → 预览距离/费用 → 确认后在 AOC 侧改位置
+  const [ferry, setFerry] = useState<{ row: OpsAircraft; to?: string; distance?: number } | null>(null);
+  const [ferryBusy, setFerryBusy] = useState(false);
+  const [ferryRate, setFerryRate] = useState({ perNm: 12, fixed: 1000 });
+
   const load = useCallback(async () => {
-    const [f, t] = await Promise.all([
+    const [f, t, cfg] = await Promise.all([
       api<{ items: OpsAircraft[] }>("/local/ops/fleet"),
       api<{ items: OpsAircraftType[] }>("/local/ops/aircraft-types"),
+      api<{ economy?: Record<string, number> }>("/local/ops/config")
+        .catch(() => ({ economy: {} as Record<string, number> })),
     ]);
     setFleet(f.items);
     setTypes(t.items);
+    setFerryRate({
+      perNm: Number(cfg.economy?.fast_ferry_fee_per_nm ?? 12),
+      fixed: Number(cfg.economy?.fast_ferry_fixed_fee ?? 1000),
+    });
   }, []);
 
   useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
@@ -175,6 +187,49 @@ export function OpsFleet() {
       message.error((e as Error).message);
     }
   };
+
+  /** 距目标机场的大圆距离（用于费用预览；失败就只显示固定费）。 */
+  const previewFerry = async (row: OpsAircraft, to?: string) => {
+    setFerry({ row, to });
+    if (!to || !row.current_airport_icao || to === row.current_airport_icao) return;
+    try {
+      const [a, b] = await Promise.all([
+        api<{ lat: number; lon: number }>(`/local/airports/${row.current_airport_icao}`),
+        api<{ lat: number; lon: number }>(`/local/airports/${to}`),
+      ]);
+      const rad = Math.PI / 180;
+      const dLat = (b.lat - a.lat) * rad;
+      const dLon = (b.lon - a.lon) * rad;
+      const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+      setFerry({ row, to, distance: 2 * 3440.065 * Math.asin(Math.min(1, Math.sqrt(h))) });
+    } catch {
+      /* 预览失败不影响提交 */
+    }
+  };
+
+  const submitFerry = async () => {
+    if (!ferry?.to) return;
+    setFerryBusy(true);
+    try {
+      const res = await api<{ fee: number; warnings?: string[] }>(
+        `/local/ops/fleet/${ferry.row.id}/ferry`,
+        { method: "POST", body: JSON.stringify({ to_icao: ferry.to }) },
+      );
+      setFerry(null);
+      await load();
+      (res.warnings || []).forEach((w) => message.info(w));
+      message.success(tr(`已调机，费用 ${money(res.fee)}`, `Ferried for ${money(res.fee)}`));
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setFerryBusy(false);
+    }
+  };
+
+  const ferryFee = ferry?.distance != null
+    ? Math.round(ferryRate.fixed + ferry.distance * ferryRate.perNm)
+    : ferryRate.fixed;
 
   // ---- 机型模板 ----
   const openCreateType = () => {
@@ -322,6 +377,11 @@ export function OpsFleet() {
                         <Button size="small" danger icon={<UnlockOutlined />}>{tr("释放", "Release")}</Button>
                       </Popconfirm>
                     ) : null}
+                    {r.status === "ACTIVE" && !r.locked ? (
+                      <Button size="small" onClick={() => void previewFerry(r)}>
+                        {tr("快速调机", "Ferry")}
+                      </Button>
+                    ) : null}
                     {r.status === "ACTIVE" || r.status === "MAINTENANCE" ? (
                       <Button size="small" onClick={() => void patch(r, {
                         status: r.status === "ACTIVE" ? "MAINTENANCE" : "ACTIVE", version: r.version,
@@ -435,6 +495,49 @@ export function OpsFleet() {
           ]}
         />
       </Drawer>
+
+      <Modal
+        open={!!ferry}
+        title={ferry ? tr(`快速调机 · ${ferry.row.registration}`, `Ferry · ${ferry.row.registration}`) : ""}
+        okText={tr("确认调机（付费）", "Confirm ferry (paid)")}
+        cancelText={tr("返回", "Back")}
+        confirmLoading={ferryBusy}
+        okButtonProps={{ disabled: !ferry?.to }}
+        onOk={() => void submitFerry()}
+        onCancel={() => setFerry(null)}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={tr("模拟器里不会搬飞机", "The simulator does not move the aircraft")}
+          description={tr("调机只改 AOC 侧位置与账本：请在 MSFS 里于目标机场重新进入飞行；位置不符时不会开始录制。",
+            "Ferrying only changes the AOC-side position and ledger: re-enter the flight at the target airport in MSFS; recording will not start from the wrong position.")}
+        />
+        <Form layout="vertical">
+          <Form.Item label={tr("目标机场", "Target airport")}>
+            <AirportSelect
+              value={ferry?.to}
+              onChange={(v) => { if (ferry) void previewFerry(ferry.row, v); }}
+              placeholder={tr("输入 ICAO 或机场名", "Search ICAO or airport")}
+            />
+          </Form.Item>
+        </Form>
+        <Descriptions size="small" column={2}>
+          <Descriptions.Item label={tr("当前位置", "Current")}>
+            {ferry?.row.current_airport_icao || "—"}
+          </Descriptions.Item>
+          <Descriptions.Item label={tr("距离", "Distance")}>
+            {ferry?.distance != null ? `${Math.round(ferry.distance)} NM` : "—"}
+          </Descriptions.Item>
+          <Descriptions.Item label={tr("费用（允许透支）", "Fee (overdraft allowed)")}>
+            {money(ferryFee)}
+          </Descriptions.Item>
+          <Descriptions.Item label={tr("计价", "Rate")}>
+            {`${money(ferryRate.fixed)} + ${ferryRate.perNm} / NM`}
+          </Descriptions.Item>
+        </Descriptions>
+      </Modal>
 
       <Modal
         open={typeModal}

@@ -5,18 +5,19 @@ import re
 from urllib.parse import urlencode
 
 BASE = "https://dispatch.simbrief.com/options/custom"
-KG_TO_LB = 2.2046226
+KG_PER_TON = 1000.0
 
 
 def _manualzfw(zfw_kg: float | int | None) -> str | None:
-    """ZFW（kg）→ SimBrief `manualzfw`（千磅，保留 3 位小数）。
+    """ZFW（kg）→ SimBrief `manualzfw`（吨 t = 1000 kg，保留 3 位小数）。
 
-    SimBrief 的 manualzfw 单位是 1000 lb，不是 kg。
+    V-2 实测（2026-11-02）：`manualzfw` 的单位是吨，不是 1000 lb。
+    166714 kg → `166.714`；传 367.542 会被当成 367.542 t（远超 MTOW）丢弃。
     """
     if zfw_kg is None:
         return None
     try:
-        value = float(zfw_kg) * KG_TO_LB / 1000.0
+        value = float(zfw_kg) / KG_PER_TON
     except (TypeError, ValueError):
         return None
     if value <= 0:
@@ -45,7 +46,7 @@ def build_url(dep: str, arr: str, aircraft: str | None = "A320",
     """起降/机型/航路/注册号 + 配载（ZFW → `manualzfw`）。
 
     SimBrief 不接受 `callsign`/`payload`：呼号拆成 `airline` + `fltnum`，
-    配载改用零油重（`manualzfw`，千磅）。不预填高度（fl），交给 SimBrief 自算。
+    配载改用零油重（`manualzfw`，单位吨）。不预填高度（fl），交给 SimBrief 自算。
     """
     dep, arr = (dep or "").strip().upper(), (arr or "").strip().upper()
     if not dep or not arr:

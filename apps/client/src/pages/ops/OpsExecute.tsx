@@ -4,7 +4,7 @@ import {
 import {
   Alert, Button, Card, Col, Descriptions, Empty, Modal, Popconfirm, Row, Space, Statistic, Table, Tag, Typography, message,
 } from "antd";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api";
 import { SimBriefButton } from "../../components/SimBriefButton";
@@ -43,6 +43,8 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
   const [settlement, setSettlement] = useState<OpsSettlement | null>(null);
   const [flightStatus, setFlightStatus] = useState<FlightStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  // 推出时 ZFW 仍偏低：只提示一次（按后端给的 seq 去重）
+  const zfwWarnSeq = useRef(0);
 
   const loadAll = useCallback(async () => {
     const res = await api<ActiveResponse>("/local/ops/active");
@@ -69,12 +71,12 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     if (recording.active) void loadAll();
   }, [recording.active, loadAll]);
 
-  const startRecording = async (actualZfw?: number | null) => {
+  const startRecording = async (partial = false) => {
     setBusy(true);
     try {
       const res = await api<{ warnings?: string[] }>("/local/recording/start", {
         method: "POST",
-        body: JSON.stringify({ actual_zfw_kg: actualZfw ?? null }),
+        body: JSON.stringify({ partial }),
       });
       (res.warnings || []).forEach((w) => message.warning(w));
       await refresh();
@@ -87,8 +89,36 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     }
   };
 
-  /** 推出前 ZFW 校验：实际 ZFW 低于配载单时提示「可能漏装旅客/货物」，确认后继续。 */
-  const startWithZfwCheck = async () => {
+  /** 开录前的位置/连接检查（§33 位置闸）；ZFW 不再在这里校验（§32 改由推出事件定稿）。 */
+  const startWithChecks = async () => {
+    // §33 位置闸：距出发机场 >10 NM 不开录；已在空中可改「部分记录」（走复核，D-2）
+    if (flightStatus && flightStatus.position_ok === false) {
+      if (flightStatus.partial_allowed) {
+        const ok = await new Promise<boolean>((resolve) => {
+          Modal.confirm({
+            title: tr("已在空中", "Already airborne"),
+            content: tr(
+              "位置闸发现飞机已经在空中：可以按「部分记录」开始。缺地面/起飞段的记录不会自动判完成，落地后进复核队列。",
+              "The position gate sees you airborne: start a partial recording. Records missing the ground/takeoff phase are not auto-completed; they go to review after landing.",
+            ),
+            okText: tr("按部分记录开始", "Start partial recording"),
+            cancelText: tr("返回", "Back"),
+            onOk: () => resolve(true),
+            onCancel: () => resolve(false),
+          });
+        });
+        if (!ok) return;
+        await startRecording(true);
+        return;
+      }
+      message.warning(
+        tr(
+          `尚未进入飞行 / 位置不符：距 ${flightStatus.dep_icao || "出发机场"} ${flightStatus.dep_distance_nm ?? "?"} NM，请先在 MSFS 里于本场进入飞行`,
+          `Not in flight / wrong position: ${flightStatus.dep_distance_nm ?? "?"} NM from ${flightStatus.dep_icao || "departure"}. Enter the flight at this airport in MSFS first.`,
+        ),
+      );
+      return;
+    }
     // SimLink 在跑但没连上模拟器：这次记录不会有采样点，先确认
     if (sim.level === "no-sim") {
       const proceed = await new Promise<boolean>((resolve) => {
@@ -107,36 +137,8 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
       });
       if (!proceed) return;
     }
-    let actual = flightStatus?.actual_zfw_kg ?? null;
-    if (actual === null) {
-      try {
-        const latest = await api<FlightStatus>("/local/ops/flight-status");
-        setFlightStatus(latest);
-        actual = latest.actual_zfw_kg ?? null;
-      } catch {
-        actual = null;
-      }
-    }
-    const planned = load?.zfw_kg ?? null;
-    if (actual !== null && planned !== null && actual < planned) {
-      const shortage = Math.round(planned - actual);
-      const ok = await new Promise<boolean>((resolve) => {
-        Modal.confirm({
-          title: tr("实际 ZFW 低于配载单", "Actual ZFW is below the load sheet"),
-          content: tr(
-            `实际 ${Math.round(actual as number)} kg，配载单 ${Math.round(planned)} kg，少 ${shortage} kg；可能漏装旅客/货物。仍要开始记录吗？`,
-            `Actual ${Math.round(actual as number)} kg vs load sheet ${Math.round(planned)} kg (${shortage} kg short). Passengers or cargo may be missing. Start anyway?`,
-          ),
-          okText: tr("仍要开始", "Start anyway"),
-          okButtonProps: { danger: true },
-          cancelText: tr("返回检查", "Back"),
-          onOk: () => resolve(true),
-          onCancel: () => resolve(false),
-        });
-      });
-      if (!ok) return;
-    }
-    await startRecording(actual);
+    // §32 方案 B：开录不带 ZFW/油量，推出时由 SimLink 定稿（不再弹「偏低」Modal）
+    await startRecording();
   };
 
   const stopRecording = async (abort: boolean) => {
@@ -201,6 +203,10 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
       try {
         const status = await api<FlightStatus>("/local/ops/flight-status");
         if (alive) setFlightStatus(status);
+        if (status.zfw_warning_seq > zfwWarnSeq.current) {
+          zfwWarnSeq.current = status.zfw_warning_seq;
+          (status.zfw_warnings || []).forEach((w) => message.warning(w));
+        }
       } catch {
         if (alive) setFlightStatus(null);
       }
@@ -294,7 +300,9 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                     callsign={task.callsign}
                     opsLeg={{ flightRecordId: task.flight_record_id }}
                   />
-                  <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void startWithZfwCheck()}>
+                  <Button type="primary" icon={<PlayCircleOutlined />} loading={busy}
+                    disabled={flightStatus?.position_ok === false && !flightStatus?.partial_allowed}
+                    onClick={() => void startWithChecks()}>
                     {tr("开始记录", "Start recording")}
                   </Button>
                   <Text type={sim.level === "online" ? "secondary" : "warning"}>
@@ -309,6 +317,21 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                 </>
               )}
             </Space>
+            {!recording.active && flightStatus && flightStatus.position_ok === false ? (
+              <Alert
+                style={{ marginTop: 8 }}
+                type="warning"
+                showIcon
+                message={flightStatus.partial_allowed
+                  ? tr("已在空中：可以按部分记录开始（走复核）", "Airborne: start a partial recording (goes to review)")
+                  : tr("位置不符，暂时无法开始记录", "Wrong position — recording is blocked for now")}
+                description={flightStatus.partial_allowed
+                  ? tr("缺地面/起飞段的记录不会自动判完成，落地后进复核队列。",
+                    "A record without the ground/takeoff phase is not auto-completed; it goes to review after landing.")
+                  : tr(`距 ${flightStatus.dep_icao || "出发机场"} ${flightStatus.dep_distance_nm ?? "?"} NM（需 ≤10 NM 且在地面）：请先在 MSFS 里于本场进入飞行，幽灵机/加载期的位置不会开录。`,
+                    `${flightStatus.dep_distance_nm ?? "?"} NM from ${flightStatus.dep_icao || "departure"} (needs ≤10 NM on the ground): enter the flight at this airport in MSFS first.`)}
+              />
+            ) : null}
           </Card>
 
           <SimlinkNotice style={{ marginTop: 16 }} />
@@ -342,12 +365,37 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
               <Text type="secondary">{tr("没有 SimLink 采样（检查 SimLink 是否在线）",
                 "No SimLink samples — check that SimLink is running")}</Text>
             ) : null}
-            {flightStatus?.actual_zfw_kg != null && load && load.zfw_kg != null ? (
-              <Text type={flightStatus.actual_zfw_kg < load.zfw_kg ? "danger" : "secondary"}>
-                {tr("实际 ZFW", "Actual ZFW")} {num(flightStatus.actual_zfw_kg)} kg
-                {" / "}{tr("配载单", "Load sheet")} {num(load.zfw_kg)} kg
-              </Text>
-            ) : null}
+            <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 3 }} style={{ marginTop: 8 }}>
+              <Descriptions.Item label={tr("实际 ZFW（推出后定稿）", "Actual ZFW (final at pushback)")}>
+                {flightStatus?.actual_zfw_kg != null
+                  ? <span className={flightStatus.zfw_state === "short" ? "text-danger" : undefined}>
+                      {num(flightStatus.actual_zfw_kg)} kg
+                    </span>
+                  : "—"}
+                {flightStatus?.zfw_source === "preflight"
+                  ? <Tag style={{ marginLeft: 6 }}>{tr("推出前临时值", "provisional")}</Tag>
+                  : null}
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("配载单 ZFW", "Load sheet ZFW")}>
+                {num(flightStatus?.planned_zfw_kg ?? load?.zfw_kg)} kg
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("差异", "Delta")}>
+                {flightStatus?.actual_zfw_kg != null && (flightStatus.planned_zfw_kg ?? load?.zfw_kg) != null
+                  ? `${num(flightStatus.actual_zfw_kg - Number(flightStatus.planned_zfw_kg ?? load?.zfw_kg ?? 0))} kg`
+                  : "—"}
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("实际滑出油量", "Fuel at pushback")}>
+                {num(flightStatus?.fuel_at_pushback ?? flightStatus?.fuel_weight_kg)} kg
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("计划油量", "Planned fuel")}>
+                {num(flightStatus?.planned_fuel_kg ?? load?.fuel_kg)} kg
+              </Descriptions.Item>
+              <Descriptions.Item label={tr("推出时间", "Pushback")}>
+                {flightStatus?.fuel_at_pushback != null
+                  ? tr("已定稿", "captured")
+                  : tr("尚未推出（推出时会再校验）", "not yet — checked again at pushback")}
+              </Descriptions.Item>
+            </Descriptions>
           </Card>
 
           {load ? (

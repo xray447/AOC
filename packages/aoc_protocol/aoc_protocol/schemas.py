@@ -61,6 +61,10 @@ class Settings(Model):
     max_gap_s: int = Field(default=45, ge=5, le=120)
     turn_threshold_dps: float = Field(default=4.0, ge=1.0, le=12.0)
     navdata_path: str | None = None
+    # 场景库（§36 / D-7）：Little Navmap 从 MSFS 场景扫出的 little_navmap_msfs24.sqlite
+    scenery_navdata_path: str | None = None
+    # 跑道几何来源：auto（场景库命中优先）/ navdata / scenery
+    runway_data_source: Literal["auto", "navdata", "scenery"] = "auto"
     aip_path: str | None = None
     # None = 用内置 jp-routes 地址自动同步；"" = 关闭
     aip_url: str | None = None
@@ -210,6 +214,10 @@ class NavdataStatus(Model):
     airways: int = 0
     error: str | None = None
     coverage_ready: bool = False
+    # 场景库（§36）：游戏内跑道几何来源；缺失时自动回落现实 navdata
+    scenery_path: str | None = None
+    scenery_available: bool = False
+    runway_data_source: str = "auto"
 
 
 # --------------------------------------------------------------------------
@@ -419,6 +427,10 @@ class RecordingStatus(Model):
     # 用来区分「SimLink 没起」和「SimLink 起了但没连上 MSFS」。
     simlink_source: str | None = None
     last_connect_error: str | None = None
+    # 推出后定稿的 ZFW / 油量（§32 方案 B）：未推出为 None
+    zfw_at_pushback: float | None = None
+    fuel_at_pushback: float | None = None
+    pushback_source: str | None = None
 
 
 # --------------------------------------------------------------------------

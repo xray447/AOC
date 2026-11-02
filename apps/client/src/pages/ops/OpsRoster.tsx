@@ -1,7 +1,7 @@
 import { PlayCircleOutlined, ReloadOutlined, ThunderboltOutlined } from "@ant-design/icons";
 import {
-  Alert, Button, Card, Col, Descriptions, Divider, Empty, Form, InputNumber, Popconfirm, Progress,
-  Row, Select, Space, Switch, Table, Tag, Typography, message,
+  Alert, Button, Card, Col, Descriptions, Divider, Empty, Form, InputNumber, Modal, Popconfirm,
+  Progress, Row, Select, Space, Switch, Table, Tag, Typography, message,
 } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -20,6 +20,8 @@ const DEFAULTS = {
   max_legs: 3,
   // 合计航时（整条班表）与每程航时区间是两个维度，表单里分开标注
   max_block_minutes: 480,
+  // 合计航时下限（§34）：留空按「上限 −25%」推导（480 → 360）
+  min_total_block_minutes: undefined as number | undefined,
   min_leg_block_minutes: 30,
   max_leg_block_minutes: 480,
   min_turnaround_min: 45,
@@ -42,6 +44,9 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
   const [types, setTypes] = useState<OpsAircraftType[]>([]);
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm<typeof DEFAULTS>();
+  // 合计航时下限的默认值跟着上限走（留空 = 上限 −25%），表单里实时提示
+  const maxBlockWatch = Form.useWatch("max_block_minutes", form) ?? DEFAULTS.max_block_minutes;
+  const minTotalDefault = Math.max(30, Math.round(Number(maxBlockWatch) * 0.75));
 
   const load = useCallback(async () => {
     const [r, t] = await Promise.all([
@@ -116,6 +121,35 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
       await api(`/local/ops/rosters/${roster.id}/legs/${sequence}/start`, { method: "POST" });
       message.success(tr("航段已开始，配载已固化", "Leg started, load sheet frozen"));
       navigate("/ops/execute");
+    } catch (e) {
+      const err = e as { code?: string; message: string };
+      if (err.code === "AIRCRAFT_NOT_AT_DEPARTURE") {
+        // §35：位置不符只提示不过瘾，直接给「快速调机」入口
+        Modal.confirm({
+          title: tr("飞机不在出发机场", "Aircraft is not at the departure airport"),
+          content: err.message,
+          okText: tr("去快速调机", "Fast ferry"),
+          cancelText: tr("返回", "Back"),
+          onOk: () => navigate("/ops/fleet"),
+        });
+      } else {
+        message.error(err.message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 本段作废重飞（§33 / D-3）：误判成「已完成」的航段退回未开始，并冲销结算/账本/位置。 */
+  const voidLeg = async (sequence: number) => {
+    if (!roster) return;
+    setBusy(true);
+    try {
+      await api(`/local/ops/rosters/${roster.id}/legs/${sequence}/void`, {
+        method: "POST", body: JSON.stringify({ reason: "本段作废重飞" }),
+      });
+      await load();
+      message.success(tr("本段已作废，可重新开始这一段的记录", "Leg voided — you can start it again"));
     } catch (e) {
       message.error((e as Error).message);
     } finally {
@@ -201,7 +235,9 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
               {tr(" 段 · 每程 ", " legs · per leg ")}
               {String(roster.constraints.min_leg_block_minutes ?? "—")}–{String(roster.constraints.max_leg_block_minutes ?? "—")}min
               {tr(" · 合计 ", " · total ")}
-              {String(roster.constraints.max_block_minutes ?? "—")}min
+              {String((roster.constraints as Record<string, unknown>).min_total_block_minutes
+                ?? Math.max(30, Math.round(Number(roster.constraints.max_block_minutes ?? 480) * 0.75)))}
+              –{String(roster.constraints.max_block_minutes ?? "—")}min
               {roster.constraints.follow_routes === false ? tr(" · 任意机场对", " · any airport pair") : ""}
             </Descriptions.Item>
           </Descriptions>
@@ -246,6 +282,20 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                         {tr("开始本段", "Start leg")}
                       </Button>
                     </Space>
+                  ) : l.status === "COMPLETED" || l.status === "IN_PROGRESS" ? (
+                    <Popconfirm
+                      title={tr("本段作废重飞？", "Void this leg and re-fly it?")}
+                      description={tr("退回未开始，并冲销该段的结算、账本与机队位置（幽灵机/假起降误判时用）。",
+                        "Returns the leg to planned and reverses its settlement, ledger entries and aircraft position.")}
+                      okText={tr("作废重飞", "Void & re-fly")}
+                      okButtonProps={{ danger: true }}
+                      cancelText={tr("返回", "Back")}
+                      onConfirm={() => void voidLeg(l.sequence)}
+                    >
+                      <Button size="small" danger loading={busy}>
+                        {tr("本段作废重飞", "Void & re-fly")}
+                      </Button>
+                    </Popconfirm>
                   ) : null
                 ),
               },
@@ -293,6 +343,33 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                 <Col span={12}>
                   <Form.Item name="max_block_minutes" label={tr("合计飞行时间（min）", "Total block (min)")}>
                     <InputNumber min={30} max={1440} step={30} style={{ width: "100%" }} />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item
+                    name="min_total_block_minutes"
+                    label={tr("最少合计航时（min）", "Min total block (min)")}
+                    dependencies={["max_block_minutes"]}
+                    extra={(
+                      <span className="muted" style={{ fontSize: 12 }}>
+                        {tr(`可接受 ${minTotalDefault}–${Number(maxBlockWatch)} min`,
+                          `Accept ${minTotalDefault}–${Number(maxBlockWatch)} min`)}
+                      </span>
+                    )}
+                    rules={[({ getFieldValue }) => ({
+                      validator: (_rule, value) => {
+                        const max = Number(getFieldValue("max_block_minutes") ?? DEFAULTS.max_block_minutes);
+                        if (value == null || (Number(value) >= 30 && Number(value) <= max)) {
+                          return Promise.resolve();
+                        }
+                        return Promise.reject(new Error(tr(
+                          `需在 30–${max} min 之间（不能超过合计上限）`,
+                          `Must be 30–${max} min (not above the total cap)`)));
+                      },
+                    })]}
+                  >
+                    <InputNumber min={30} max={1440} step={30} style={{ width: "100%" }}
+                      placeholder={tr(`留空 = ${minTotalDefault}`, `blank = ${minTotalDefault}`)} />
                   </Form.Item>
                 </Col>
                 <Col span={12}>
@@ -412,6 +489,11 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                 <Text type="secondary">{tr("共评估", "considered")} {draw.considered}</Text>
               </Space>
             ) : null}>
+            {draw?.warnings?.length ? (
+              <Alert style={{ marginBottom: 12 }} type="warning" showIcon
+                message={tr("约束已放宽", "Constraints relaxed")}
+                description={draw.warnings.join("；")} />
+            ) : null}
             {draw?.candidates.length ? (
               <Space direction="vertical" size={12} style={{ width: "100%" }}>
                 {draw.candidates.map((candidate, index) => (

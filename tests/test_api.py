@@ -138,6 +138,50 @@ def test_record_requires_simlink(app_client):
     assert res.json()["detail"]["code"] == "SIMLINK_UNAVAILABLE"
 
 
+def test_recorder_resets_on_teleport(app_client):
+    """§33 第 3 道闸：录制中瞬移丢弃跳变前轨迹、时间轴重锚，并写 teleport 事件。"""
+    service = app_client.app.state.service
+    service.flights.start(flight_id="tp-flight", started_at="2026-10-20T00:00:00Z", manual=True)
+    seq = 0
+    ghost = []
+    for i in range(3):
+        ghost.append({"seq": seq, "t": float(i), "lat": 0.0, "lon": 90.0, "alt_ft": 233.0,
+                      "agl_ft": 216.0, "gs_kt": 0.0, "on_ground": False})
+        seq += 1
+    service.flights.ingest(ghost)
+    # 瞬移到 ZBAA 地面（dt≈148s、3,500 NM）
+    service.flights.ingest([{"seq": seq, "t": 150.0, "lat": 40.0801, "lon": 116.5846,
+                             "alt_ft": 116.0, "agl_ft": 0.0, "gs_kt": 0.0, "on_ground": True}])
+    rec = service.flights.recorder
+    assert rec.samples and rec.samples[0]["lat"] == 40.0801
+    assert rec.samples[0]["t"] == 0.0            # 时间轴重锚到跳变后首帧
+    assert rec.sample_count == 1
+    assert rec.started_at == "2026-10-20T00:02:30Z"
+    assert any(e["type"] == "teleport" for e in rec.events)
+    service.flights.stop(abort=True)
+
+
+def test_position_gate_blocks_outside_departure(app_client, navdata_path):
+    """§33 第 1 道闸：不在出发机场地面（或已在空中）时不让开录。"""
+    app_client.put("/local/settings", json={"navdata_path": str(navdata_path)})
+    service = app_client.app.state.service
+    service.ops.seed_demo()
+    drawn = service.ops.draw({"max_legs": 1, "max_block_minutes": 480, "window_hours": 168,
+                              "min_turnaround_min": 45})
+    roster = service.ops.confirm_roster(drawn["candidates"][0]["candidate_token"], 0)
+    task = service.ops.start_leg(roster["id"], 1)["task"]
+    info = service.nav.airport(task["dep_icao"])
+    gate = service.position_gate({"lat": 0.0, "lon": 90.0, "on_ground": False})
+    assert gate["ok"] is False and gate["reason"] == "airborne"
+    assert gate["dep_icao"] == task["dep_icao"]
+    ok = service.position_gate({"lat": info["lat"], "lon": info["lon"], "on_ground": True})
+    assert ok["ok"] is True and ok["dep_distance_nm"] is not None
+    far = service.position_gate({"lat": info["lat"] + 5.0, "lon": info["lon"], "on_ground": True})
+    assert far["ok"] is False and far["reason"] == "not_at_departure"
+    # 无采样（demo/replay）时闸降级放行，不能因为查不到位置就不让录
+    assert service.position_gate({"lat": None, "lon": None, "on_ground": None})["ok"] is True
+
+
 def test_ops_finance_summary_and_task_abort(app_client):
     summary = app_client.get("/local/ops/finance/summary").json()
     assert summary["totals"]["flights"] == 0

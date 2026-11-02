@@ -19,6 +19,10 @@ export interface Settings {
   max_gap_s: number;
   turn_threshold_dps: number;
   navdata_path: string | null;
+  /** 场景库（§36）：Little Navmap 从 MSFS 场景扫出的 little_navmap_msfs24.sqlite。 */
+  scenery_navdata_path: string | null;
+  /** 跑道几何来源：auto（场景库优先）/ navdata / scenery。 */
+  runway_data_source: "auto" | "navdata" | "scenery";
   aip_path: string | null;
   network_pkl: string | null;
   pre_train_dir: string | null;
@@ -60,6 +64,10 @@ export interface NavdataStatus {
   airways: number;
   error: string | null;
   coverage_ready: boolean;
+  /** 场景库（§36）：游戏内跑道几何来源，缺失时回落现实 navdata。 */
+  scenery_path?: string | null;
+  scenery_available?: boolean;
+  runway_data_source?: "auto" | "navdata" | "scenery" | string;
 }
 
 export interface Airport {
@@ -88,6 +96,10 @@ export interface AirportRunway {
   displaced_threshold_m?: number | null;
   /** 跑道宽度（米）；旧库没有该列时为 null（视图按 45 m 兜底）。 */
   width_m?: number | null;
+  /** 几何来源（§36）：scenery = 游戏内场景库，navdata = 现实库。 */
+  source?: "scenery" | "navdata" | null;
+  /** 现实 navdata 的对照长度（米），用于「游戏内 X / 现实 Y」提示。 */
+  length_reference_m?: number | null;
 }
 
 export interface AirportDetail extends Airport {
@@ -230,6 +242,14 @@ export interface FlightRecord {
   touchdown_lat?: number | null;
   touchdown_lon?: number | null;
   runway_ident?: string | null;
+  /** §36：这条记录实际用的跑道长度与几何来源（scenery = 游戏内）。 */
+  runway_length_m?: number | null;
+  runway_source?: "scenery" | "navdata" | null;
+  /** §33：空中接入的部分记录（走复核，不自动判完成）。 */
+  partial?: number | boolean | null;
+  /** §33：中途接入（block_off 只能取接入后首帧）。 */
+  late_join?: number | boolean | null;
+  block_off_source?: "preroll" | "connect" | null;
   threshold_distance_m?: number | null;
   /** 着陆入口内移量（米），距入口距离已扣掉这段。 */
   displaced_threshold_m?: number | null;
@@ -551,6 +571,10 @@ export interface OpsDrawResult {
   considered: number;
   follow_routes?: boolean;
   excluded_airports?: string[];
+  /** 合计航时下限不达标时的放宽提示（不静默降级）。 */
+  warnings?: string[];
+  /** 是否发生过放宽（warnings 非空）。 */
+  relaxed?: boolean;
   /** 抽不到候选时的原因分类提示。 */
   reason?: string;
 }
@@ -708,6 +732,22 @@ export interface FlightStatus {
   total_weight_kg: number | null;
   fuel_weight_kg: number | null;
   actual_zfw_kg: number | null;
+  /** 位置闸（§33）：出发机场、距离与准入结果。 */
+  dep_icao: string | null;
+  dep_distance_nm: number | null;
+  position_ok: boolean;
+  position_reason: "airborne" | "not_at_departure" | null;
+  /** 已在空中：可改按「部分记录」开始（走复核，D-2）。 */
+  partial_allowed: boolean;
+  /** §32 推出定稿：计划 ZFW / 计划油量 / 推出油量，后端已算好差异，前端不再自己比。 */
+  planned_zfw_kg: number | null;
+  planned_fuel_kg: number | null;
+  fuel_at_pushback: number | null;
+  zfw_source: "preflight" | "pushback" | "start" | null;
+  zfw_state: "ok" | "short" | "over" | "unknown";
+  /** 推出时仍偏低：只推一次（按 zfw_warning_seq 去重）。 */
+  zfw_warnings: string[];
+  zfw_warning_seq: number;
 }
 
 export interface OpsFreeFlight {

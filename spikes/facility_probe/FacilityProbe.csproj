@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>FacilityProbe</RootNamespace>
+    <AssemblyName>FacilityProbe</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <SimConnectSdkDir Condition="'$(SimConnectSdkDir)' == ''">$(MSBuildProjectDirectory)\..\simconnect_probe\SimConnect SDK</SimConnectSdkDir>
+    <SimConnectDll Condition="'$(SimConnectDll)' == ''">$(SimConnectSdkDir)\lib\managed\Microsoft.FlightSimulator.SimConnect.dll</SimConnectDll>
+    <SimConnectNativeDll Condition="'$(SimConnectNativeDll)' == ''">$(SimConnectSdkDir)\lib\SimConnect.dll</SimConnectNativeDll>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(SimConnectDll)')">
+    <Reference Include="Microsoft.FlightSimulator.SimConnect">
+      <HintPath>$(SimConnectDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(SimConnectNativeDll)')">
+    <None Include="$(SimConnectNativeDll)" Link="SimConnect.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+</Project>

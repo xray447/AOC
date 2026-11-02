@@ -77,6 +77,22 @@ public sealed class RecordingInfo
     [JsonPropertyName("reconnect_attempts")] public int ReconnectAttempts { get; set; }
     /// <summary>最近一次连模拟器失败的原始错误（异常类型 + message），供界面折叠展示。</summary>
     [JsonPropertyName("last_connect_error")] public string? LastConnectError { get; set; }
+    /// <summary>最新一帧的位置/地速（§33 位置闸）：core 复用这一份，不再多打一次 HTTP。</summary>
+    [JsonPropertyName("lat")] public double? Lat { get; set; }
+    [JsonPropertyName("lon")] public double? Lon { get; set; }
+    [JsonPropertyName("on_ground")] public bool? OnGround { get; set; }
+    [JsonPropertyName("gs_kt")] public double? GsKt { get; set; }
+    [JsonPropertyName("alt_ft")] public double? AltFt { get; set; }
+    [JsonPropertyName("agl_ft")] public double? AglFt { get; set; }
+    /// <summary>当前下发的出发机场（core 用 `set_dep_airport` 设置）。</summary>
+    [JsonPropertyName("dep_icao")] public string? DepIcao { get; set; }
+    /// <summary>推出那一刻的 ZFW（kg，总重 − 燃油重量 的 5 帧中位数，§32）。</summary>
+    [JsonPropertyName("zfw_at_pushback")] public double? ZfwAtPushback { get; set; }
+    /// <summary>推出那一刻的燃油（kg）。</summary>
+    [JsonPropertyName("fuel_at_pushback")] public double? FuelAtPushback { get; set; }
+    [JsonPropertyName("pushback_utc")] public string? PushbackUtc { get; set; }
+    /// <summary>pushback（真推出）/ start（地面晚接入，取开录首帧）/ null。</summary>
+    [JsonPropertyName("pushback_source")] public string? PushbackSource { get; set; }
 }
 
 public sealed class RuntimeInfo

@@ -18,6 +18,16 @@ public sealed class Engine : IDisposable
     private const double AutoStartHoldS = 10.0;
     /// <summary>靠「停机刹车置位」收尾时的最短保持时间（收到 AutoStopHoldS 以内）。</summary>
     private const double ParkingBrakeHoldS = 30.0;
+    /// <summary>瞬移判定（§33 / V-1）：速度 &gt; 900kt，或「dt &gt; 30s 且位移 &gt; 10 NM」。</summary>
+    private const double TeleportSpeedKt = 900.0;
+    private const double TeleportGapS = 30.0;
+    private const double TeleportMinNm = 10.0;
+    /// <summary>距出发机场超过这个距离、或不在空中，视为「还没进飞行 / 幽灵机」。</summary>
+    private const double DepGateNm = 10.0;
+    /// <summary>推出判定（§32 / V-5）：GS ≥ 5kt 连续 3s 后取最近 5 帧的中位数。</summary>
+    private const double PushbackGsKt = 5.0;
+    private const double PushbackHoldS = 3.0;
+    private const int PushbackMedianFrames = 5;
 
     private readonly ISimSource _source;
     private readonly string _queueRoot;
@@ -46,6 +56,13 @@ public sealed class Engine : IDisposable
     private double? _stoppedSince;
     private double? _parkingBrakeSince;
     private bool _hasTakeoff;
+    // 推出快照（§32 方案 B）：开录不带 ZFW/油量，推出时定稿
+    private readonly Queue<Sample> _recent = new();
+    private double? _pushbackSince;
+    private double? _pushbackZfw;
+    private double? _pushbackFuel;
+    private string? _pushbackAt;
+    private string? _pushbackSource;
     private double _hz = 1.0;
     private double _lastErrorT = -100;
     private double _lastPreRollT = -100;
@@ -59,6 +76,11 @@ public sealed class Engine : IDisposable
     private bool _engineRunning;
     private double? _engineOffSince;
     private bool _engineEstimated;
+
+    // 出发机场（§33 位置闸 / 预录截断）：SimLink 没有导航库，坐标由 core 下发
+    private string? _depIcao;
+    private double? _depLat;
+    private double? _depLon;
 
     public bool AutoStart { get; set; } = true;
     /// <summary>自动开录起点：engine（默认，发动机运转 10s）/ taxi（滑行 10s）/ takeoff（旧行为：离地 5s）。</summary>
@@ -104,7 +126,28 @@ public sealed class Engine : IDisposable
                 AutoStartMode = AutoStartMode,
                 ReconnectAttempts = _source.ReconnectAttempts,
                 LastConnectError = _source.LastConnectError,
+                // §33 位置闸：把最新帧的位置/地速并进 /status，core 不再额外打一次 HTTP
+                Lat = _prevFrame?.Lat, Lon = _prevFrame?.Lon,
+                OnGround = _prevFrame?.OnGround, GsKt = _prevFrame?.GsKt,
+                AltFt = _prevFrame?.AltFt, AglFt = _prevFrame?.AglFt,
+                DepIcao = _depIcao,
+                // §32 推出后定稿的 ZFW / 油量（未推出为 null）
+                ZfwAtPushback = _pushbackZfw,
+                FuelAtPushback = _pushbackFuel,
+                PushbackUtc = _pushbackAt,
+                PushbackSource = _pushbackSource,
             };
+        }
+    }
+
+    /// <summary>下发出发机场（§33）：预录截断与幽灵帧判定用，查不到坐标时传 null。</summary>
+    public void SetDeparture(string? icao, double? lat, double? lon)
+    {
+        lock (_lock)
+        {
+            _depIcao = string.IsNullOrWhiteSpace(icao) ? null : icao.Trim().ToUpperInvariant();
+            _depLat = lat;
+            _depLon = lon;
         }
     }
 
@@ -180,6 +223,24 @@ public sealed class Engine : IDisposable
             _taxiSince = null;
             _stoppedSince = null;
             _parkingBrakeSince = null;
+            // §32 推出快照：每段录制重新取
+            _pushbackSince = null;
+            _pushbackZfw = null;
+            _pushbackFuel = null;
+            _pushbackAt = null;
+            _pushbackSource = null;
+            _recent.Clear();
+            // 地面晚接入（首帧已经在动）：只能取开录首帧并标 source=start；
+            // 空中接入（首帧不在空中）留 null，界面显示「—」，不参与结算
+            var foot = _prevFrame;
+            if (foot is { OnGround: true } && foot.GsKt >= PushbackGsKt
+                && foot.TotalWeightKg - foot.FuelWeightKg > 0)
+            {
+                _pushbackZfw = foot.TotalWeightKg - foot.FuelWeightKg;
+                _pushbackFuel = foot.FuelWeightKg;
+                _pushbackAt = _startedAt;
+                _pushbackSource = "start";
+            }
             if (_landed)
             {
                 // 上一次飞行已落地：不要把旧航班的起飞时刻算进新的记录
@@ -193,8 +254,10 @@ public sealed class Engine : IDisposable
             var pre = new List<Sample>();
             if (!manual)
             {
-                var frames = _preRoll.ToArray();
-                if (frames.Length > 0)
+                // §33 第 2 道闸：预录里若含幽灵帧/瞬移（KBFI → 真实机场），从最后一次跳变起截断，
+                // 否则 block_off 会落在幽灵机位置、判出假起降
+                var frames = TrimPreRoll(_preRoll.ToArray());
+                if (frames.Count > 0)
                 {
                     _recStartT = frames[0].T;
                     pre.AddRange(frames);
@@ -265,10 +328,172 @@ public sealed class Engine : IDisposable
     {
         lock (_lock)
         {
-            if (!_recording) return;
-            var t = Math.Max(0, (_prevFrame?.T ?? _recStartT) - _recStartT);
-            AddEvent(t, connected ? "sim_connected" : "sim_disconnected", new());
+            if (_recording)
+            {
+                var t = Math.Max(0, (_prevFrame?.T ?? _recStartT) - _recStartT);
+                AddEvent(t, connected ? "sim_connected" : "sim_disconnected", new());
+            }
+            // §33 / V-1：重连/切场景后状态机必须重置。旧代码保留了 _hasTakeoff/_landed，
+            // 且 StopLocked 清掉的 _engineOnSince 再没被点亮 → 进了游戏、发动机在转也不自动开录。
+            _hasTakeoff = false;
+            _landed = false;
+            _airborneSince = null;
+            _takeoffSim = _simClock;
+            _landingSim = null;
+            _taxiSince = null;
+            _stoppedSince = null;
+            _parkingBrakeSince = null;
+            _engineOffSince = null;
+            _phase = "PREFLIGHT";
+            // 重连时发动机若仍在转，重新点亮自动开录计时（否则永远等不到新的启动沿）
+            _engineOnSince = connected && _engineRunning ? (_prevFrame?.T ?? 0) : null;
         }
+    }
+
+    /// <summary>
+    /// 预录截断（§33）：回扫一遍，记录最后一次「瞬移/幽灵帧」的位置，只保留它之后的帧。
+    /// 没有跳变时用满窗口（正常流程零变化）。
+    /// </summary>
+    private List<Sample> TrimPreRoll(Sample[] frames)
+    {
+        var list = frames.ToList();
+        if (list.Count < 2) return list;
+        var cut = 0;
+        for (var i = 1; i < list.Count; i++)
+        {
+            if (!IsJump(list[i - 1], list[i])) continue;
+            cut = i;
+        }
+        if (cut > 0) list.RemoveRange(0, cut);
+        return list;
+    }
+
+    /// <summary>
+    /// 瞬移判定（只用运动学 + 幽灵坐标）：推理速度 &gt; 900kt，或「dt &gt; 30s 且位移 &gt; 10 NM」。
+    /// 录制中只用这一条 —— 把「远离出发机场的空中帧」也算瞬移会让每一次正常离场都被重置。
+    /// </summary>
+    private static bool IsTeleport(Sample a, Sample b)
+    {
+        var dt = b.T - a.T;
+        if (dt <= 0) return false;
+        var dist = DistanceNm(a.Lat, a.Lon, b.Lat, b.Lon);
+        // 位移门槛必须有：单帧位移不到 10 NM 不可能是瞬移（避免把压缩时间轴当瞬移）
+        if (dist <= TeleportMinNm) return false;
+        if (dist / (dt / 3600.0) > TeleportSpeedKt) return true;
+        if (dt > TeleportGapS) return true;
+        // 菜单/加载期的幽灵坐标 (0, 90)：陆空都算（实测 on_ground=false、AGL 216ft）
+        return !b.OnGround && Math.Abs(b.Lat) < 1e-3 && Math.Abs(b.Lon - 90.0) < 1e-3;
+    }
+
+    /// <summary>预录截断用：瞬移之外再叠「低空 + 远离出发机场」= 幽灵机帧（含 KBFI 那架）。</summary>
+    private bool IsJump(Sample a, Sample b)
+    {
+        if (IsTeleport(a, b)) return true;
+        if (b.OnGround || b.AglFt >= 2000) return false;
+        return DistanceToDep(b) is > DepGateNm;
+    }
+
+    private double? DistanceToDep(Sample s)
+    {
+        if (_depLat is null || _depLon is null) return null;
+        return DistanceNm(_depLat.Value, _depLon.Value, s.Lat, s.Lon);
+    }
+
+    private static double DistanceNm(double lat1, double lon1, double lat2, double lon2)
+    {
+        const double rad = Math.PI / 180.0;
+        var dLat = (lat2 - lat1) * rad;
+        var dLon = (lon2 - lon1) * rad;
+        var h = Math.Sin(dLat / 2) * Math.Sin(dLat / 2)
+                + Math.Cos(lat1 * rad) * Math.Cos(lat2 * rad) * Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+        return 2 * 3440.065 * Math.Asin(Math.Min(1.0, Math.Sqrt(h)));
+    }
+
+    /// <summary>
+    /// 录制中瞬移 = 重置（§33 第 3 道闸）：核心那边丢弃跳变前轨迹，这里只把状态机清干净，
+    /// 避免假起降事件与「已起飞/已落地」被带进新位置。
+    /// </summary>
+    private void ResetAfterTeleport(Sample s, bool recording)
+    {
+        _hasTakeoff = false;
+        _landed = false;
+        _airborneSince = null;
+        _takeoffSim = _simClock;
+        _landingSim = null;
+        _taxiSince = null;
+        _stoppedSince = null;
+        _parkingBrakeSince = null;
+        _phase = "PREFLIGHT";
+        // 换了位置：推出快照要在新机位重新取
+        _pushbackSince = null;
+        _pushbackZfw = null;
+        _pushbackFuel = null;
+        _pushbackAt = null;
+        _pushbackSource = null;
+        _recent.Clear();
+        if (recording)
+        {
+            AddEvent(Math.Max(0, s.T - _recStartT), "teleport", new()
+            {
+                ["lat"] = s.Lat, ["lon"] = s.Lon, ["on_ground"] = s.OnGround,
+            });
+        }
+    }
+
+    /// <summary>
+    /// 推出判定（§32 方案 B / V-5）：`GS ≥ 5kt` 连续 3s 后取最近 5 帧的 ZFW 与油量中位数，
+    /// 相邻帧跳变 &gt; 10% 就继续等稳定；只在「地面且未起飞」时计时，空中接入不参与。
+    /// </summary>
+    private void TrackPushback(Sample s)
+    {
+        if (_pushbackZfw != null || _hasTakeoff || !s.OnGround)
+        {
+            if (!s.OnGround || _hasTakeoff) _pushbackSince = null;
+            return;
+        }
+        if (s.GsKt < PushbackGsKt)
+        {
+            _pushbackSince = null;
+            return;
+        }
+        _pushbackSince ??= s.T;
+        // 候选帧起表，等 t - since ≥ 3s 再取值（V-5：不能用「3s 窗口内全满足」，实测帧间隔 0.98–2.0s）
+        if (s.T - _pushbackSince < PushbackHoldS) return;
+        var frames = _recent.Where(f => f.OnGround).ToList();
+        if (frames.Count == 0) return;
+        var zfws = frames.Select(f => f.TotalWeightKg - f.FuelWeightKg).ToList();
+        for (var i = 1; i < zfws.Count; i++)
+        {
+            if (zfws[i - 1] > 0 && Math.Abs(zfws[i] - zfws[i - 1]) / zfws[i - 1] > 0.10)
+            {
+                _pushbackSince = s.T;   // EFB 还在装货/加油：重新起表
+                return;
+            }
+        }
+        var zfw = Median(zfws);
+        if (zfw <= 0) return;
+        _pushbackZfw = zfw;
+        _pushbackFuel = Median(frames.Select(f => f.FuelWeightKg).ToList());
+        _pushbackAt = TimeUtil.Iso(DateTime.UtcNow);
+        _pushbackSource = "pushback";
+        if (_recording)
+        {
+            AddEvent(Math.Max(0, s.T - _recStartT), "pushback", new()
+            {
+                ["zfw_kg"] = Math.Round(zfw, 1),
+                ["fuel_kg"] = Math.Round(_pushbackFuel ?? 0, 1),
+                ["gs_kt"] = s.GsKt,
+            });
+        }
+    }
+
+    private static double Median(List<double> values)
+    {
+        if (values.Count == 0) return 0;
+        var sorted = values.OrderBy(v => v).ToList();
+        return sorted.Count % 2 == 1
+            ? sorted[sorted.Count / 2]
+            : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
     }
 
     private void OnFrame(Sample s)
@@ -293,7 +518,14 @@ public sealed class Engine : IDisposable
                     _simClock += simDt;
                     UpdateEngine(s, simDt);
                 }
+                // §33 第 3 道闸：录制中瞬移 = 重置状态机（假起降不许进事件流）
+                if (_prevFrame != null && IsTeleport(_prevFrame, s))
+                    ResetAfterTeleport(s, _recording);
                 UpdateStateMachine(s);
+                // §32：推出时定稿 ZFW / 油量（最近的 5 帧留着算中位数）
+                _recent.Enqueue(s);
+                while (_recent.Count > PushbackMedianFrames) _recent.Dequeue();
+                TrackPushback(s);
                 if (!_recording && AutoStart && AutoStartDue(s)) StartRecording(manual: false);
                 if (_recording) SaveSample(s);
             }

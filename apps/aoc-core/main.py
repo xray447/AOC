@@ -55,7 +55,7 @@ from aoc_core import __version__  # noqa: E402
 from aoc_core.lock import InstanceLocked, SingleInstance  # noqa: E402
 from aoc_core.ops import OpsError  # noqa: E402
 from aoc_core.paths import AppPaths  # noqa: E402
-from aoc_core.service import PersonalService  # noqa: E402
+from aoc_core.service import PersonalService, PositionGateError  # noqa: E402
 from aoc_protocol.schemas import (  # noqa: E402
     CoverageRequest,
     FlownLegIn,
@@ -324,7 +324,7 @@ def create_app(config: CoreConfig) -> FastAPI:
     def route_simbrief(dep: str, arr: str, aircraft_type: str | None = None,
                        route: str | None = None, callsign: str | None = None,
                        zfw_kg: float | None = None, registration: str | None = None):
-        """公开 SimBrief 预填：呼号拆 airline/fltnum，配载用 manualzfw（由 ZFW kg 换算）。"""
+        """公开 SimBrief 预填：呼号拆 airline/fltnum，配载用 manualzfw（ZFW kg ÷ 1000，单位吨）。"""
         return {"simbrief_url": service.route.simbrief(
             dep, arr, aircraft=aircraft_type, route=route, callsign=callsign,
             zfw_kg=zfw_kg, registration=registration)}
@@ -456,8 +456,16 @@ def create_app(config: CoreConfig) -> FastAPI:
 
     @app.post("/local/recording/start")
     async def recording_start(body: dict[str, Any] | None = None):
+        """开始录制；`partial=true` = 已在空中也按部分记录开始（走复核，D-2）。
+
+        不再接受 `actual_zfw_kg`（§32 方案 B）：ZFW/油量由 SimLink 在推出事件里回传。
+        """
+        body = body or {}
         try:
-            return await service.start_recording((body or {}).get("actual_zfw_kg"))
+            return await service.start_recording(partial=bool(body.get("partial")))
+        except PositionGateError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "POSITION_GATE", "message": str(exc), "gate": exc.gate}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "SIMLINK_UNAVAILABLE",
                                                          "message": str(exc)}) from exc
@@ -581,6 +589,12 @@ def create_app(config: CoreConfig) -> FastAPI:
     def ops_fleet_release(aircraft_id: str, body: dict[str, Any] | None = None):
         return service.ops.release_aircraft(aircraft_id, (body or {}).get("reason"))
 
+    @app.post("/local/ops/fleet/{aircraft_id}/ferry")
+    def ops_fleet_ferry(aircraft_id: str, body: dict[str, Any]):
+        """快速调机（§35）：付费把飞机在 AOC 侧移到目标机场，需在模拟器里重新进入。"""
+        return service.ops.fast_ferry(aircraft_id, body.get("to_icao") or "",
+                                      body.get("hold"))
+
     @app.get("/local/ops/routes")
     def ops_routes():
         return {"items": service.ops.list_routes()}
@@ -666,6 +680,11 @@ def create_app(config: CoreConfig) -> FastAPI:
     def ops_leg_start(roster_id: str, sequence: int, body: dict[str, Any] | None = None):
         """开始航段；可带 `actual_zfw_kg`，低于配载单时在 `warnings[]` 提示（不阻断）。"""
         return service.ops.start_leg(roster_id, sequence, (body or {}).get("actual_zfw_kg"))
+
+    @app.post("/local/ops/rosters/{roster_id}/legs/{sequence}/void")
+    def ops_leg_void(roster_id: str, sequence: int, body: dict[str, Any] | None = None):
+        """本段作废重飞（§33 / D-3）：退回 PLANNED，并冲销结算/账本/机队位置。"""
+        return service.ops.void_leg(roster_id, sequence, reason=(body or {}).get("reason"))
 
     @app.get("/local/ops/free-flights/airports")
     def ops_free_airports():

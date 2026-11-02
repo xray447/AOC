@@ -502,8 +502,8 @@ def test_simbrief_preview_carries_frozen_payload(ops: PersonalService):
     assert payload["registration"]
     airline, fltnum = split_callsign(payload["callsign"])
     url = preview["simbrief_url"]
-    # 配载用 manualzfw（千磅，3 位小数）；呼号拆成 airline + fltnum；不预填高度
-    assert f"manualzfw={payload['zfw_kg'] * 2.2046226 / 1000:.3f}" in url
+    # 配载用 manualzfw（吨，3 位小数）；呼号拆成 airline + fltnum；不预填高度
+    assert f"manualzfw={payload['zfw_kg'] / 1000:.3f}" in url
     assert "reg=" in url
     assert f"airline={airline}" in url and fltnum and f"fltnum={fltnum}" in url
     assert "fl=" not in url
@@ -516,7 +516,7 @@ def test_simbrief_preview_carries_frozen_payload(ops: PersonalService):
     assert payload["zfw_kg"] == pytest.approx(float(sheet["zfw_kg"]), abs=0.1)
 
     frozen = ops.simbrief_for_leg(flight_record_id=started["task"]["flight_record_id"])
-    assert f"manualzfw={float(sheet['zfw_kg']) * 2.2046226 / 1000:.3f}" in frozen["simbrief_url"]
+    assert f"manualzfw={float(sheet['zfw_kg']) / 1000:.3f}" in frozen["simbrief_url"]
     assert frozen["payload"]["registration"] == payload["registration"]
     assert "fl=" not in frozen["simbrief_url"]
 
@@ -762,6 +762,180 @@ def test_draw_follow_routes_keeps_legacy_behaviour(ops: PersonalService):
         assert all(leg.get("virtual") is False for leg in candidate["legs"])
         assert all(leg["flight_instance_id"] for leg in candidate["legs"])
     assert result["constraints"]["excluded_airports"] == []
+
+
+# ------------------------------------------------------- 合计航时下限（§34 / D-4）
+def test_void_leg_reverts_settlement_and_position(ops: PersonalService):
+    """§33 / D-3 本段作废重飞：航段退回 PLANNED，结算/账本/机队位置一起冲销。"""
+    roster, _ = _confirm(ops)
+    before = ops.ops.profile()["balance"]
+    flight, settlement, _started = _fly(ops, roster["id"], 1)
+    aircraft_id = roster["aircraft_id"]
+    arr = ops.ops.get_aircraft(aircraft_id)["current_airport_icao"]
+    assert settlement["status"] == "SETTLED"
+    assert ops.ops.profile()["balance"] != before
+
+    result = ops.ops.void_leg(roster["id"], 1)
+    leg = next(l for l in result["roster"]["legs"] if int(l["sequence"]) == 1)
+    assert leg["status"] == "PLANNED"
+    assert ops.ops.settlement(settlement["id"])["status"] == "VOID"
+    assert ops.ops.profile()["balance"] == pytest.approx(before, abs=0.01)
+    aircraft = ops.ops.get_aircraft(aircraft_id)
+    assert aircraft["current_airport_icao"] == leg["dep_icao"]
+    assert aircraft["current_airport_icao"] != arr
+    assert ops.db.get_flight(flight["id"])["status"] == "ABORTED"
+
+    # 作废后可以重新开始本段
+    again = ops.ops.start_leg(roster["id"], 1)
+    assert again["task"]["flight_record_id"]
+
+
+def test_pushback_zfw_is_final(ops: PersonalService):
+    """§32：推出事件回传的 ZFW 覆盖 flight_record，并补一条 final 的 zfw_check 事件。"""
+    roster, _ = _confirm(ops)
+    flight_id = ops.ops.start_leg(roster["id"], 1)["task"]["flight_record_id"]
+    sheet = ops.ops.load_sheet(flight_id)
+    ops.flights.start(flight_id, "2026-10-20T00:00:00Z", manual=True)
+    actual = float(sheet["zfw_kg"]) - 5000
+    warnings = ops.ops.set_actual_zfw(actual, source="pushback", final=True)
+    assert warnings                      # 推出时仍偏低 → 提示一次
+    flight = ops.db.get_flight(flight_id)
+    assert flight["actual_zfw_kg"] == pytest.approx(actual, abs=0.1)
+    assert flight["zfw_delta_kg"] == pytest.approx(-5000, abs=0.1)
+    events = ops.db.list_events(flight_id)
+    assert any(e["type"] == "zfw_check" and e["payload"].get("source") == "pushback"
+               and e["payload"].get("final") is True for e in events)
+    ops.flights.stop(abort=True)
+
+
+def test_fuel_start_uses_pushback_value_and_never_negative(ops: PersonalService):
+    """§32：起始油量取推出定稿值；推出前加满导致「起始 − 结束 < 0」时记 0 并标异常。"""
+    from tests.conftest import make_points
+
+    ops.flights.start(flight_id="fuel-1", started_at="2026-10-20T00:00:00Z", manual=True)
+    ops.flights.ingest(make_points())
+    ops.flights.fuel_at_pushback = 9000.0
+    flight = ops.flights.stop()
+    assert flight["fuel_start_kg"] == pytest.approx(9000.0)
+    assert flight["fuel_used_kg"] and flight["fuel_used_kg"] > 0
+
+    ops.flights.start(flight_id="fuel-2", started_at="2026-10-20T01:00:00Z", manual=True)
+    ops.flights.ingest(make_points())
+    ops.flights.fuel_at_pushback = 1000.0     # 比结束油量还低：加油把顺序反了
+    flight = ops.flights.stop()
+    assert flight["fuel_used_kg"] == pytest.approx(0.0)
+    assert "FUEL_ANOMALY" in (flight.get("anomaly_flags") or [])
+
+
+# ------------------------------------------------------- 快速调机（§35 / D-6）
+def test_fast_ferry_moves_aircraft_charges_and_audits(ops: PersonalService):
+    aircraft = ops.ops.list_fleet()[0]
+    before = ops.ops.profile()["balance"]
+    result = ops.ops.fast_ferry(aircraft["id"], "ZSSS")
+    assert result["aircraft"]["current_airport_icao"] == "ZSSS"
+    assert result["distance_nm"] > 0 and result["fee"] > 0
+    assert ops.ops.profile()["balance"] == pytest.approx(before - result["fee"], abs=0.01)
+    ledger = ops.ops.ledger()
+    assert ledger["totals"].get("COST_FERRY") == pytest.approx(-result["fee"], abs=0.01)
+    assert ledger["reconciled"] is True
+    assert any(a["action"] == "AIRCRAFT_FERRY" for a in ops.ops.audit_log(20))
+    assert result["warnings"] and "重新进入飞行" in result["warnings"][-1]
+
+
+def test_fast_ferry_rejects_invalid_cases(ops: PersonalService):
+    fleet = ops.ops.list_fleet()
+    aircraft = fleet[0]
+    with pytest.raises(OpsError) as same:
+        ops.ops.fast_ferry(aircraft["id"], aircraft["current_airport_icao"])
+    assert same.value.code == "INVALID_STATE"
+    with pytest.raises(OpsError) as unknown:
+        ops.ops.fast_ferry(aircraft["id"], "ZZZZ")
+    assert unknown.value.code == "NOT_FOUND"
+    roster, _ = _confirm(ops, registration=aircraft["registration"])
+    with pytest.raises(OpsError):
+        ops.ops.fast_ferry(aircraft["id"], "ZSSS")     # 已被班表占用
+    # 班表执行中也不能调机（先开始第一段）
+    ops.ops.start_leg(roster["id"], 1)
+    other = next(a for a in ops.ops.list_fleet() if a["id"] != aircraft["id"])
+    with pytest.raises(OpsError):
+        ops.ops.fast_ferry(other["id"], "ZSSS")
+
+
+def test_fast_ferry_hold_expires(ops: PersonalService):
+    aircraft = ops.ops.list_fleet()[0]
+    economy = ops.ops.economy_params()
+    ops.ops.publish_config({**economy, "fast_ferry_hold": True}, None, "测试调机占用")
+    result = ops.ops.fast_ferry(aircraft["id"], "ZSSS")
+    assert result["hold"] is True
+    held = ops.ops.get_aircraft(aircraft["id"])
+    assert held["status"] == "HELD" and held["locked"] is True
+    # 到期后自动释放（把 lock 的 expires_at 改成过去）
+    with ops.ops._tx() as con:
+        con.execute("update aircraft_lock set expires_at='2000-01-01T00:00:00Z' "
+                    "where aircraft_id=?", (aircraft["id"],))
+    released = ops.ops.get_aircraft(aircraft["id"])
+    assert released["status"] == "ACTIVE" and released["locked"] is False
+    assert released["current_airport_icao"] == "ZSSS"
+
+
+def test_partial_recording_goes_to_review(ops: PersonalService):
+    """D-2：空中接入的部分记录不自动判完成（HELD + PENDING，航段保持 IN_PROGRESS）。"""
+    roster, _ = _confirm(ops)
+    flight, settlement, _started = _fly(ops, roster["id"], 1, partial=1)
+    assert flight["partial"] == 1
+    assert settlement["status"] == "HELD"
+    assert settlement["review_status"] == "PENDING"
+    leg = next(l for l in ops.ops.roster(roster["id"])["legs"] if int(l["sequence"]) == 1)
+    assert leg["status"] == "IN_PROGRESS"
+
+def test_min_total_block_defaults_to_three_quarters_of_cap(ops: PersonalService):
+    """留空按「上限 −25%」推导；手填优先；越界 PARAM_OUT_OF_RANGE。"""
+    assert ops.ops._constraints({"max_block_minutes": 480})["min_total_block_minutes"] == 360
+    assert ops.ops._constraints({"max_block_minutes": 120})["min_total_block_minutes"] == 90
+    # 上限 30 时下限钳在 30，不会出现「下限 > 上限」
+    assert ops.ops._constraints({"max_block_minutes": 30})["min_total_block_minutes"] == 30
+    assert ops.ops._constraints({
+        "max_block_minutes": 480, "min_total_block_minutes": 300})["min_total_block_minutes"] == 300
+    with pytest.raises(OpsError) as exc:
+        ops.ops._constraints({"max_block_minutes": 480, "min_total_block_minutes": 600})
+    assert exc.value.code == "PARAM_OUT_OF_RANGE"
+    assert exc.value.details.get("key") == "min_total_block_minutes"
+    with pytest.raises(OpsError):
+        ops.ops._constraints({"max_block_minutes": 480, "min_total_block_minutes": 10})
+
+
+def test_draw_respects_total_block_lower_bound(ops: PersonalService):
+    """未放宽时所有候选合计航时都 ≥ 下限；放宽时一定带 warnings（不静默降级）。"""
+    result = _draw(ops, max_legs=3, max_block_minutes=480, min_total_block_minutes=120)
+    assert result["constraints"]["min_total_block_minutes"] == 120
+    assert result["candidates"]
+    if not result["warnings"]:
+        for candidate in result["candidates"]:
+            assert candidate["total_block_minutes"] >= 120
+    else:
+        assert result["relaxed"] is True
+        for candidate in result["candidates"]:
+            assert candidate["total_block_minutes"] <= 480
+
+
+def test_draw_relaxes_when_lower_bound_unreachable(ops: PersonalService):
+    """下限不可能达标（1440 min）时先放宽为「只保上限」，候选照常给出并带提示。"""
+    result = _draw(ops, max_legs=1, max_block_minutes=1440, min_total_block_minutes=1440)
+    assert result["candidates"]
+    assert result["relaxed"] is True
+    assert any("已放宽" in item for item in result["warnings"])
+    for candidate in result["candidates"]:
+        assert candidate["total_block_minutes"] <= 1440
+
+
+def test_draw_lower_bound_applies_to_virtual_chains(ops: PersonalService):
+    """`follow_routes=false`（虚拟航段）同样受下限约束。"""
+    result = _draw(ops, follow_routes=False, max_legs=2, max_block_minutes=480,
+                   min_total_block_minutes=120)
+    assert result["candidates"]
+    if not result["warnings"]:
+        for candidate in result["candidates"]:
+            assert candidate["total_block_minutes"] >= 120
 
 
 # ------------------------------------------------------- 自定义机型模板（P-07/P-10）

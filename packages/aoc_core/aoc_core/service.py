@@ -64,6 +64,22 @@ ROOT = _resolve_root()
 log = logging.getLogger("aoc-core")
 
 
+class PositionGateError(RuntimeError):
+    """位置闸（§33）挡住开录：界面据此提示「请在 MSFS 里进入本场」或改用部分记录。"""
+
+    def __init__(self, gate: dict[str, Any]):
+        self.gate = gate or {}
+        reason = self.gate.get("reason")
+        if reason == "airborne":
+            message = "飞机已在空中：可改为「按部分记录开始」（走复核），或先回到出发机场"
+        else:
+            dep = self.gate.get("dep_icao") or "出发机场"
+            dist = self.gate.get("dep_distance_nm")
+            message = (f"尚未进入飞行或位置不符：距 {dep} "
+                       f"{dist if dist is not None else '?'} NM（需 ≤10 NM 且在地面）")
+        super().__init__(message)
+
+
 class PersonalService:
     def __init__(self, paths: AppPaths | None = None):
         self.paths = paths or AppPaths.create()
@@ -73,13 +89,22 @@ class PersonalService:
         self._settings = self._load_settings()
         self.catalog = AircraftCatalog(ROOT / "data" / "aircraft_types.json")
         self._nav: NavData | None = None
-        self._nav_path: str | None = None
+        self._nav_path: tuple[str, str | None] | None = None
         self._nav_error: str | None = None
         self._route: RouteService | None = None
         self._simlink_url: str | None = None
         self._simlink_token: str | None = None
         self._simlink_client: SimLinkClient | None = None
         self._evt_seq = -1
+        # §33 位置闸：挡住的帧只推进游标（不建 recorder、不喂帧），开录时一次性跳过
+        self._sim_cursor = -1
+        self._sim_recording_id: str | None = None
+        self._dep_sent: str | None = None
+        self._last_gate: dict[str, Any] = {}
+        # §32 推出定稿：已经写进任务的 ZFW 值（避免每轮重复落库）与一次性提示
+        self._pushback_applied: float | None = None
+        self._zfw_warnings: list[str] = []
+        self._zfw_warning_seq = 0
         self._auto_start_sent: bool | None = None
         self._auto_start_mode_sent: str | None = None
         self._auto_stop_hold_sent: float | None = None
@@ -138,11 +163,14 @@ class PersonalService:
     def update_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         merged = _deep_merge(self._settings, patch)
         validated = Settings(**merged).model_dump()
-        old_nav = self._settings.get("navdata_path")
+        old_nav = (self._settings.get("navdata_path"),
+                   self._settings.get("scenery_navdata_path"),
+                   self._settings.get("runway_data_source"))
         old_graph = (self._settings.get("pre_train_dir"), self._settings.get("network_pkl"))
         self._settings = validated
         self.db.setting_set("settings", validated)
-        if validated.get("navdata_path") != old_nav:
+        if (validated.get("navdata_path"), validated.get("scenery_navdata_path"),
+                validated.get("runway_data_source")) != old_nav:
             self._close_nav()
         if (validated.get("pre_train_dir"), validated.get("network_pkl")) != old_graph:
             self._graph_provider = self._make_graph_provider()
@@ -180,16 +208,42 @@ class PersonalService:
         path = self._navdata_candidate()
         if not path:
             return None
-        if self._nav is not None and self._nav_path == path:
+        source = str(self._settings.get("runway_data_source") or "auto")
+        scenery = self._scenery_candidate() if source != "navdata" else None
+        key = (path, scenery)
+        if self._nav is not None and self._nav_path == key:
             return self._nav
         self._close_nav()
-        self._nav_path = path
+        self._nav_path = key
         try:
-            self._nav = NavData(path)
+            self._nav = NavData(path, scenery_path=scenery, runway_source=source)
         except (NavDataError, Exception) as exc:  # noqa: BLE001
             self._nav_error = f"{type(exc).__name__}: {exc}"
             self._nav = None
         return self._nav
+
+    def _scenery_candidate(self) -> str | None:
+        """游戏场景库（§36 / D-7）：Little Navmap 从 MSFS 扫出的 navdata。
+
+        单测用 `AOC_NO_SCENERY=1` 关掉，避免读到本机的库导致跑道几何随机器变。
+        """
+        path = self._settings.get("scenery_navdata_path")
+        if path:
+            return str(path)
+        if os.environ.get("AOC_NO_SCENERY"):
+            return None
+        env = os.environ.get("AOC_SCENERY_NAVDATA")
+        if env:
+            return env
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        base = Path(appdata) / "ABarthel" / "little_navmap_db"
+        for name in ("little_navmap_msfs24.sqlite", "little_navmap_msfs2024.sqlite"):
+            candidate = base / name
+            if candidate.exists():
+                return str(candidate)
+        return None
 
     def navdata_status(self) -> NavdataStatus:
         nav = self.nav
@@ -197,11 +251,16 @@ class PersonalService:
             return NavdataStatus(available=False, path=self._navdata_candidate(),
                                  error=self._nav_error or "未配置 navdata")
         counts = nav.counts()
-        return NavdataStatus(
+        status = NavdataStatus(
             available=True, path=str(nav.path), airac=nav.airac, version=nav.navdata_version,
             airports=counts["airports"], runways=counts["runways"], airways=counts["airways"],
             coverage_ready=counts["airways"] > 0,
         )
+        # §36：跑道几何是否来自游戏场景库（缺失自动回落现实 navdata）
+        status.scenery_path = str(nav.scenery_path) if nav.scenery_path else None
+        status.scenery_available = nav.scenery_available()
+        status.runway_data_source = self._settings.get("runway_data_source") or "auto"
+        return status
 
     def select_navdata(self, path: str | None) -> NavdataStatus:
         if path:
@@ -404,13 +463,20 @@ class PersonalService:
         if not info:
             return None
         runways = nav.runways(icao)
+        # §36：场景库命中时同时给出「现实 navdata」的对照长度，界面提示长度差
+        reference = {str(r.get("name") or "").upper(): r.get("length_m")
+                     for r in nav.navdata_runways(icao)}
         visited = self.db.visited_airports()
         return {
             **info, "icao": info["ident"],
             "visited": info["ident"] in visited,
+            "runway_source": (runways[0].get("source") if runways else "navdata"),
             "runways": [{
                 "ident": r.get("name"), "heading": r.get("hdg"),
                 "length_m": r.get("length_m"), "ils": r.get("ils"),
+                # 来源与对照长度（scenery = 游戏内；reference = 现实 navdata）
+                "source": r.get("source"),
+                "length_reference_m": reference.get(str(r.get("name") or "").upper()),
                 # 入口坐标（跑道接地区俯视图要用）：阈值端经纬度 + 标高
                 "lat": r.get("lat"), "lon": r.get("lon"), "elev_ft": r.get("elev_ft"),
                 # 内移入口（米）；旧库没有该列时为 0
@@ -550,6 +616,8 @@ class PersonalService:
     def recording_status(self) -> dict:
         st = self.flights.status().model_dump()
         st["simlink_last"] = self._last_status
+        # 位置闸（§33）：执行页按它禁用「开始记录」/提示部分记录
+        st["gate"] = self._last_gate or self.position_gate()
         return st
 
     # -- 当前状态（顶部状态条：空闲 / 地面等待 / 飞行中） ------------------
@@ -608,21 +676,27 @@ class PersonalService:
                 return {"ok": True, "aborted": True, "task": task}
         return self.ops.abort_task(reason, task=task)
 
-    async def start_recording(self, actual_zfw_kg: float | None = None) -> dict:
+    async def start_recording(self, partial: bool = False) -> dict:
+        """开始录制。ZFW/油量不再在开录时取样（§32 方案 B）：由推出事件回传定稿值。"""
         if not self._simlink_client:
             raise RuntimeError("SimLink 未连接，无法开始记录；请确认模拟器和 SimLink 已启动")
+        gate = self.position_gate()
+        if not gate.get("ok") and not partial:
+            raise PositionGateError(gate)
+        already = bool(self._last_status.get("recording"))
         try:
             resp = await self._simlink_client.command("start_recording")
         except Exception as exc:  # noqa: BLE001
             self.flights.last_error = f"SimLink 未响应: {type(exc).__name__}"
             raise RuntimeError("SimLink 未连接，无法开始记录；请确认模拟器和 SimLink 已启动") from exc
         self._evt_seq = -1
-        # 推出前 ZFW 校验：偏低只提示，任务照常开始；差异随任务进入 flight_record
-        warnings = self.ops.set_actual_zfw(actual_zfw_kg)
         # 没连上模拟器时只给 warnings、不阻断（demo/replay 源不受影响）
-        warnings = [*warnings, *self.simlink_warnings()]
-        self.flights.start(resp.get("recording_id"), resp.get("recording_started_at"), manual=True)
-        return {**self.recording_status(), "warnings": warnings}
+        warnings = self.simlink_warnings()
+        # 已经在录（自动开录卡在幽灵机阶段）时跳过闸前帧；新开一条记录则从 0 开始
+        self.flights.start(resp.get("recording_id"), resp.get("recording_started_at"),
+                           manual=True, partial=bool(partial) and not gate.get("ok"),
+                           skip_seq=self._sim_cursor if already else -1)
+        return {**self.recording_status(), "warnings": warnings, "gate": gate}
 
     def simlink_warnings(self) -> list[str]:
         """SimLink 在跑但没连上模拟器：这次记录可能 0 个采样点，开始前提示。"""
@@ -638,6 +712,68 @@ class PersonalService:
         if detail:
             message += f"：{detail}"
         return [message]
+
+    # -- 位置闸（§33 / D-1） ----------------------------------------------
+    DEP_GATE_NM = 10.0
+
+    def recording_departure(self) -> str | None:
+        try:
+            return self.ops.recording_departure()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def position_gate(self, status: dict[str, Any] | None = None) -> dict[str, Any]:
+        """开录准入（§33 第 1 道闸）：距出发机场 ≤10 NM 且在地面才建录。
+
+        navdata 缺失 / 查不到出发机场时闸降级为「只做瞬移断点」，不能因此不让录。
+        """
+        status = status if status is not None else self._last_status
+        lat, lon = status.get("lat"), status.get("lon")
+        on_ground = status.get("on_ground")
+        dep = self.recording_departure()
+        gate: dict[str, Any] = {
+            "ok": True, "dep_icao": dep, "dep_distance_nm": None,
+            "on_ground": None if on_ground is None else bool(on_ground),
+            "reason": None,
+        }
+        if dep and lat is not None and lon is not None:
+            info = self.nav.airport(dep) if self.nav is not None else None
+            if info:
+                gate["dep_distance_nm"] = round(
+                    haversine_nm(float(lat), float(lon), info["lat"], info["lon"]), 2)
+        if gate["on_ground"] is False:
+            gate.update(ok=False, reason="airborne")
+        elif gate["dep_distance_nm"] is not None and gate["dep_distance_nm"] > self.DEP_GATE_NM:
+            gate.update(ok=False, reason="not_at_departure")
+        return gate
+
+    async def _push_departure(self, client: SimLinkClient) -> None:
+        """把出发机场坐标下发给 SimLink（预录截断要用，SimLink 没有导航库）。"""
+        dep = self.recording_departure() or ""
+        if self._dep_sent == dep:
+            return
+        info = self.nav.airport(dep) if (dep and self.nav is not None) else None
+        try:
+            await client.command("set_dep_airport", icao=dep or None,
+                                 lat=(info or {}).get("lat"), lon=(info or {}).get("lon"))
+            self._dep_sent = dep
+        except Exception:  # noqa: BLE001 - 老版本 SimLink 没有这个命令
+            pass
+
+    async def _advance_cursor(self, client: SimLinkClient) -> None:
+        """位置闸挡住期间只推进游标：不建 recorder、也不喂帧（否则幽灵帧会进记录）。"""
+        try:
+            samples = await client.samples(self._sim_cursor)
+            for sample in samples:
+                seq = sample.get("seq")
+                if isinstance(seq, int):
+                    self._sim_cursor = max(self._sim_cursor, seq)
+            for ev in await client.events(self._evt_seq):
+                seq = ev.get("seq")
+                if isinstance(seq, int) and seq > self._evt_seq:
+                    self._evt_seq = seq
+        except Exception:  # noqa: BLE001
+            pass
 
     async def latest_sample(self) -> dict[str, Any] | None:
         client = self._simlink_client
@@ -660,6 +796,13 @@ class PersonalService:
             "lat": None, "lon": None, "vs_fpm": None, "phase": None,
             "remaining_nm": None, "ete_min": None, "eta_utc": None,
             "total_weight_kg": None, "fuel_weight_kg": None, "actual_zfw_kg": None,
+            # 位置闸（§33）：前端据此禁用「开始记录」或改走部分记录
+            "dep_icao": None, "dep_distance_nm": None, "position_ok": True,
+            "position_reason": None, "partial_allowed": False,
+            # §32 推出定稿：实际/计划 ZFW 与油量，前端不再自己比
+            "planned_zfw_kg": None, "planned_fuel_kg": None, "fuel_at_pushback": None,
+            "zfw_source": None, "zfw_state": "unknown",
+            "zfw_warnings": [], "zfw_warning_seq": 0,
         }
         sample = await self.latest_sample()
         if sample:
@@ -684,6 +827,13 @@ class PersonalService:
             phase = self.flights.status().phase
             phase = getattr(phase, "value", phase)
         out["phase"] = str(phase) if phase else None
+        gate = self.position_gate({
+            "lat": out["lat"], "lon": out["lon"], "on_ground": out["on_ground"]})
+        out.update({
+            "dep_icao": gate["dep_icao"], "dep_distance_nm": gate["dep_distance_nm"],
+            "position_ok": gate["ok"], "position_reason": gate["reason"],
+            "partial_allowed": gate["reason"] == "airborne",
+        })
         task = self.ops.active_task()
         arr = (task or {}).get("arr_icao")
         if arr and out["lat"] is not None and out["lon"] is not None:
@@ -697,6 +847,28 @@ class PersonalService:
                     out["ete_min"] = round(ete, 1)
                     out["eta_utc"] = (datetime.now(timezone.utc) + timedelta(minutes=ete)) \
                         .isoformat(timespec="seconds").replace("+00:00", "Z")
+        # §32：推出后以 SimLink 回传的定稿值为准（展示与结算同一来源）
+        pushback_zfw = self.flights.zfw_at_pushback
+        if pushback_zfw is not None:
+            out["actual_zfw_kg"] = round(float(pushback_zfw), 1)
+        sheet = (self.ops.load_sheet(task["flight_record_id"])
+                 if task and task.get("flight_record_id") else None) or {}
+        planned_zfw = sheet.get("zfw_kg")
+        planned_fuel = sheet.get("fuel_kg")
+        out["planned_zfw_kg"] = round(float(planned_zfw), 1) if planned_zfw else None
+        out["planned_fuel_kg"] = round(float(planned_fuel), 1) if planned_fuel else None
+        out["fuel_at_pushback"] = self.flights.fuel_at_pushback
+        if pushback_zfw is not None:
+            out["zfw_source"] = self.flights.pushback_source or "pushback"
+        else:
+            out["zfw_source"] = "preflight" if out["actual_zfw_kg"] is not None else None
+        if out["actual_zfw_kg"] is None or out["planned_zfw_kg"] is None:
+            out["zfw_state"] = "unknown"
+        else:
+            delta = float(out["actual_zfw_kg"]) - float(out["planned_zfw_kg"])
+            out["zfw_state"] = "short" if delta < -1 else ("over" if delta > 1 else "ok")
+        out["zfw_warnings"] = list(self._zfw_warnings)
+        out["zfw_warning_seq"] = self._zfw_warning_seq
         return out
 
     async def stop_recording(self, abort: bool = False) -> dict:
@@ -737,6 +909,23 @@ class PersonalService:
         except (TypeError, ValueError):
             pass
         self.flights.engine_estimated = bool(status.get("engine_estimated"))
+        # §32 方案 B：推出事件的 ZFW/油量才是定稿值（开录不再取快照，单一来源）
+        pushback_zfw = status.get("zfw_at_pushback")
+        pushback_fuel = status.get("fuel_at_pushback")
+        self.flights.pushback_source = status.get("pushback_source")
+        if isinstance(pushback_zfw, (int, float)) and float(pushback_zfw) > 0:
+            self.flights.zfw_at_pushback = round(float(pushback_zfw), 1)
+        if isinstance(pushback_fuel, (int, float)) and float(pushback_fuel) > 0:
+            self.flights.fuel_at_pushback = round(float(pushback_fuel), 1)
+        if (self.flights.zfw_at_pushback is not None
+                and self._pushback_applied != self.flights.zfw_at_pushback):
+            self._pushback_applied = self.flights.zfw_at_pushback
+            warnings = self.ops.set_actual_zfw(
+                self.flights.zfw_at_pushback,
+                source=self.flights.pushback_source or "pushback", final=True)
+            if warnings:
+                self._zfw_warnings = list(warnings)
+                self._zfw_warning_seq += 1
         desired_auto = bool(self._settings.get("auto_start", True))
         if self._auto_start_sent != desired_auto:
             try:
@@ -761,10 +950,26 @@ class PersonalService:
                 pass
         recording = bool(status.get("recording"))
         rec = self.flights.recorder
+        # 位置闸（§33）：距出发机场 >10 NM 或已在空中时不建录、不喂帧
+        self._last_gate = self.position_gate(status)
+        await self._push_departure(client)
+        rid = status.get("recording_id")
+        if rid != self._sim_recording_id:
+            # 新的一段录制：SimLink 的 seq 从 0 重新开始，游标与推出定稿也要复位
+            self._sim_recording_id = rid
+            self._sim_cursor = -1
+            self._evt_seq = -1
+            self._pushback_applied = None
+            self._zfw_warnings = []
+            self.flights.zfw_at_pushback = None
+            self.flights.fuel_at_pushback = None
         if recording:
             if rec is None:
+                if not self._last_gate["ok"]:
+                    await self._advance_cursor(client)
+                    return True
                 self.flights.start(status.get("recording_id"), status.get("recording_started_at"),
-                                   manual=False)
+                                   manual=False, skip_seq=self._sim_cursor)
                 self._evt_seq = -1
                 rec = self.flights.recorder
             if rec is None:

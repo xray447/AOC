@@ -145,8 +145,14 @@ class CoverageIndex:
 
 
 class NavData:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, scenery_path: str | Path | None = None,
+                 runway_source: str = "auto"):
         self.path = Path(path)
+        # 跑道几何的第二数据源（§36 / D-7）：Little Navmap 从 MSFS 场景扫出的库
+        # （little_navmap_msfs24.sqlite）。命中优先用游戏内数据，缺失回落现实 navdata。
+        self.runway_source = (runway_source or "auto").lower()
+        self.scenery_path: Path | None = None
+        self._scenery: NavData | None = None
         if not self.path.exists():
             raise NavDataError(f"navdata 不存在: {self.path}")
         try:
@@ -175,6 +181,14 @@ class NavData:
         self._lat_arr = np.array([a["lat"] for a in self.airports.values()], dtype=float)
         self._lon_arr = np.array([a["lon"] for a in self.airports.values()], dtype=float)
         self._ident_arr = list(self.airports.keys())
+        if scenery_path:
+            candidate = Path(scenery_path)
+            if candidate.exists() and candidate.resolve() != self.path.resolve():
+                self.scenery_path = candidate
+                try:
+                    self._scenery = NavData(candidate, None, "navdata")
+                except NavDataError:
+                    self._scenery = None
 
     # -- 加载 -------------------------------------------------------------
     def _columns(self, table: str) -> set[str]:
@@ -505,6 +519,9 @@ class NavData:
         return airac, version
 
     def close(self) -> None:
+        if self._scenery is not None:
+            self._scenery.close()
+            self._scenery = None
         try:
             self._con.close()
         except Exception:  # noqa: BLE001
@@ -515,7 +532,27 @@ class NavData:
         return self.airports.get((ident or "").upper())
 
     def runways(self, ident: str | None) -> list[dict]:
-        return self._load_runways_for((ident or "").upper())
+        """跑道端几何：`auto`/`scenery` 时先查游戏场景库，缺失回落现实 navdata。"""
+        key = (ident or "").strip().upper()
+        if self._scenery is not None and self.runway_source != "navdata":
+            rows = self._scenery.runways(key)
+            if rows:
+                info = self.airports.get(key)
+                derived = max((r.get("length_m") or 0) for r in rows) or None
+                if info is not None and derived:
+                    # 跑道长度改用游戏内数据：「跑道够不够长」与 §26 的翼展推断都随之更新
+                    info["longest_runway_m"] = round(float(derived), 1)
+                    info["longest_runway_ft"] = round(float(derived) * FT_PER_M, 1)
+                    info["runway_source"] = "scenery"
+                return [{**r, "source": "scenery"} for r in rows]
+        return [{**r, "source": "navdata"} for r in self._load_runways_for(key)]
+
+    def scenery_available(self) -> bool:
+        return self._scenery is not None
+
+    def navdata_runways(self, ident: str | None) -> list[dict]:
+        """现实 navdata 的跑道几何（用于「游戏内 / 现实」对照展示）。"""
+        return [{**r, "source": "navdata"} for r in self._load_runways_for((ident or "").upper())]
 
     def search_airports(self, query: str, limit: int = 20) -> list[dict]:
         q = (query or "").strip().upper()
@@ -589,8 +626,11 @@ class NavData:
                     "distance_nm": round(dist, 3), "heading_diff_deg": round(diff, 1),
                     "along_m": round(fix[0], 1), "lateral_m": round(fix[1], 1),
                     "length_m": rwy.get("length_m"), "ils": rwy.get("ils"),
+                    "width_m": rwy.get("width_m"),
                     # 沿跑道方向从物理入口量起；着陆入口 = 物理入口 + 内移
                     "displaced_threshold_m": rwy.get("displaced_threshold_m") or 0.0,
+                    # §36：几何来源（scenery = 游戏内数据 / navdata = 现实库）
+                    "runway_source": rwy.get("source") or "navdata",
                 }
                 score = diff + dist * 5
                 if best is None or score < best["_score"]:

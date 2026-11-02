@@ -7,12 +7,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
-import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from aoc_navdata import NavData
+from aoc_navdata import NavData, haversine_nm
 from aoc_protocol.schemas import Phase, RecordingStatus
 
 from .db import Database, utcnow
@@ -28,6 +27,41 @@ AUTO_STOP_GS_KT = 5.0
 AUTO_STOP_HOLD_S = 60.0
 PARKING_BRAKE_HOLD_S = 30.0
 FRAME_GAP_S = 3.0
+# 瞬移判定（§33 / V-1）：加载期 dt 常达 ~148s，所以「速度 > 900kt」之外再叠一条
+# 「dt > 30s 且位移 > 10 NM」，两条都命中才算瞬移
+TELEPORT_SPEED_KT = 900.0
+TELEPORT_DT_S = 30.0
+TELEPORT_MIN_NM = 10.0
+# 幽灵飞机：MSFS 菜单/切场景期间固定在 (0, 90)，on_ground=false
+GHOST_LAT = 0.0
+GHOST_LON = 90.0
+# 开录位置闸（D-1）：距出发机场 > 10 NM 或不在空中都不建录
+DEP_GATE_NM = 10.0
+# 收尾门槛（§33 第 4 道闸）：假空中只有 ≈1.9s / AGL 233ft，两条都不过
+FAKE_AIRBORNE_MIN_S = 60.0
+FAKE_CLIMB_MIN_FT = 500.0
+
+
+def teleport_jump(prev: dict[str, Any], cur: dict[str, Any]) -> dict[str, Any] | None:
+    """相邻两帧是否瞬移（§33）：返回 `{dt_s, distance_nm, speed_kt}` 或 None。"""
+    dt = float(cur.get("t", 0)) - float(prev.get("t", 0))
+    if dt <= 0:
+        return None
+    dist = haversine_nm(float(prev["lat"]), float(prev["lon"]),
+                        float(cur["lat"]), float(cur["lon"]))
+    # 位移门槛是必需的：压缩时间轴的演示/导入轨迹每帧也有上千 kt，但位移只有几 NM；
+    # 真瞬移（V-1）单帧就是数千 NM（历史录制里 16,609 ~ 12,717,282 kt）
+    if dist <= TELEPORT_MIN_NM:
+        return None
+    speed = dist / (dt / 3600.0)
+    if speed > TELEPORT_SPEED_KT or dt > TELEPORT_DT_S:
+        return {"dt_s": round(dt, 1), "distance_nm": round(dist, 1), "speed_kt": round(speed)}
+    return None
+
+
+def is_ghost_position(lat: float, lon: float) -> bool:
+    """(0.0, 90.0) 是 MSFS 菜单/加载期的幽灵坐标（V-1）。"""
+    return abs(float(lat) - GHOST_LAT) < 1e-3 and abs(float(lon) - GHOST_LON) < 1e-3
 # 内存里最多保留的原始采样条数（1Hz ≈ 30 分钟）。采样逐条写进 raw.jsonl.gz，
 # 到量就丢掉内存里的列表，落地评估时再从文件读回来，避免长航线越飞越占内存。
 TRIM_AFTER_SAMPLES = 1800
@@ -98,6 +132,13 @@ class FlightRecorder:
         self.parking_brake_since: float | None = None
         self.phase = Phase.PREFLIGHT
         self.seen_airborne = False
+        # §33：中途接入（手动开录）→ block_off 只能取接入后首帧；partial = 空中接入走复核
+        self.partial = False
+        self.late_join = False
+        self.block_off_source = "preroll"
+        self.teleports = 0
+        # 瞬移重锚后，SimLink 的原始 t 需要整体减去这个偏移（保持时间轴连续）
+        self.t_offset = 0.0
         self._last_state: dict[str, Any] | None = None
         self._raw = self.paths.tracks / flight_id / "raw.jsonl.gz"
         self._raw.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +151,8 @@ class FlightRecorder:
         sample = _norm_sample(raw)
         if sample is None:
             return
+        if self.t_offset:
+            sample["t"] = sample["t"] - self.t_offset
         seq = raw.get("seq")
         if isinstance(seq, int):
             if seq <= self.last_seq:
@@ -117,6 +160,11 @@ class FlightRecorder:
             self.last_seq = seq
         if sample["t"] < self.last_t - 1e-6:
             return
+        # 录制中瞬移 = 重置（§33 第 3 道闸）：丢掉跳变前轨迹，block_off 重锚到跳变后首帧
+        if self._last_state is not None:
+            jump = teleport_jump(self._last_state, sample)
+            if jump is not None:
+                self._reset_after_teleport(jump, sample)
         self._update_events(sample)
         self.samples.append(sample)
         self.sample_count += 1
@@ -126,6 +174,41 @@ class FlightRecorder:
         self._last_state = sample
         if len(self.samples) >= TRIM_AFTER_SAMPLES:
             self.trim_samples()
+
+    def _reset_after_teleport(self, jump: dict[str, Any], sample: dict[str, Any]) -> None:
+        """瞬移重置：轨迹/事件清空、时间轴重锚（t 归零），并让状态机从头开始。
+
+        不做这一条的话，加载期「空中帧 → 地面帧」会被判成一次假起降，整段记录直接
+        `COMPLETED`（§33 的核心缺陷）。
+        """
+        delta = float(sample["t"])
+        if delta > 0:
+            self.started_at = _iso_add(self.started_at, delta)
+            self.t_offset += delta
+            sample["t"] = 0.0
+        self.teleports += 1
+        self.samples.clear()
+        self.sample_count = 0
+        self.trimmed = False
+        self.events.clear()
+        self.last_t = -1.0
+        # 写入端从空文件重来（旧轨迹已丢弃）
+        try:
+            self._raw_writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._raw_writer = gzip.open(self._raw, "wt", encoding="utf-8")
+        # 状态机重置：SimLink 侧同样会清 _hasTakeoff/_landed
+        self.airborne_since = None
+        self.touchdown_t = None
+        self.on_ground_since = None
+        self.stopped_since = None
+        self.parking_brake_since = None
+        self.seen_airborne = False
+        self.phase = Phase.PREFLIGHT
+        self._last_state = None
+        self.add_event(0.0, "teleport", jump)
+        self.add_event(0.0, "recording_started", {"reanchored": True})
 
     def trim_samples(self) -> None:
         """把内存里的采样清空（数据已经在 raw.jsonl.gz 里，逐条 flush 过）。"""
@@ -278,6 +361,10 @@ class FlightService:
         self.engine_estimated = False
         # core 自己判定收尾后，要让 PersonalService 通知 SimLink 也停下（§30）
         self.auto_stopped = False
+        # §32 推出定稿（SimLink 回传）：开录不再取 ZFW 快照，推出/起飞前才是最终值
+        self.zfw_at_pushback: float | None = None
+        self.fuel_at_pushback: float | None = None
+        self.pushback_source: str | None = None
         self._persisted = self._load_persisted()
 
     # -- 持久化 -----------------------------------------------------------
@@ -347,7 +434,8 @@ class FlightService:
         return " ".join(p.strip() for p in parts if p and p.strip())
 
     def start(self, flight_id: str | None = None, started_at: str | None = None,
-              manual: bool = True) -> RecordingStatus:
+              manual: bool = True, partial: bool = False,
+              skip_seq: int = -1) -> RecordingStatus:
         if self.recorder is not None:
             return self.status()
         ctx = self.ops_context() if self.ops_context else None
@@ -357,15 +445,27 @@ class FlightService:
         if existing is not None and existing.get("status") != "RECORDING":
             # SimLink 已收尾或重复轮询，不要重复建档
             return self.status()
-        self.recorder = FlightRecorder(fid, started, self.paths)
+        rec = FlightRecorder(fid, started, self.paths)
+        # §33：手动开录只能从接入那一刻算 block_off（late_join）；空中接入按部分记录走复核
+        rec.partial = bool(partial)
+        rec.late_join = bool(manual)
+        rec.block_off_source = "connect" if manual else "preroll"
+        if isinstance(skip_seq, int) and skip_seq >= 0:
+            # 位置闸挡住期间的帧全部跳过，避免把幽灵机/瞬移前的轨迹带进记录
+            rec.last_seq = skip_seq
+        self.recorder = rec
         self.auto_stopped = False
-        self.recorder.add_event(0.0, "recording_started", {"manual": manual})
+        self.recorder.add_event(0.0, "recording_started",
+                                {"manual": manual, "partial": bool(partial),
+                                 "block_off_source": rec.block_off_source})
         actual_zfw = (ctx or {}).get("actual_zfw_kg")
         zfw_delta = (ctx or {}).get("zfw_delta_kg")
         if actual_zfw is not None:
-            # 推出前 ZFW 校验结果：写进事件，供日志详情核对（字段同时落库）
+            # §32：开录时的快照只是「临时值」（provisional），推出后由 pushback 定稿
             self.recorder.add_event(0.0, "zfw_check", {
                 "actual_zfw_kg": actual_zfw, "delta_kg": zfw_delta,
+                "source": (ctx or {}).get("zfw_source") or "preflight",
+                "provisional": not bool((ctx or {}).get("zfw_final")),
             })
         if existing is None:
             # 机型优先级：任务上下文 → SimLink 标题匹配（机队/机型模板 keyword）→ 设置默认值
@@ -395,6 +495,11 @@ class FlightService:
                     "scheduled_dep_utc": ctx.get("scheduled_dep_utc"),
                     "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
                 })
+            record.update({
+                "partial": 1 if rec.partial else 0,
+                "late_join": 1 if rec.late_join else 0,
+                "block_off_source": rec.block_off_source,
+            })
             self.db.insert_flight(record)
         self._save_persisted()
         return self.status()
@@ -430,19 +535,20 @@ class FlightService:
     # -- 采样 -------------------------------------------------------------
     def ingest(self, raw_samples: list[dict[str, Any]], events: list[dict[str, Any]] | None = None,
                recording_id: str | None = None, recording_started_at: str | None = None,
-               auto_ingest: bool = True) -> None:
+               auto_ingest: bool = True, skip_seq: int = -1) -> None:
         if self.recorder is None and auto_ingest:
             if recording_id:
-                self.start(recording_id, recording_started_at, manual=False)
+                self.start(recording_id, recording_started_at, manual=False, skip_seq=skip_seq)
             elif raw_samples:
-                self.start(manual=False)
+                self.start(manual=False, skip_seq=skip_seq)
         if self.recorder is None:
             return
         for ev in events or []:
             payload = ev.get("data") or ev.get("detail") or {}
             if not isinstance(payload, dict):
                 payload = {"value": payload}
-            self.recorder.add_event(float(ev.get("t", 0)), ev.get("type", "event"), payload)
+            self.recorder.add_event(float(ev.get("t", 0)) - self.recorder.t_offset,
+                                    ev.get("type", "event"), payload)
         for raw in raw_samples:
             self.recorder.ingest(raw)
         if self.recorder.sample_count:
@@ -469,12 +575,8 @@ class FlightService:
         accelerated = any(float(s.get("sim_rate") or 1) > 1.5 for s in samples)
         if not accelerated:
             for a, b in zip(samples, samples[1:]):
-                dt = b["t"] - a["t"]
-                if dt <= 0:
-                    continue
-                dist = math.hypot((b["lat"] - a["lat"]) * 60,
-                                  (b["lon"] - a["lon"]) * 60 * math.cos(math.radians(a["lat"])))
-                if dist / (dt / 3600.0) > 900:
+                # 与录制中的重置判据同一套（§33 / V-1 双判据 + 10 NM 位移门槛）
+                if teleport_jump(a, b) is not None:
                     flags.append("TELEPORT")
                     break
         return flags
@@ -489,7 +591,10 @@ class FlightService:
         # 收尾统一用建档时已存的机型：事后改「默认机型」不会让旧记录前后不一致
         stored = self.db.get_flight(rec.flight_id) or {}
         aircraft_type = stored.get("aircraft_type") or self._aircraft_type()
-        result = evaluate(points, nav, rating_thresholds(settings), aircraft_type)
+        result = evaluate(points, nav, rating_thresholds(settings), aircraft_type,
+                          partial=bool(rec.partial),
+                          # §32：滑出油量取推出定稿值，缺失回落首帧（demo/replay 源）
+                          fuel_start_kg=self.fuel_at_pushback)
         takeoff_idx = result.get("takeoff_index")
         landing_idx = result.get("landing_index")
         if takeoff_idx is None:
@@ -502,6 +607,13 @@ class FlightService:
         arr = result.get("arr_icao")
         if landing_idx is None:
             arr = arr or dep
+        # §33 第 4 道闸：带瞬移痕迹又短得离谱（<2min 或 <5NM）的记录一律不收尾，
+        # 绝不把 roster_leg 置 COMPLETED（假起降会污染账本，事后无法自动恢复）
+        anomalies = self._anomalies(points)
+        block_span = ((result.get("block_on_t") or 0) - (result.get("block_off_t") or 0)) / 60.0
+        if "TELEPORT" in anomalies and (block_span < 2.0
+                                        or float(result.get("distance_nm") or 0) < 5.0):
+            status = "ABORTED"
 
         cfg = SamplingConfig(
             max_gap_s=float(settings.get("max_gap_s", 45)),
@@ -525,7 +637,6 @@ class FlightService:
         takeoff_utc = _iso_add(rec.started_at, result["takeoff_t"]) if result.get("takeoff_t") is not None else None
         landing_utc = _iso_add(rec.started_at, result["landing_t"]) if result.get("landing_t") is not None else None
         block_minutes = round(((result.get("block_on_t") or 0) - (result.get("block_off_t") or 0)) / 60.0, 1)
-        anomalies = self._anomalies(points)
         profile = {
             "profile": "adaptive_v2", "base_hz": 1, "encoding": "BIN_V2",
             "max_gap_s": cfg.max_gap_s, "straight_interval_s": 20, "turn_interval_s": 2,
@@ -535,6 +646,16 @@ class FlightService:
             "target_size_kb": 500, "fidelity_m": 30,
             "raw_points": len(points), "saved_points": len(saved), "segments": len(segments),
         }
+        fuel_start, fuel_end = result.get("fuel_start_kg"), result.get("fuel_end_kg")
+        fuel_used = None
+        if fuel_start is not None and fuel_end is not None:
+            if float(fuel_start) - float(fuel_end) < 0:
+                # §32：推出前加满油会让「起始 − 结束」变负；不许生成负燃油成本
+                fuel_used = 0.0
+                if "FUEL_ANOMALY" not in anomalies:
+                    anomalies.append("FUEL_ANOMALY")
+            else:
+                fuel_used = round(float(fuel_start) - float(fuel_end), 1)
         update: dict[str, Any] = {
             "status": status,
             "dep_icao": dep, "arr_icao": arr,
@@ -542,10 +663,9 @@ class FlightService:
             "takeoff_utc": takeoff_utc, "landing_utc": landing_utc,
             "block_minutes": block_minutes,
             "distance_nm": result.get("distance_nm"),
-            "fuel_start_kg": result.get("fuel_start_kg"),
-            "fuel_end_kg": result.get("fuel_end_kg"),
-            "fuel_used_kg": (round((result.get("fuel_start_kg") or 0) - (result.get("fuel_end_kg") or 0), 1)
-                             if result.get("fuel_start_kg") is not None and result.get("fuel_end_kg") is not None else None),
+            "fuel_start_kg": fuel_start,
+            "fuel_end_kg": fuel_end,
+            "fuel_used_kg": fuel_used,
             "max_g_flight": metrics.get("max_g_flight") or result.get("max_g_flight"),
             "max_g_landing": metrics.get("max_g_landing"),
             "touchdown_g": metrics.get("touchdown_g"),
@@ -553,6 +673,9 @@ class FlightService:
             "touchdown_lat": metrics.get("touchdown_lat"),
             "touchdown_lon": metrics.get("touchdown_lon"),
             "runway_ident": metrics.get("runway_ident"),
+            # §36：这条记录实际用的跑道几何来源与长度
+            "runway_length_m": metrics.get("runway_length_m"),
+            "runway_source": metrics.get("runway_source"),
             "threshold_distance_m": metrics.get("threshold_distance_m"),
             "displaced_threshold_m": metrics.get("displaced_threshold_m"),
             "centerline_offset_m": metrics.get("centerline_offset_m"),
@@ -572,9 +695,13 @@ class FlightService:
             "validation_status": "SUSPECT" if anomalies else "VALID",
             "anomaly_flags_json": anomalies,
             "airac": nav.airac if nav else None,
+            # §33：中途接入标记（block_off 只能取接入后首帧，结算不按异常扣分）
+            "partial": 1 if rec.partial else 0,
+            "late_join": 1 if rec.late_join else 0,
+            "block_off_source": rec.block_off_source,
         }
         flight = self.db.update_flight(rec.flight_id, update)
-        if flight and status in ("COMPLETED", "DIVERTED") and dep and arr:
+        if flight and status in ("COMPLETED", "DIVERTED") and dep and arr and not rec.partial:
             self.db.add_flown_leg({
                 "dep_icao": dep, "arr_icao": arr,
                 "flight_date": (block_off or "")[:10] or None,
@@ -611,4 +738,8 @@ class FlightService:
             last_error=self.last_error,
             simlink_source=self.simlink_source,
             last_connect_error=self.last_connect_error,
+            # §32 推出定稿：未推出时为 None，界面显示「—」
+            zfw_at_pushback=self.zfw_at_pushback,
+            fuel_at_pushback=self.fuel_at_pushback,
+            pushback_source=self.pushback_source,
         )

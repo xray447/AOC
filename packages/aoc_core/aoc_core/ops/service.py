@@ -45,6 +45,8 @@ CONSTRAINT_LIMITS = {
 }
 FREE_LOCK_MINUTES = 30
 FREE_DEP_OFFSET_MINUTES = 50
+# 合计航时下限（§34）的绝对下限：留空推导 / 手填都不能低于它
+CONSTRAINT_MIN_TOTAL_BLOCK = 30
 # 不遵循航线时：首段最早起飞偏移、每个航点最多评估的候选机场数、每个出发点最多评估的分支数
 VIRTUAL_FIRST_DEPART_MINUTES = 60
 VIRTUAL_POOL_LIMIT = 160
@@ -69,6 +71,8 @@ LEDGER_TYPES = (
     "POLICY_ADJUSTMENT", "REVENUE_ADJUSTMENT", "ADVANCE_PAYOUT", "ADVANCE_CLAWBACK",
     "COST_FUEL", "COST_LANDING", "COST_HANDLING", "COST_CREW", "COST_MAINTENANCE",
     "COST_LEASE", "COST_PARKING", "COST_ATC", "COST_INSURANCE", "COST_REPAIR",
+    # §35 快速调机（付费改位置）
+    "COST_FERRY",
     "PENALTY_CANCEL", "PENALTY_NO_SHOW", "PENALTY_DIVERSION",
 )
 ACTIVE_TASK_KEY = "ops_active_task"
@@ -147,7 +151,7 @@ def _simbrief_payload(*, dep: str | None = None, arr: str | None = None,
                       sheet: dict[str, Any] | None = None) -> dict[str, Any]:
     """SimBrief 预填参数：机场/机型/呼号/注册号，有配载单时再带上旅客与 ZFW。
 
-    链接里只传 `airline`+`fltnum` 与 `manualzfw`（千磅）；`pax` 仅用于界面展示。
+    链接里只传 `airline`+`fltnum` 与 `manualzfw`（吨）；`pax` 仅用于界面展示。
     """
     payload: dict[str, Any] = {
         "dep": (dep or "").upper(), "arr": (arr or "").upper(),
@@ -800,6 +804,69 @@ class OpsService:
             self._audit(con, "AIRCRAFT_UPDATE", "aircraft", aircraft_id, before, allowed)
         return self.get_aircraft(aircraft_id) or {}
 
+    def fast_ferry(self, aircraft_id: str, to_icao: str,
+                   hold: bool | None = None) -> dict[str, Any]:
+        """快速调机（§35 / D-6）：付费把飞机「在 AOC 侧」移到别的机场。
+
+        模拟器里不搬飞机：必须提示玩家在 MSFS 里于目标机场重新进入飞行，并由
+        §33 的位置闸兜底（位置不符就不开录）。余额允许透支，不拦负余额。
+        """
+        to = (to_icao or "").strip().upper()
+        if len(to) != 4 or not re.fullmatch(r"[A-Z0-9]{4}", to):
+            raise OpsError("VALIDATION", "目标机场必须是 4 字码", {"key": "to_icao"})
+        aircraft = self.get_aircraft(aircraft_id)
+        if not aircraft:
+            raise OpsError("NOT_FOUND", "飞机不存在")
+        if aircraft["status"] != "ACTIVE" or aircraft.get("locked"):
+            raise OpsError("AIRCRAFT_LOCKED", "飞机正被班表/自由飞占用，先取消任务",
+                           {"aircraft_id": aircraft_id})
+        if self.active_task():
+            raise OpsError("TASK_IN_PROGRESS", "已有正在执行的任务")
+        if (self.current_roster() or {}).get("status") == "IN_PROGRESS":
+            raise OpsError("INVALID_STATE", "班表执行中不能调机")
+        current = (aircraft.get("current_airport_icao") or "").upper()
+        if current == to:
+            raise OpsError("INVALID_STATE", f"飞机已经在 {to}")
+        target = eco.airport_meta(self.nav, to)
+        if not target.get("known"):
+            raise OpsError("NOT_FOUND", f"navdata 里查不到机场 {to}")
+        params = self.economy_params()
+        distance = eco.gcd_nm(eco.airport_meta(self.nav, current), target) if current else 0.0
+        fee = round(float(params.get("fast_ferry_fixed_fee") or 1000.0)
+                    + float(distance or 0.0) * float(params.get("fast_ferry_fee_per_nm") or 12.0), 2)
+        warnings: list[str] = []
+        if not distance:
+            warnings.append("查不到两场距离，按固定费用计费")
+        hold_enabled = bool(params.get("fast_ferry_hold")) if hold is None else bool(hold)
+        stamp = utcnow()
+        with self._tx() as con:
+            con.execute("update aircraft set current_airport_icao=?, updated_at=?, "
+                        "version=version+1 where id=?", (to, stamp, aircraft_id))
+            self._ledger_entries(con, None, None, [{
+                "type": "COST_FERRY", "amount": -fee,
+                "description": f"快速调机 {current or '?'} → {to}"
+                               f"（{round(distance or 0.0)} NM）"}])
+            if hold_enabled:
+                # 可选占用：按「距离 ÷ 巡航速度 + 30min 地面」占住飞机，到点自动释放
+                cruise = float((self.get_type(aircraft["type_id"]) or {}).get("cruise_speed_kt") or 440)
+                minutes = int(round((distance or 0.0) / max(60.0, cruise) * 60 + 30))
+                con.execute(
+                    "insert into aircraft_lock(id, aircraft_id, roster_id, free_flight_id, lock_type, "
+                    "status, acquired_at, expires_at, heartbeat_at) values(?,?,?,?,?,?,?,?,?)",
+                    (new_id(), aircraft_id, None, None, "FERRY", "HELD", stamp,
+                     _iso(_now() + timedelta(minutes=minutes)), stamp))
+                con.execute("update aircraft set status='HELD', updated_at=? where id=?",
+                            (stamp, aircraft_id))
+            self._audit(con, "AIRCRAFT_FERRY", "aircraft", aircraft_id,
+                        {"from": current or None},
+                        {"to": to, "distance_nm": round(distance or 0.0, 1), "fee": fee,
+                         "hold": hold_enabled})
+        warnings.append(f"已在 AOC 侧把飞机移到 {to}，请在 MSFS 里于 {to} 重新进入飞行")
+        return {"aircraft": self.get_aircraft(aircraft_id) or {},
+                "distance_nm": round(distance or 0.0, 1), "fee": fee,
+                "currency": (self.profile() or {}).get("currency", "USD"),
+                "hold": hold_enabled, "warnings": warnings}
+
     def release_aircraft(self, aircraft_id: str, reason: str | None = None) -> dict[str, Any]:
         aircraft = self.get_aircraft(aircraft_id)
         if not aircraft:
@@ -1051,6 +1118,25 @@ class OpsService:
         if out["min_leg_block_minutes"] > out["max_leg_block_minutes"]:
             raise OpsError("PARAM_OUT_OF_RANGE", "每程最短航时不能大于每程最长航时",
                            {"key": "min_leg_block_minutes"})
+        # 合计航时下限（§34 / D-4）：留空按「上限 −25%」推导（480 → 360），填写值优先
+        raw_total_min = req.get("min_total_block_minutes")
+        total_min: int | None = None
+        if raw_total_min not in (None, ""):
+            try:
+                total_min = int(raw_total_min)
+            except (TypeError, ValueError) as exc:
+                raise OpsError("PARAM_OUT_OF_RANGE", "最少合计航时必须是整数",
+                               {"key": "min_total_block_minutes"}) from exc
+            # 0 = 显式关闭下限（放宽阶梯与探针工具用；界面最小 30）
+            if total_min != 0 and (total_min < CONSTRAINT_MIN_TOTAL_BLOCK
+                                   or total_min > out["max_block_minutes"]):
+                raise OpsError(
+                    "PARAM_OUT_OF_RANGE",
+                    f"最少合计航时需在 {CONSTRAINT_MIN_TOTAL_BLOCK}–{out['max_block_minutes']} min"
+                    "（不能超过合计上限）",
+                    {"key": "min_total_block_minutes"})
+        out["min_total_block_minutes"] = total_min if total_min is not None else max(
+            CONSTRAINT_MIN_TOTAL_BLOCK, int(round(out["max_block_minutes"] * 0.75)))
         base = (req.get("base_airport") or "").strip().upper() or None
         out["base_airport"] = base
         out["aircraft_type_id"] = req.get("aircraft_type_id") or None
@@ -1102,6 +1188,81 @@ class OpsService:
         self._expire_locks()
         types = self._type_map()
         now = _now()
+        warnings: list[str] = []
+        aircraft: list[dict[str, Any]] = []
+        instances: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        top: list[dict[str, Any]] = []
+        # 下限不达标时的放宽顺序（§34 / V-4）：原样 → 只保上限 → 每程最长航时 ×1.2
+        # V-4 实测：遵循航线时下限会让 480 上限「全灭」，所以放宽是必需路径，不能静默降级
+        for attempt in self._relax_attempts(constraints):
+            if attempt["warning"]:
+                warnings.append(attempt["warning"])
+            aircraft, instances, candidates = self._collect_candidates(
+                attempt["constraints"], types, now)
+            top = self._select_top(candidates, 3)
+            if top:
+                break
+        token = self._sign({
+            "aircraft_id": None,
+            "candidates": [{
+                "aircraft_id": c["aircraft"]["id"],
+                # 航班实例为空 = 关掉「遵循航线」时生成的虚拟航段，确认时再落一次性实例
+                "instance_ids": [leg["flight_instance_id"] for leg in c["legs"]],
+                "virtual_legs": [{
+                    "dep": leg["dep"], "arr": leg["arr"],
+                    "scheduled_dep_utc": leg["scheduled_dep_utc"],
+                    "scheduled_arr_utc": leg["scheduled_arr_utc"],
+                } for leg in c["legs"] if leg.get("virtual")],
+            } for c in top],
+            "constraints": constraints,
+            "exp": _iso(now + timedelta(seconds=CANDIDATE_TTL_SECONDS)),
+        })
+        for item in top:
+            item["candidate_token"] = token
+        result = {
+            "candidates": top,
+            "constraints": constraints,
+            "expires_at": _iso(now + timedelta(seconds=CANDIDATE_TTL_SECONDS)),
+            "considered": len(candidates),
+            "follow_routes": constraints["follow_routes"],
+            "excluded_airports": constraints["excluded_airports"],
+            "warnings": warnings,
+            "relaxed": bool(warnings),
+        }
+        if not top:
+            result["reason"] = self._no_candidate_reason(
+                aircraft, types, instances, constraints)
+        return result
+
+    @staticmethod
+    def _relax_attempts(constraints: dict[str, Any]) -> list[dict[str, Any]]:
+        """合计航时下限的放宽阶梯（§34）：每步带一条给 UI 的提示。"""
+        attempts: list[dict[str, Any]] = [{"constraints": constraints, "warning": None}]
+        total_min = int(constraints.get("min_total_block_minutes") or 0)
+        if total_min <= 0:
+            return attempts
+        dropped = {**constraints, "min_total_block_minutes": 0}
+        attempts.append({
+            "constraints": dropped,
+            "warning": (f"合计航时不足 {total_min} min，已放宽为只保上限 "
+                        f"{constraints['max_block_minutes']} min"),
+        })
+        widened = {**dropped,
+                   "max_leg_block_minutes": min(1440, int(round(
+                       float(constraints["max_leg_block_minutes"]) * 1.2)))}
+        attempts.append({
+            "constraints": widened,
+            "warning": (f"仍无候选，已把每程最长航时放宽到 "
+                        f"{widened['max_leg_block_minutes']} min"),
+        })
+        return attempts
+
+    def _collect_candidates(self, constraints: dict[str, Any],
+                            types: dict[str, dict[str, Any]],
+                            now: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                                    list[dict[str, Any]]]:
+        """按一份约束跑一遍抽班，返回 (可用飞机, 可用实例, 候选)。"""
         window_end = now + timedelta(hours=constraints["window_hours"])
         aircraft = [a for a in self.list_fleet()
                     if a["status"] == "ACTIVE" and not a.get("locked")]
@@ -1159,36 +1320,7 @@ class OpsService:
                 if candidate:
                     candidates.append(candidate)
         candidates.sort(key=lambda c: c["score"], reverse=True)
-        top = self._select_top(candidates, 3)
-        token = self._sign({
-            "aircraft_id": None,
-            "candidates": [{
-                "aircraft_id": c["aircraft"]["id"],
-                # 航班实例为空 = 关掉「遵循航线」时生成的虚拟航段，确认时再落一次性实例
-                "instance_ids": [leg["flight_instance_id"] for leg in c["legs"]],
-                "virtual_legs": [{
-                    "dep": leg["dep"], "arr": leg["arr"],
-                    "scheduled_dep_utc": leg["scheduled_dep_utc"],
-                    "scheduled_arr_utc": leg["scheduled_arr_utc"],
-                } for leg in c["legs"] if leg.get("virtual")],
-            } for c in top],
-            "constraints": constraints,
-            "exp": _iso(now + timedelta(seconds=CANDIDATE_TTL_SECONDS)),
-        })
-        for item in top:
-            item["candidate_token"] = token
-        result = {
-            "candidates": top,
-            "constraints": constraints,
-            "expires_at": _iso(now + timedelta(seconds=CANDIDATE_TTL_SECONDS)),
-            "considered": len(candidates),
-            "follow_routes": constraints["follow_routes"],
-            "excluded_airports": constraints["excluded_airports"],
-        }
-        if not top:
-            result["reason"] = self._no_candidate_reason(
-                aircraft, types, instances, constraints)
-        return result
+        return aircraft, instances, candidates
 
     @staticmethod
     def _select_top(candidates: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
@@ -1223,6 +1355,7 @@ class OpsService:
         min_turn = timedelta(minutes=constraints["min_turnaround_min"])
         max_turn = timedelta(minutes=constraints["max_turnaround_min"])
         max_block = constraints["max_block_minutes"]
+        total_min = int(constraints.get("min_total_block_minutes") or 0)
         min_leg = constraints["min_leg_block_minutes"]
         max_leg = constraints["max_leg_block_minutes"]
         max_legs = constraints["max_legs"]
@@ -1231,9 +1364,13 @@ class OpsService:
 
         def walk(position: str, earliest: datetime, latest: datetime | None,
                  chain: list[dict[str, Any]], block_total: int) -> None:
-            if chain:
+            if chain and block_total >= total_min:
                 results.append(list(chain))
             if len(chain) >= max_legs or len(results) > 200:
+                return
+            # 提前剪枝：剩下的航段全取最长也补不到下限时，不再往下走
+            # （否则 200 条候选上限会被不达标的前缀链占满）
+            if total_min and block_total + max_leg * (max_legs - len(chain)) < total_min:
                 return
             for inst in by_dep.get(position, []):
                 dep_icao = (inst.get("dep_icao") or "").upper()
@@ -1335,14 +1472,19 @@ class OpsService:
         rng = eco.seeded_rng(f"{aircraft['id']}|{start}|{key}", "virtual")
         min_turn = timedelta(minutes=constraints["min_turnaround_min"])
         max_block = constraints["max_block_minutes"]
+        total_min = int(constraints.get("min_total_block_minutes") or 0)
+        max_leg = constraints["max_leg_block_minutes"]
         max_legs = constraints["max_legs"]
         results: list[list[dict[str, Any]]] = []
 
         def walk(position: str, earliest: datetime, chain: list[dict[str, Any]],
                  block_total: int) -> None:
-            if chain:
+            if chain and block_total >= total_min:
                 results.append(list(chain))
             if len(chain) >= max_legs or len(results) > 60:
+                return
+            # 提前剪枝：剩余航段全取最长也补不到下限时直接返回
+            if total_min and block_total + max_leg * (max_legs - len(chain)) < total_min:
                 return
             # 每架飞机/出发点一份池：不同飞机的随机顺序不同，候选才不会完全一样
             cache_key = (str(aircraft.get("id")), position)
@@ -1393,6 +1535,9 @@ class OpsService:
             hints.append("已排除军用机场")
         if constraints.get("consider_wingspan"):
             hints.append("已按跑道宽度过滤翼展")
+        if constraints.get("min_total_block_minutes"):
+            hints.append(f"合计航时需 ≥ {constraints['min_total_block_minutes']} min"
+                         "（已放宽一次仍无候选）")
         if hints:
             return ("候选被排除机场/军用机场/翼展或跑道宽度/每程航时区间/合计航时或过站时间挡掉了："
                     + "，".join(hints))
@@ -2226,10 +2371,12 @@ class OpsService:
         return {"task": task, "load_sheet": self.load_sheet(flight_id),
                 "free_flight": self.free_flight(free_id), "warnings": warnings}
 
-    def set_actual_zfw(self, actual_zfw_kg: Any) -> list[str]:
-        """记录开始前补录实际 ZFW（由 SimLink 采样换算），返回偏低警告。
+    def set_actual_zfw(self, actual_zfw_kg: Any, source: str = "preflight",
+                       final: bool = False) -> list[str]:
+        """记录实际 ZFW（由 SimLink 采样换算），返回偏低警告。
 
-        差异写进当前任务，开始录制时带入 `flight_record`，供事后核对。
+        §32 方案 B：开录不再取快照，由推出事件回传 `zfw_at_pushback` 定稿
+        （`source="pushback", final=True`）：覆盖 `flight_record` 并补一条 `zfw_check` 事件。
         """
         task = self.active_task()
         if not task:
@@ -2240,7 +2387,17 @@ class OpsService:
             return []
         task["actual_zfw_kg"] = actual
         task["zfw_delta_kg"] = delta
+        task["zfw_source"] = source
+        task["zfw_final"] = bool(final)
         self._meta_set(ACTIVE_TASK_KEY, task)
+        flight_id = task.get("flight_record_id")
+        if final and flight_id:
+            self.db.update_flight(flight_id, {"actual_zfw_kg": actual, "zfw_delta_kg": delta})
+            self.db.add_events(flight_id, [{
+                "t_offset_ms": 0, "type": "zfw_check",
+                "payload": {"actual_zfw_kg": actual, "delta_kg": delta,
+                            "source": source, "final": True},
+            }])
         return warnings
 
     def _callsign(self, flight_number: str | None) -> str:
@@ -2373,6 +2530,21 @@ class OpsService:
             return None
         return task
 
+    def recording_departure(self) -> str | None:
+        """位置闸（§33）用的出发机场：优先当前任务，其次已锁定班表的首段、自由飞。"""
+        task = self.active_task() or {}
+        if task.get("dep_icao") and not task.get("finished"):
+            return str(task["dep_icao"]).upper()
+        roster = self.current_roster() or {}
+        if roster.get("status") in ("LOCKED", "IN_PROGRESS"):
+            leg = next((l for l in roster.get("legs") or [] if l.get("status") == "PLANNED"), None)
+            if leg and leg.get("dep_icao"):
+                return str(leg["dep_icao"]).upper()
+        free = self.current_free_flight() or {}
+        if free.get("status") == "LOCKED" and free.get("dep_icao"):
+            return str(free["dep_icao"]).upper()
+        return None
+
     def abort_task(self, reason: str | None = None,
                    task: dict[str, Any] | None = None) -> dict[str, Any]:
         """飞行员放弃当前航班：取消本段与剩余航段、释放飞机、清空任务（不结算）。"""
@@ -2458,6 +2630,13 @@ class OpsService:
         policy_result = evaluate(policy_row, anomalies)
         action = policy_result["action"]
         factor = policy_result["payout_factor"]
+        if (flight.get("partial") or 0) and not review_action:
+            # 空中接入的部分记录（D-2）：不自动判完成，一律进复核队列
+            action, factor = "REVIEW", 1.0
+            policy_result["action"] = "REVIEW"
+            policy_result.setdefault("breakdown", []).append({
+                "kind": "PARTIAL", "action": "REVIEW", "penalty": 0.0,
+                "detail": "空中接入的部分记录（缺地面/起飞段），转人工复核"})
         if review_action:
             action = review_action.upper()
             factor = 1.0 if action == "ACCEPT" else (factor if action == "WEIGHTED" else 0.0)
@@ -2550,6 +2729,74 @@ class OpsService:
                 self._meta_set(ACTIVE_TASK_KEY, {**(task or {}), "finished": True}, con)
         return self.settlement(settlement_id) or {}
 
+    def void_leg(self, roster_id: str, sequence: int | None = None,
+                 roster_leg_id: str | None = None,
+                 reason: str | None = None) -> dict[str, Any]:
+        """本段作废重飞（§33 / D-3）：把误判成 `COMPLETED` 的航段退回 `PLANNED`。
+
+        配套冲销：`settlement` 置 `VOID` + 账本反向条目、机队位置/小时/循环回滚、
+        `flown_leg` 删除、飞机锁退回 `HELD`，然后允许重新点「开始本段」。
+        """
+        roster = self.roster(roster_id)
+        if not roster:
+            raise OpsError("NOT_FOUND", "班表不存在")
+        if roster_leg_id:
+            leg = next((l for l in roster["legs"] if l["id"] == roster_leg_id), None)
+        else:
+            leg = next((l for l in roster["legs"] if int(l["sequence"]) == int(sequence or 0)), None)
+        if not leg:
+            raise OpsError("NOT_FOUND", "航段不存在")
+        if leg["status"] not in ("COMPLETED", "IN_PROGRESS"):
+            raise OpsError("INVALID_STATE", "只有已完成/进行中的航段可以作废重飞")
+        flight_id = leg.get("flight_record_id")
+        flight = self._one("select * from flight_record where id=?", (flight_id,)) if flight_id else None
+        settlement = self._one("select * from settlement where flight_record_id=?",
+                               (flight_id,)) if flight_id else None
+        aircraft_id = roster["aircraft_id"]
+        block_minutes = float((flight or {}).get("block_minutes") or 0)
+        dep = (leg.get("dep_icao") or "").upper() or None
+        task = self.active_task() or {}
+        stamp = utcnow()
+        with self._tx() as con:
+            if settlement and settlement.get("status") != "VOID":
+                rows = con.execute("select entry_type, amount, description from ledger_entry "
+                                   "where settlement_id=?", (settlement["id"],)).fetchall()
+                reversals = [{"type": r["entry_type"], "amount": -float(r["amount"] or 0),
+                              "description": f"作废冲销：{r['description'] or ''}".strip()}
+                             for r in rows if float(r["amount"] or 0) != 0]
+                self._ledger_entries(con, settlement["id"], flight_id, reversals)
+                con.execute("update settlement set status='VOID', review_status='VOID', "
+                            "updated_at=? where id=?", (stamp, settlement["id"]))
+            if flight_id:
+                # 记录本身留档（ABORTED），机队账与轨迹不再计入
+                con.execute("update flight_record set status='ABORTED', updated_at=? where id=?",
+                            (stamp, flight_id))
+                con.execute("delete from flown_leg where source='AOC' and external_id=?",
+                            (flight_id,))
+            if aircraft_id:
+                con.execute(
+                    "update aircraft set current_airport_icao=coalesce(?, current_airport_icao), "
+                    "total_hours=max(0, total_hours-?), total_cycles=max(0, total_cycles-1), "
+                    "status='HELD', updated_at=?, version=version+1 where id=?",
+                    (dep, round(block_minutes / 60.0, 3), stamp, aircraft_id))
+                con.execute("update aircraft_lock set status='HELD', expires_at=NULL, heartbeat_at=? "
+                            "where roster_id=? and status in ('HELD','IN_FLIGHT')",
+                            (stamp, roster_id))
+            con.execute(
+                "update roster_leg set status='PLANNED', flight_record_id=NULL, actual_dep_utc=NULL, "
+                "actual_arr_utc=NULL, updated_at=? where id=?", (stamp, leg["id"]))
+            if leg.get("flight_instance_id"):
+                con.execute("update flight_instance set status='SCHEDULED', updated_at=? where id=?",
+                            (stamp, leg["flight_instance_id"]))
+            con.execute("update roster set status='IN_PROGRESS', completed_at=NULL, updated_at=? "
+                        "where id=?", (stamp, roster_id))
+            if task.get("roster_leg_id") == leg["id"] or (flight_id and task.get("flight_record_id") == flight_id):
+                self._meta_set(ACTIVE_TASK_KEY, {**task, "finished": True}, con)
+            self._audit(con, "LEG_VOID", "roster_leg", leg["id"], leg["status"], "PLANNED",
+                        reason or "本段作废重飞")
+        return {"ok": True, "roster": self.roster(roster_id), "flight_id": flight_id,
+                "settlement_id": (settlement or {}).get("id")}
+
     def _instance_dep(self, task: dict[str, Any] | None) -> str | None:
         if not task:
             return None
@@ -2587,9 +2834,12 @@ class OpsService:
                 (arr or None, round(block_minutes / 60.0, 3), fuel_end, stamp, aircraft_id))
             con.execute("update aircraft_lock set status='RELEASED', released_at=? "
                         "where aircraft_id=? and status in ('HELD','IN_FLIGHT')", (stamp, aircraft_id))
+        # 部分记录（空中接入）转复核：航段不能算完成，保留 IN_PROGRESS 等人工确认/作废
+        hold_leg = action == "REVIEW" and bool(flight.get("partial"))
         if task and task.get("kind") == "ROSTER" and task.get("roster_leg_id"):
-            con.execute("update roster_leg set status='COMPLETED', actual_arr_utc=?, updated_at=? "
-                        "where id=?", (flight.get("block_on_utc") or stamp, stamp, task["roster_leg_id"]))
+            con.execute("update roster_leg set status=?, actual_arr_utc=?, updated_at=? where id=?",
+                        ("IN_PROGRESS" if hold_leg else "COMPLETED",
+                         flight.get("block_on_utc") or stamp, stamp, task["roster_leg_id"]))
             if task.get("flight_instance_id"):
                 con.execute("update flight_instance set status=?, updated_at=? where id=?",
                             ("SETTLED" if action != "REVIEW" else "LANDED", stamp,
@@ -2597,7 +2847,7 @@ class OpsService:
             remaining = con.execute(
                 "select count(*) from roster_leg where roster_id=? and status in ('PLANNED','IN_PROGRESS')",
                 (task.get("roster_id"),)).fetchone()[0]
-            if not remaining:
+            if not remaining and not hold_leg:
                 con.execute("update roster set status='COMPLETED', completed_at=?, updated_at=? "
                             "where id=?", (stamp, stamp, task["roster_id"]))
         if task and task.get("kind") == "FREE" and task.get("free_flight_id"):
@@ -2873,6 +3123,16 @@ class OpsService:
                                 "where free_flight_id=?", (now, row["id"]))
                     con.execute("update aircraft set status='ACTIVE', updated_at=?, version=version+1 "
                                 "where id=?", (now, free["aircraft_id"]))
+            # 快速调机的可选占用（§35）：只有 aircraft_lock 到期，没有班表/自由飞
+            ferries = self._rows(
+                "select * from aircraft_lock where status='HELD' and expires_at is not null "
+                "and expires_at < ? and roster_id is null and free_flight_id is null", (now,))
+            for lock in ferries:
+                with self._tx() as con:
+                    con.execute("update aircraft_lock set status='EXPIRED', released_at=? "
+                                "where id=?", (now, lock["id"]))
+                    con.execute("update aircraft set status='ACTIVE', updated_at=?, version=version+1 "
+                                "where id=? and status='HELD'", (now, lock["aircraft_id"]))
         except Exception:  # noqa: BLE001
             return
         finally:

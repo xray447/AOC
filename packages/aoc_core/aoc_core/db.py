@@ -36,6 +36,10 @@ FLIGHT_COLUMNS = [
     "touchdown_lat", "touchdown_lon", "runway_ident", "threshold_distance_m",
     "centerline_offset_m", "bounce_count", "landing_distance_m", "landing_rating",
     "displaced_threshold_m", "engine_seconds", "engine_estimated",
+    # §33 位置闸/瞬移：部分记录（空中接入）、中途接入、block_off 来源
+    "partial", "late_join", "block_off_source",
+    # §36 跑道几何来源（场景库优先，回落 navdata）
+    "runway_length_m", "runway_source",
     "track_profile_json", "track_points", "track_bytes", "track_fidelity_m",
     "track_sha256", "data_gap_seconds", "validation_status",
     "validation_notes_json", "anomaly_flags_json", "notes", "created_at", "updated_at",
@@ -267,7 +271,10 @@ class Database:
             flight_cols = {r["name"] for r in con.execute("pragma table_info(flight_record)")}
             for name, ddl in (("actual_zfw_kg", "REAL"), ("zfw_delta_kg", "REAL"),
                               ("displaced_threshold_m", "REAL"),
-                              ("engine_seconds", "INTEGER"), ("engine_estimated", "INTEGER")):
+                              ("engine_seconds", "INTEGER"), ("engine_estimated", "INTEGER"),
+                              ("partial", "INTEGER"), ("late_join", "INTEGER"),
+                              ("block_off_source", "TEXT"),
+                              ("runway_length_m", "REAL"), ("runway_source", "TEXT")):
                 if name not in flight_cols:
                     con.execute(f"alter table flight_record add column {name} {ddl}")
 
