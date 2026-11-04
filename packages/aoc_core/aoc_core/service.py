@@ -41,6 +41,7 @@ from .aircraft import AircraftCatalog
 from .db import Database, utcnow
 from .flights import FlightService
 from .ops import OpsService
+from .ops.service import zfw_check
 from .paths import AppPaths
 from .recommend import recommend as build_recommend
 from .simlink import SimLinkClient
@@ -78,6 +79,20 @@ class PositionGateError(RuntimeError):
             message = (f"尚未进入飞行或位置不符：距 {dep} "
                        f"{dist if dist is not None else '?'} NM（需 ≤10 NM 且在地面）")
         super().__init__(message)
+
+
+# §39：推出定稿的来源（engine / gs / start）。旧版 SimLink 只有 "pushback"（地速触发），
+# 读到老值/老队列时按 gs 的别名兼容，其余未知值一律视为 None。
+PUSHBACK_SOURCES = ("engine", "gs", "start")
+_PUSHBACK_SOURCE_ALIASES = {"pushback": "gs"}
+
+
+def _pushback_source(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    source = value.strip().lower()
+    source = _PUSHBACK_SOURCE_ALIASES.get(source, source)
+    return source if source in PUSHBACK_SOURCES else None
 
 
 class PersonalService:
@@ -801,6 +816,8 @@ class PersonalService:
             "position_reason": None, "partial_allowed": False,
             # §32 推出定稿：实际/计划 ZFW 与油量，前端不再自己比
             "planned_zfw_kg": None, "planned_fuel_kg": None, "fuel_at_pushback": None,
+            # §40：差异由后端算（与结算/警告同一口径），前端只负责显示
+            "zfw_delta_kg": None,
             "zfw_source": None, "zfw_state": "unknown",
             "zfw_warnings": [], "zfw_warning_seq": 0,
         }
@@ -859,14 +876,18 @@ class PersonalService:
         out["planned_fuel_kg"] = round(float(planned_fuel), 1) if planned_fuel else None
         out["fuel_at_pushback"] = self.flights.fuel_at_pushback
         if pushback_zfw is not None:
-            out["zfw_source"] = self.flights.pushback_source or "pushback"
+            out["zfw_source"] = self.flights.pushback_source or "gs"
         else:
             out["zfw_source"] = "preflight" if out["actual_zfw_kg"] is not None else None
         if out["actual_zfw_kg"] is None or out["planned_zfw_kg"] is None:
             out["zfw_state"] = "unknown"
         else:
-            delta = float(out["actual_zfw_kg"]) - float(out["planned_zfw_kg"])
-            out["zfw_state"] = "short" if delta < -1 else ("over" if delta > 1 else "ok")
+            # §40：差异与状态用同一个函数、同一阈值（±0.5 kg 归零、±1 kg 分档），
+            # 避免「状态 ok 但差异显示 -0 kg」这种两套口径
+            _, delta, _ = zfw_check(out["actual_zfw_kg"], out["planned_zfw_kg"])
+            out["zfw_delta_kg"] = delta
+            out["zfw_state"] = ("unknown" if delta is None
+                                else "short" if delta < -1 else ("over" if delta > 1 else "ok"))
         out["zfw_warnings"] = list(self._zfw_warnings)
         out["zfw_warning_seq"] = self._zfw_warning_seq
         return out
@@ -912,7 +933,8 @@ class PersonalService:
         # §32 方案 B：推出事件的 ZFW/油量才是定稿值（开录不再取快照，单一来源）
         pushback_zfw = status.get("zfw_at_pushback")
         pushback_fuel = status.get("fuel_at_pushback")
-        self.flights.pushback_source = status.get("pushback_source")
+        # §39：engine / gs / start；旧版 SimLink 只有 "pushback"（地速触发），按 gs 的别名兼容
+        self.flights.pushback_source = _pushback_source(status.get("pushback_source"))
         if isinstance(pushback_zfw, (int, float)) and float(pushback_zfw) > 0:
             self.flights.zfw_at_pushback = round(float(pushback_zfw), 1)
         if isinstance(pushback_fuel, (int, float)) and float(pushback_fuel) > 0:
@@ -922,7 +944,7 @@ class PersonalService:
             self._pushback_applied = self.flights.zfw_at_pushback
             warnings = self.ops.set_actual_zfw(
                 self.flights.zfw_at_pushback,
-                source=self.flights.pushback_source or "pushback", final=True)
+                source=self.flights.pushback_source or "gs", final=True)
             if warnings:
                 self._zfw_warnings = list(warnings)
                 self._zfw_warning_seq += 1

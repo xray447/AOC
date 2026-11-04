@@ -108,10 +108,15 @@ SPEC_OVERRIDES: dict[str, dict[str, Any]] = {
 # 目录里不写翼展，按 category 兜底；常用机型写近似真值。
 WINGSPAN_BY_CATEGORY = {"ga": 15.0, "regional": 28.0, "narrow": 36.0, "wide": 65.0}
 WINGSPAN_OVERRIDES: dict[str, float] = {
-    "C172": 11.0, "B350": 17.7, "C25C": 15.5, "AT76": 27.1, "E190": 28.7, "CRJ9": 24.9,
-    "A319": 35.8, "A320": 35.8, "A321": 35.8, "B738": 35.9, "B39M": 35.9, "B752": 38.0,
-    "A332": 60.3, "A333": 60.3, "A343": 60.3, "A359": 64.8, "A388": 79.8,
-    "B77W": 64.8, "B789": 60.1,
+    "C172": 11.0, "SR22": 11.7, "DA62": 14.6, "PC12": 16.3, "TBM9": 12.2,
+    "B350": 17.7, "E55P": 12.4, "C25C": 15.5, "C68A": 19.3,
+    "AT76": 27.1, "DH8D": 25.9, "SF34": 21.4,
+    "CRJ7": 23.2, "CRJ9": 24.9, "E170": 26.0, "E190": 28.7, "E75L": 28.7,
+    "A319": 35.8, "A320": 35.8, "A20N": 35.8, "A321": 35.8, "A21N": 35.8,
+    "B737": 35.8, "B738": 35.9, "B39M": 35.9, "B752": 38.0,
+    "A332": 60.3, "A333": 60.3, "A339": 64.0, "A343": 60.3, "A359": 64.8, "A388": 79.8,
+    "B744": 64.4, "B763": 47.6, "B772": 60.9, "B77W": 64.8,
+    "B788": 60.1, "B789": 60.1, "B78X": 60.1,
 }
 
 # SimLink `aircraft_title` 的常见写法（MSFS 里的机型名）：只用于自动识别机型。
@@ -334,6 +339,25 @@ def build_aircraft_types(catalog_items: list[dict[str, Any]], now: str | None = 
         row["created_at"] = stamp
         rows.append(row)
     return rows
+
+
+def builtin_wingspans(catalog_items: list[dict[str, Any]] | None = None
+                      ) -> dict[tuple[str, str], float]:
+    """内置模板的翼展真值：(icao, variant) → 米（§38 P0 的同步与 P2 的「重置」共用）。
+
+    口径与 `build_aircraft_types()` 完全一致（覆盖表 → 目录 category 兜底），
+    所以「老库迁移后的值」与「新建库的值」必然相同。
+    """
+    items = [item for item in (catalog_items or []) if (item.get("icao") or "").strip()]
+    truth: dict[tuple[str, str], float] = {}
+    if items:
+        for row in build_aircraft_types(items):
+            truth[(str(row["icao"]).upper(), str(row["variant"]).upper())] = \
+                float(row["wingspan_m"] or 0)
+    # 目录里没有的机型（老库遗留/手工变体）用覆盖表兜底；STANDARD 变体优先
+    for icao, span in WINGSPAN_OVERRIDES.items():
+        truth.setdefault((icao.upper(), "STANDARD"), float(span))
+    return {key: value for key, value in truth.items() if value > 0}
 
 
 def _guess_category(item: dict[str, Any]) -> str:

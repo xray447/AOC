@@ -9,7 +9,9 @@ import { projectOnRunway } from "../components/RunwayTouchdown";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
 import type { AirportDetail, AirportRunway, FlightRecord, TrackData } from "../types";
-import { fmtAltitude, fmtDateTime, fmtDistance, fmtMinutes, fmtWeight, ratingLabels, statusLabels } from "../utils";
+import {
+  fmtAltitude, fmtDateTime, fmtDistance, fmtMinutes, fmtSignedKg, fmtWeight, ratingLabels, statusLabels,
+} from "../utils";
 
 const { Text } = Typography;
 
@@ -220,10 +222,9 @@ export function LogDetail() {
                       </Descriptions.Item>
                       <Descriptions.Item label={tr("实际 ZFW", "Actual ZFW")}>
                         {flight.actual_zfw_kg != null ? fmtWeight(flight.actual_zfw_kg, settings.units) : "—"}
+                        {/* §40：与执行页同一个来源、同一个格式化函数（±0.5 kg 归零，不出现 -0 kg） */}
                         {flight.zfw_delta_kg != null ? (
-                          <span className="muted">
-                            {" "}({flight.zfw_delta_kg > 0 ? "+" : ""}{Math.round(flight.zfw_delta_kg)} kg)
-                          </span>
+                          <span className="muted"> ({fmtSignedKg(flight.zfw_delta_kg)})</span>
                         ) : null}
                       </Descriptions.Item>
                       <Descriptions.Item label={tr("跑道数据", "Runway data")}>

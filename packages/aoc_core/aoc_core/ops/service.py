@@ -27,6 +27,7 @@ from .schema import ensure_schema
 from .specs import (
     PARAM_SCHEMA,
     build_aircraft_types,
+    builtin_wingspans,
     default_economy,
     default_policy,
     title_keywords,
@@ -77,6 +78,9 @@ LEDGER_TYPES = (
 )
 ACTIVE_TASK_KEY = "ops_active_task"
 NO_SHOW_KEY = "ops_no_show_count"
+# §38 P0：内置机型翼展一次性纠偏的标记（老库迁移后只跑一次，改口径时提升版本号）
+WINGSPAN_SYNC_KEY = "wingspan_sync"
+WINGSPAN_SYNC_VERSION = "v1"
 
 
 class OpsError(Exception):
@@ -189,6 +193,13 @@ def _actual_zfw(value: Any) -> float | None:
     return round(actual, 1) if actual > 0 else None
 
 
+# §40：实际 ZFW 与配载单的差异在 ±0.5 kg 内视为 0 —— SimLink 的 TotalWeight − FuelWeight
+# 是浮点求和，差 0.1–0.5 kg 很常见，直接显示会变成「-0 kg」，像少装了货。
+ZFW_DELTA_ZERO_KG = 0.5
+# 差异小于 1 kg 不报警（与 zfw_state 的 ±1 kg 同一阈值，避免「状态 ok + 少 0 kg」）
+ZFW_WARN_THRESHOLD_KG = 1.0
+
+
 def zfw_check(actual_zfw_kg: Any, planned_zfw_kg: Any) -> tuple[float | None, float | None, list[str]]:
     """实际 ZFW 与配载单比对：返回 (实际值, 差异, 警告)。偏低只提示，不阻断开始。"""
     actual = _actual_zfw(actual_zfw_kg)
@@ -201,8 +212,11 @@ def zfw_check(actual_zfw_kg: Any, planned_zfw_kg: Any) -> tuple[float | None, fl
     if not planned:
         return actual, None, []
     delta = round(actual - planned, 1)
+    # 浮点噪声归零：0.1–0.5 kg 的差不是真的偏差；同时把 round() 出来的 -0.0 折成 +0.0
+    if abs(delta) < ZFW_DELTA_ZERO_KG:
+        delta = 0.0
     warnings: list[str] = []
-    if delta < 0:
+    if delta <= -ZFW_WARN_THRESHOLD_KG:
         warnings.append(
             f"实际 ZFW {actual:.0f} kg 低于配载单 {planned:.0f} kg（少 {abs(delta):.0f} kg），"
             "可能漏装旅客/货物")
@@ -216,6 +230,8 @@ class OpsService:
         self.catalog = catalog
         self._tx_depth = 0
         self._expiring = False
+        # §38 P1：本轮抽班被跑道宽度/长度挡掉的航段数（只用于「无候选」原因提示）
+        self._runway_blocked = 0
         ensure_schema(db)
         self._seed_types()
         self._seed_profile()
@@ -284,12 +300,34 @@ class OpsService:
     # ------------------------------------------------------------------ 种子
     def _seed_types(self) -> None:
         row = self._one("select count(*) as n from aircraft_type")
-        if row and row["n"]:
-            return
         stamp = utcnow()
+        if not (row and row["n"]):
+            with self._tx() as con:
+                for item in build_aircraft_types(self.catalog.list(), stamp):
+                    self._insert_type(con, item)
+        self._sync_builtin_wingspans()
+
+    def _sync_builtin_wingspans(self) -> None:
+        """§38 P0：老库内置机型的 `wingspan_m` 是「按最短跑道兜底」的假值，按内置真值纠正一次。
+
+        `_seed_types` 用 `insert or ignore` + `UNIQUE(icao, variant)`，所以 §26 落地前建的库
+        （A359 被兜底成 52 m）永远不会被刷新 —— 抽班就会放行 52 m 翼展上限的窄跑道机场。
+        `CUSTOM` 行一律不动；`ops_meta` 记版本，只跑一次（P2 的「重置」可单行补救）。
+        """
+        if self._meta_get(WINGSPAN_SYNC_KEY) == WINGSPAN_SYNC_VERSION:
+            return
+        truth = builtin_wingspans(self.catalog.list())
         with self._tx() as con:
-            for item in build_aircraft_types(self.catalog.list(), stamp):
-                self._insert_type(con, item)
+            for (icao, variant), span in truth.items():
+                rows = con.execute(
+                    "select id, wingspan_m from aircraft_type where source='BUILTIN' "
+                    "and upper(icao)=? and upper(variant)=?", (icao, variant)).fetchall()
+                for existing in rows:
+                    if abs(float(existing["wingspan_m"] or 0) - span) < 1e-6:
+                        continue
+                    con.execute("update aircraft_type set wingspan_m=? where id=?",
+                                (span, existing["id"]))
+            self._meta_set(WINGSPAN_SYNC_KEY, WINGSPAN_SYNC_VERSION, con)
 
     def _insert_type(self, con, item: dict[str, Any]) -> str:
         type_id = item.get("id") or new_id()
@@ -673,6 +711,30 @@ class OpsService:
                  payload["fare_multiplier"], payload["lease_per_hour"], payload["title_keyword"],
                  type_id))
             self._audit(con, "AIRCRAFT_TYPE_UPDATE", "aircraft_type", type_id, before, payload)
+        return self.get_type(type_id) or {}
+
+    def reset_type_wingspan(self, type_id: str) -> dict[str, Any]:
+        """§38 P2：把内置机型的翼展按内置真值重置（内置行只读，玩家只能这样自救）。
+
+        与 P0 的一次性同步共用 `builtin_wingspans()`，写 `TYPE_WINGSPAN_FIX` 审计；
+        `CUSTOM` 机型本来就能直接编辑，这里拒绝，避免覆盖玩家自己的值。
+        """
+        before = self.get_type(type_id)
+        if not before:
+            raise OpsError("NOT_FOUND", "机型不存在")
+        if before["source"] != "BUILTIN":
+            raise OpsError("INVALID_STATE",
+                           "自定义机型可直接编辑翼展，不需要「重置为内置真值」",
+                           {"type_id": type_id})
+        truth = builtin_wingspans(self.catalog.list())
+        span = truth.get((str(before["icao"]).upper(), str(before["variant"]).upper()))
+        if span is None:
+            raise OpsError("NOT_FOUND", "这个机型没有内置翼展真值（目录与覆盖表都没有）",
+                           {"type_id": type_id})
+        with self._tx() as con:
+            con.execute("update aircraft_type set wingspan_m=? where id=?", (span, type_id))
+            self._audit(con, "TYPE_WINGSPAN_FIX", "aircraft_type", type_id,
+                        {"wingspan_m": before["wingspan_m"]}, {"wingspan_m": span})
         return self.get_type(type_id) or {}
 
     def delete_type(self, type_id: str) -> bool:
@@ -1264,6 +1326,8 @@ class OpsService:
                                                     list[dict[str, Any]]]:
         """按一份约束跑一遍抽班，返回 (可用飞机, 可用实例, 候选)。"""
         window_end = now + timedelta(hours=constraints["window_hours"])
+        # §38 P1：被目的地跑道长度/宽度挡掉的航段数（无候选时给 UI 一个具体原因）
+        self._runway_blocked = 0
         aircraft = [a for a in self.list_fleet()
                     if a["status"] == "ACTIVE" and not a.get("locked")]
         if constraints["base_airport"]:
@@ -1360,6 +1424,8 @@ class OpsService:
         max_leg = constraints["max_leg_block_minutes"]
         max_legs = constraints["max_legs"]
         excluded = excluded or set()
+        # §38 P1：与飞机同机型的班期也要过跑道长度/翼展；关掉开关回到旧行为
+        check_runway = bool(constraints.get("consider_wingspan", True))
         results: list[list[dict[str, Any]]] = []
 
         def walk(position: str, earliest: datetime, latest: datetime | None,
@@ -1386,6 +1452,10 @@ class OpsService:
                 if type_id and type_id != aircraft["type_id"]:
                     if not lenient_types or not self._can_operate(inst, ac_type):
                         continue
+                elif check_runway and not self._runway_operable(inst, ac_type):
+                    # §38 P1：班期挂的机型与飞机一致时旧逻辑直接放行，窄/短跑道永远拦不住
+                    self._runway_blocked += 1
+                    continue
                 block = self._instance_block(inst, ac_type)
                 # 每程航时区间（与「合计」max_block 是两个维度）
                 if block < min_leg or block > max_leg:
@@ -1534,7 +1604,9 @@ class OpsService:
         if constraints.get("exclude_military"):
             hints.append("已排除军用机场")
         if constraints.get("consider_wingspan"):
-            hints.append("已按跑道宽度过滤翼展")
+            blocked = int(getattr(self, "_runway_blocked", 0) or 0)
+            hints.append("已按跑道长度/宽度过滤翼展"
+                         + (f"（{blocked} 个航段的目的地跑道不够长/不够宽）" if blocked else ""))
         if constraints.get("min_total_block_minutes"):
             hints.append(f"合计航时需 ≥ {constraints['min_total_block_minutes']} min"
                          "（已放宽一次仍无候选）")
@@ -1543,8 +1615,8 @@ class OpsService:
                     + "，".join(hints))
         return "候选被每程航时区间/合计航时/过站时间挡掉了：试试放宽这些约束"
 
-    def _can_operate(self, inst: dict[str, Any], ac_type: dict[str, Any]) -> bool:
-        """机型替换是否可行：到达机场跑道够长够宽、距离在航程内（0.9 余量）。"""
+    def _runway_operable(self, inst: dict[str, Any], ac_type: dict[str, Any]) -> bool:
+        """到达机场跑道够长够宽（§26 / §38 P1）：机型替换与「遵循航线」同机型分支共用。"""
         arr_meta = eco.airport_meta(self.nav, inst.get("arr_icao"))
         runway = arr_meta.get("runway_m")
         min_runway = float(ac_type.get("min_runway_m") or 0)
@@ -1552,8 +1624,13 @@ class OpsService:
             return False
         wingspan = float(ac_type.get("wingspan_m") or 0)
         limit = arr_meta.get("max_wingspan_m")
-        if wingspan and limit is not None and wingspan > float(limit):
+        return not (wingspan and limit is not None and wingspan > float(limit))
+
+    def _can_operate(self, inst: dict[str, Any], ac_type: dict[str, Any]) -> bool:
+        """机型替换是否可行：到达机场跑道够长够宽、距离在航程内（0.9 余量）。"""
+        if not self._runway_operable(inst, ac_type):
             return False
+        arr_meta = eco.airport_meta(self.nav, inst.get("arr_icao"))
         route = self._one("select distance_nm from ops_route where id=?", (inst.get("route_id"),))
         distance = float((route or {}).get("distance_nm") or 0)
         if not distance:

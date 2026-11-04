@@ -16,9 +16,17 @@ import { simlinkState } from "../../simlink";
 import type {
   FlightStatus, OpsFreeFlight, OpsLoadSheet, OpsRoster, OpsSettlement, OpsTask,
 } from "../../types";
-import { fmtHms } from "../../utils";
+import { fmtHms, fmtSignedKg } from "../../utils";
 
 const LIVE_POLL_MS = 2000;
+
+/** §39 推出定稿来源的界面标签（preflight = 推出前的临时值）。 */
+const zfwSourceLabels: Record<string, { zh: string; en: string; color?: string }> = {
+  engine: { zh: "发动机启动", en: "engine start", color: "green" },
+  gs: { zh: "地速推出", en: "ground speed", color: "blue" },
+  start: { zh: "开录首帧", en: "first frame", color: "gold" },
+  preflight: { zh: "推出前临时值", en: "provisional", color: "default" },
+};
 
 function num(value: number | null | undefined, digits = 0): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
@@ -372,17 +380,27 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                       {num(flightStatus.actual_zfw_kg)} kg
                     </span>
                   : "—"}
-                {flightStatus?.zfw_source === "preflight"
-                  ? <Tag style={{ marginLeft: 6 }}>{tr("推出前临时值", "provisional")}</Tag>
-                  : null}
+                {zfwSourceLabels[flightStatus?.zfw_source || ""] ? (
+                  <Tag color={zfwSourceLabels[flightStatus?.zfw_source || ""].color} style={{ marginLeft: 6 }}>
+                    {tr(zfwSourceLabels[flightStatus?.zfw_source || ""].zh,
+                      zfwSourceLabels[flightStatus?.zfw_source || ""].en)}
+                  </Tag>
+                ) : null}
               </Descriptions.Item>
               <Descriptions.Item label={tr("配载单 ZFW", "Load sheet ZFW")}>
                 {num(flightStatus?.planned_zfw_kg ?? load?.zfw_kg)} kg
               </Descriptions.Item>
               <Descriptions.Item label={tr("差异", "Delta")}>
-                {flightStatus?.actual_zfw_kg != null && (flightStatus.planned_zfw_kg ?? load?.zfw_kg) != null
-                  ? `${num(flightStatus.actual_zfw_kg - Number(flightStatus.planned_zfw_kg ?? load?.zfw_kg ?? 0))} kg`
-                  : "—"}
+                {/* §40：差异用后端算好的值（±0.5 kg 归零、±1 kg 分档），格式化统一走 fmtSignedKg */}
+                {(() => {
+                  const planned = flightStatus?.planned_zfw_kg ?? load?.zfw_kg ?? null;
+                  const delta = flightStatus?.zfw_delta_kg
+                    ?? (flightStatus?.actual_zfw_kg != null && planned != null
+                      ? flightStatus.actual_zfw_kg - Number(planned) : null);
+                  if (delta == null) return "—";
+                  const short = (flightStatus?.zfw_state || (delta < -1 ? "short" : delta > 1 ? "over" : "ok"));
+                  return <span className={short === "short" ? "text-danger" : undefined}>{fmtSignedKg(delta)}</span>;
+                })()}
               </Descriptions.Item>
               <Descriptions.Item label={tr("实际滑出油量", "Fuel at pushback")}>
                 {num(flightStatus?.fuel_at_pushback ?? flightStatus?.fuel_weight_kg)} kg

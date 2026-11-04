@@ -430,6 +430,8 @@ class RecordingStatus(Model):
     # 推出后定稿的 ZFW / 油量（§32 方案 B）：未推出为 None
     zfw_at_pushback: float | None = None
     fuel_at_pushback: float | None = None
+    # 定稿来源（§39）：engine（发动机启动 10s）/ gs（地速 ≥ 5kt 连续 3s）/
+    # start（地面晚接入取开录首帧）。旧版 SimLink 只发 "pushback"，读端按 gs 的别名兼容。
     pushback_source: str | None = None
 
 

@@ -558,6 +558,11 @@ def create_app(config: CoreConfig) -> FastAPI:
         """修改自定义机型；内置（BUILTIN）只允许「复制为自定义」后再改。"""
         return service.ops.update_type(type_id, body)
 
+    @app.post("/local/ops/aircraft-types/{type_id}/reset-wingspan")
+    def ops_aircraft_type_reset_wingspan(type_id: str):
+        """§38 P2：内置机型翼展被兜底值写坏时，按内置真值重置单行（写 TYPE_WINGSPAN_FIX 审计）。"""
+        return service.ops.reset_type_wingspan(type_id)
+
     @app.delete("/local/ops/aircraft-types/{type_id}")
     def ops_aircraft_type_delete(type_id: str):
         return {"ok": service.ops.delete_type(type_id)}

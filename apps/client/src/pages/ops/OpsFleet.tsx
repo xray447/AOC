@@ -308,6 +308,19 @@ export function OpsFleet() {
     }
   };
 
+  /** §38 P2：内置机型翼展被兜底值写坏时，按内置真值重置（写审计 TYPE_WINGSPAN_FIX）。 */
+  const resetTypeWingspan = async (row: OpsAircraftType) => {
+    try {
+      const updated = await api<OpsAircraftType>(
+        `/local/ops/aircraft-types/${row.id}/reset-wingspan`, { method: "POST" });
+      await load();
+      message.success(tr(`翼展已按内置真值重置为 ${updated.wingspan_m} m`,
+        `Wingspan reset to ${updated.wingspan_m} m`));
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
+
   return (
     <div className="page">
       <div className="page-head">
@@ -444,6 +457,10 @@ export function OpsFleet() {
             },
             { title: tr("座位", "Seats"), dataIndex: "pax_capacity", width: 70 },
             {
+              title: tr("翼展", "Wingspan"), dataIndex: "wingspan_m", width: 84,
+              render: (v: number) => (v ? `${v.toFixed(1)} m` : "—"),
+            },
+            {
               title: "OEW / MTOW", key: "w", width: 140,
               render: (_: unknown, r: OpsAircraftType) =>
                 `${Math.round(r.oew_kg / 1000)}t / ${Math.round(r.mtow_kg / 1000)}t`,
@@ -475,6 +492,16 @@ export function OpsFleet() {
                     <Button size="small" onClick={() => openEditType(r)}>{tr("编辑", "Edit")}</Button>
                   ) : null}
                   <Button size="small" onClick={() => openCopyType(r)}>{tr("复制", "Copy")}</Button>
+                  {r.source !== "CUSTOM" ? (
+                    <Popconfirm
+                      title={tr("按内置真值重置翼展？", "Reset wingspan to the built-in value?")}
+                      description={tr("只改这一行，用于翼展被旧版兜底值写坏的情况。",
+                        "Only this row; for wingspans left wrong by older fallback values.")}
+                      onConfirm={() => void resetTypeWingspan(r)}
+                    >
+                      <Button size="small" type="text">{tr("重置翼展", "Reset span")}</Button>
+                    </Popconfirm>
+                  ) : null}
                   {r.source === "CUSTOM" ? (
                     <>
                       <Tooltip title={tr("停用后不再参与抽班/包机", "Disabled types are excluded from draws")}>

@@ -1129,6 +1129,129 @@ def test_aircraft_type_wingspan_defaults_and_validation(ops: PersonalService):
     assert generated["wingspan_m"] == pytest.approx(52.0)
 
 
+# --------------------------------------------------------- §38 抽班翼展规则
+def test_old_builtin_wingspan_is_synced_once(ops: PersonalService):
+    """§38 P0：§26 之前建的库被兜底成 52/60.3 m，起一次服务后按内置真值纠正；CUSTOM 不动。"""
+    assert _standard_type(ops, "A359")["wingspan_m"] == pytest.approx(64.8)
+    custom = ops.ops.create_type({**CUSTOM_TYPE, "icao": "XW3", "wingspan_m": 66.0})
+
+    # 模拟老库：兜底值写进内置行，且没有同步标记
+    with ops.ops._tx() as con:
+        con.execute("update aircraft_type set wingspan_m=52 where upper(icao)='A359'")
+        con.execute("update aircraft_type set wingspan_m=60.3 where upper(icao)='A388'")
+        con.execute("delete from ops_meta where key='wingspan_sync'")
+    ops.ops._seed_types()
+
+    assert _standard_type(ops, "A359")["wingspan_m"] == pytest.approx(64.8)
+    assert _standard_type(ops, "A388")["wingspan_m"] == pytest.approx(79.8)
+    assert ops.ops._meta_get("wingspan_sync") == "v1"
+    assert ops.ops.get_type(custom["id"])["wingspan_m"] == pytest.approx(66.0)
+
+    # 已同步过就不再覆盖（手工再改一次，重新起服务不会被抹掉）
+    with ops.ops._tx() as con:
+        con.execute("update aircraft_type set wingspan_m=52 where upper(icao)='A359'")
+    ops.ops._seed_types()
+    assert _standard_type(ops, "A359")["wingspan_m"] == pytest.approx(52.0)
+
+
+def test_reset_builtin_wingspan_restores_truth_and_audits(ops: PersonalService):
+    """§38 P2：内置行只读，但可以单行「重置为内置真值」（写 TYPE_WINGSPAN_FIX）。"""
+    a359 = _standard_type(ops, "A359")
+    with ops.ops._tx() as con:
+        con.execute("update aircraft_type set wingspan_m=52 where id=?", (a359["id"],))
+    fixed = ops.ops.reset_type_wingspan(a359["id"])
+    assert fixed["wingspan_m"] == pytest.approx(64.8)
+    assert any(a["action"] == "TYPE_WINGSPAN_FIX" for a in ops.ops.audit_log(20))
+
+    custom = ops.ops.create_type({**CUSTOM_TYPE, "icao": "XW4", "wingspan_m": 66.0})
+    with pytest.raises(OpsError) as exc:
+        ops.ops.reset_type_wingspan(custom["id"])
+    assert exc.value.code == "INVALID_STATE"
+
+
+def test_follow_routes_checks_destination_runway(tmp_path: Path, navdata_path: Path):
+    """§38 P1：班期机型与飞机一致时也要过目的地跑道宽度（旧逻辑直接放行）。"""
+    service = _flagged_ops(tmp_path, navdata_path, width_ft={"ZSNJ": 148.0})
+    a359 = _standard_type(service, "A359")
+    aircraft = {"id": "ac-a359", "type_id": a359["id"], "current_airport_icao": "ZBAA"}
+    now = datetime.now(timezone.utc)
+    dep = now + timedelta(minutes=60)
+    inst = {
+        "id": "inst-a359", "dep_icao": "ZBAA", "arr_icao": "ZSNJ",
+        "scheduled_dep_utc": dep.isoformat().replace("+00:00", "Z"),
+        "scheduled_arr_utc": (dep + timedelta(minutes=90)).isoformat().replace("+00:00", "Z"),
+        "aircraft_type_id": a359["id"], "route_id": None,
+    }
+    base = {"max_legs": 1, "max_block_minutes": 480, "min_total_block_minutes": 0,
+            "min_turnaround_min": 45, "max_turnaround_min": 360, "window_hours": 24,
+            "min_leg_block_minutes": 30, "max_leg_block_minutes": 480}
+    window_end = now + timedelta(hours=24)
+
+    service.ops._runway_blocked = 0
+    chains = service.ops._build_chains(
+        aircraft, a359, {"ZBAA": [inst]}, service.ops._constraints(base), now, window_end)
+    assert chains == [], "45 m 宽跑道（52 m 上限）拦不住 64.8 m 的 A359"
+    assert service.ops._runway_blocked == 1
+
+    off = service.ops._constraints({**base, "consider_wingspan": False})
+    assert service.ops._build_chains(aircraft, a359, {"ZBAA": [inst]}, off, now, window_end)
+
+    # 同一座 45 m 机场：35.9 m 的 B738 正常放行（不是把整条班期都砍掉）
+    b738 = _standard_type(service, "B738")
+    narrow = {"id": "ac-b738", "type_id": b738["id"], "current_airport_icao": "ZBAA"}
+    narrow_inst = {**inst, "aircraft_type_id": b738["id"]}
+    assert service.ops._build_chains(narrow, b738, {"ZBAA": [narrow_inst]},
+                                     service.ops._constraints(base), now, window_end)
+
+
+# --------------------------------------------------------- §40 ZFW 差异显示
+def test_zfw_check_zeroes_float_noise():
+    """§40：±0.5 kg 的浮点噪声归零（不报警、不显示 -0），真差异照旧提示。"""
+    from aoc_core.ops.service import zfw_check
+
+    assert zfw_check(149999.6, 150000) == (pytest.approx(149999.6), 0.0, [])
+    assert zfw_check(150000.4, 150000) == (pytest.approx(150000.4), 0.0, [])
+    # -0.0 要折成 +0.0（否则 JSON 里是 -0.0，前端会拼出 "-0 kg"）
+    assert str(zfw_check(150000, 150000)[1]) == "0.0"
+
+    actual, delta, warnings = zfw_check(145000, 150000)
+    assert delta == pytest.approx(-5000)
+    assert warnings and "少 5000 kg" in warnings[0]
+    _, delta, warnings = zfw_check(150300, 150000)
+    assert delta == pytest.approx(300) and warnings == []
+
+
+def test_flight_status_reports_normalized_zfw_delta(ops: PersonalService):
+    """§40：差异由后端给（与状态同一阈值），前端不再自己相减。"""
+    roster, _ = _confirm(ops)
+    flight_id = ops.ops.start_leg(roster["id"], 1)["task"]["flight_record_id"]
+    planned = float(ops.ops.load_sheet(flight_id)["zfw_kg"])
+    ops.flights.start(flight_id, "2026-10-20T00:00:00Z", manual=True)
+
+    ops.flights.zfw_at_pushback = planned - 0.4
+    ops.flights.pushback_source = "engine"
+    status = asyncio.run(ops.ops_flight_status())
+    assert status["zfw_delta_kg"] == pytest.approx(0.0)
+    assert status["zfw_state"] == "ok"
+    assert status["zfw_source"] == "engine"
+
+    ops.flights.zfw_at_pushback = planned - 5000
+    status = asyncio.run(ops.ops_flight_status())
+    assert status["zfw_delta_kg"] == pytest.approx(-5000)
+    assert status["zfw_state"] == "short"
+    ops.flights.stop(abort=True)
+
+
+def test_pushback_source_accepts_legacy_alias():
+    """§39：老版 SimLink 只发 "pushback"（地速触发），读端按 gs 兼容；未知值一律 None。"""
+    from aoc_core.service import _pushback_source
+
+    assert _pushback_source("pushback") == "gs"
+    assert _pushback_source("enginE") == "engine"
+    assert _pushback_source("start") == "start"
+    assert _pushback_source(None) is None and _pushback_source("nonsense") is None
+
+
 # --------------------------------------------------------- §24 候选多样性
 def test_candidate_score_no_longer_favours_one_long_loss_leg():
     """478 min 单段亏钱航线不应压过 464 min 三段链（旧口径下的实测现象）。"""

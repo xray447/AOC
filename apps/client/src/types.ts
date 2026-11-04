@@ -743,7 +743,10 @@ export interface FlightStatus {
   planned_zfw_kg: number | null;
   planned_fuel_kg: number | null;
   fuel_at_pushback: number | null;
-  zfw_source: "preflight" | "pushback" | "start" | null;
+  /** §40：实际 − 计划，后端已归一（±0.5 kg 内为 0），前端只负责显示。 */
+  zfw_delta_kg: number | null;
+  /** 定稿来源（§39）：engine（发动机启动）/ gs（地速）/ start（地面晚接入）/ preflight（临时值）。 */
+  zfw_source: "preflight" | "engine" | "gs" | "start" | null;
   zfw_state: "ok" | "short" | "over" | "unknown";
   /** 推出时仍偏低：只推一次（按 zfw_warning_seq 去重）。 */
   zfw_warnings: string[];

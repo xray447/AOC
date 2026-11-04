@@ -198,7 +198,9 @@ def test_ops_flight_status_and_free_airports(app_client):
     status = app_client.get("/local/ops/flight-status").json()
     assert status["available"] is False
     for key in ("gs_kt", "ias_kt", "alt_ft", "agl_ft", "lat", "lon", "vs_fpm", "phase",
-                "remaining_nm", "ete_min", "eta_utc", "actual_zfw_kg"):
+                "remaining_nm", "ete_min", "eta_utc", "actual_zfw_kg",
+                # §40：差异由后端给，前端只显示
+                "zfw_delta_kg", "zfw_state", "zfw_source"):
         assert key in status
     airports = app_client.get("/local/ops/free-flights/airports").json()["items"]
     assert isinstance(airports, list)

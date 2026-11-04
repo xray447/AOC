@@ -91,7 +91,9 @@ public sealed class RecordingInfo
     /// <summary>推出那一刻的燃油（kg）。</summary>
     [JsonPropertyName("fuel_at_pushback")] public double? FuelAtPushback { get; set; }
     [JsonPropertyName("pushback_utc")] public string? PushbackUtc { get; set; }
-    /// <summary>pushback（真推出）/ start（地面晚接入，取开录首帧）/ null。</summary>
+    /// <summary>
+    /// engine（发动机启动 10s，§39）/ gs（地速 ≥ 5kt 连续 3s，旧值 pushback）/ start（地面晚接入取开录首帧）/ null。
+    /// </summary>
     [JsonPropertyName("pushback_source")] public string? PushbackSource { get; set; }
 }
 

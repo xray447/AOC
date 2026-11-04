@@ -1,8 +1,8 @@
 # TODO
 
-> 状态（2026-11-02）：代码侧的条目（§31–§36）**全部实现**，当前没有待开发项；
-> `pytest` / `ruff F,E9` / `tsc --noEmit` / `dotnet build` 全绿。
-> 剩下的事都只能**在真机上做**：干净 Windows 安装验收、MSFS 2024 实机复测、低配机性能复核 —— 见「一、待办」。
+> 状态（2026-11-04）：§31–§40 **全部实现**。本批新增 §38（抽班翼展三处漏洞）、§39（发动机启动即视为推出）、§40（ZFW 差异显示 `-0 kg`），见「五、已完成 · 2026-11-04」。
+> 其余事项只能**在真机上做**：干净 Windows 安装验收、MSFS 2024 实机复测（§39 的 engine 判据要实机验证）、低配机性能复核 —— 见「一、待办」1.1–1.3。
+> `pytest`（172 项）/ `ruff F,E9` / `tsc --noEmit` + `npm run build` / `dotnet build` 全绿。§37 是 CI 维护项（Node 20 → 26），不是功能项。
 >
 > 约定：`§编号`沿用历史编号，不重排（文档、提交记录和历史对话都在引用）；新条目接在最后一个编号之后。
 > 每条实现记录包含「落地（改了什么）」+「背景（为什么/怎么发现的）」+「关联」，实测数据集中在附录 B。
@@ -11,10 +11,11 @@
 
 | 章节 | 内容 |
 |---|---|
-| 一、待办 | 人工验收 / 实机复测 / 性能复核 / 遗留小项 |
-| 二、已完成 · 2026-11-02 | §31–§36（收尾批次：幽灵机、合计航时、推出定稿、SimBrief 单位、快速调机、场景库跑道） |
+| 一、待办 | 人工验收 / 实机复测 / 性能复核 / §36 遗留小项 |
+| 二、已完成 · 2026-11-02 ~ 11-03 | §31–§37（收尾批次：幽灵机、合计航时、推出定稿、SimBrief 单位、快速调机、场景库跑道、CI Node 升级） |
 | 三、已完成 · 2026-10-30 | §23–§30（功能改进） |
 | 四、已完成 · 2026-10-24 及更早 | §1–§22（含性能修复 D-26/D-27） |
+| 五、已完成 · 2026-11-04 | §38–§40（翼展真值同步 / 遵循航线查跑道、发动机启动即推出、ZFW 差异归一） |
 | 附录 A | 决策记录 D-1～D-7 |
 | 附录 B | 验证记录 V-1～V-5（含探针工具） |
 
@@ -53,12 +54,19 @@
 - [ ] **§35 收口**：`OpsService.update_aircraft` 仍允许直接改 `current_airport_icao`（免费瞬移、无费用无审计）。建议移出可写字段，或要求 `force=true` 并写 `AIRCRAFT_FIX_POSITION` 审计。
 - [ ] **§32 边界**：推出后再改配载（罕见）不覆盖记录值；`|Δ| > 1000 kg` 时补 `zfw_changed_after_pushback` 事件供人工核对 —— 未实现。
 
+### 1.5 §38 / §39 / §40 已落地（2026-11-04）
+
+> 实现记录见「五、已完成 · 2026-11-04」；只剩实机复测与可选的阈值语义调整：
+> - [ ] **§39 实机复测**：冷舱点火 10s 内 `zfw_at_pushback` / `pushback_source=engine`；拖车（GS <5kt）也能定稿；中途接入仍是 `start`。并入 1.2。
+> - [ ] **翼展上限阈值（先不动）**：`WINGSPAN_BY_WIDTH = (<45 → 36, <60 → 52, ≥60 → 80)`，CYXY 45.1 m 落在「52 m」档；而 ICAO 代码 E 的跑道标准宽度本就是 45 m（对应 52–65 m 翼展），即本规则把 45 m 跑道按 D 类处理。要放宽到「≥45 → 65」需先定清语义是「场道等级」还是「滑行道/停机位约束」，本次按保守值保留。
+
 ---
 
-## 二、已完成 · 2026-11-02（§31–§36）
+## 二、已完成 · 2026-11-02 ~ 2026-11-03（§31–§37）
 
 > 本批按「止血 → 协议 → 小改 → 新功能 → 大改」排序落地：§33（P0 假起降）→ §34（抽班下限）→ §32（推出定稿）→ §31（单位换算）→ §35（快速调机）→ §36（场景库跑道）。
 > 测试：`pytest` 166 项、`ruff F,E9`、`tsc --noEmit`、`dotnet build` 全绿。
+> §37（2026-11-03 追加）不是功能项，是 CI 运行时维护（Node 20 → 26）。
 
 ### 31. SimBrief `manualzfw` 换算错误（单位是「吨」不是千磅）
 
@@ -125,6 +133,15 @@
 - **路线（D-7 改判）**：V-3 证明 SimConnect 设施 API 存在但字段名需官方 `FacilityDataDefinitionFlightsim.csv`（猜的名字全 `DATA_ERROR(20)`），而 LNM 从场景扫出的 msfs24 库 WMKN 正好 10,041 ft = 3060.5 m、入口与 navigraph 差 ~2.2 km → **场景库优先**，缺失回落 navdata，SimConnect 降为后续可选。兜底 C（手工覆盖表）见「1.4 遗留小项」。
 - **测试**：`tests/test_landing.py::test_scenery_runway_geometry_preferred` / `::test_runway_data_source_navdata_ignores_scenery` / `::test_landing_metrics_carry_runway_source_and_length`。
 - **关联**：§7（接地区俯视图）、§9（内移入口）、§16（跑道标志/宽度）、§26（跑道宽度→翼展）、`aoc_navdata/navdata.py::_load_runways_for/_runway_length_m/find_runway`、`aoc_core/landing.py`。
+
+### 37. CI 的 Node 停在 20（已升到最新 LTS 26）
+
+- **落地**：`.github/workflows/build.yml` 三处 `actions/setup-node` 的 `node-version` 由 `"20"` 改为 `"26"`（`test` / `app` / `portable` 作业；`test` 处留注释说明）；`docs/08` §4.7 的 `test` 作业说明补「Node 26（`setup-node`，LTS）」。前端代码零改动（Vite 6 / `@tauri-apps/cli` 2.x / TS 5.7 对 Node 26 无兼容问题）。
+- **背景**：Node 20（Iron）已于 **2026-04** 结束 LTS 维护（末版 v20.20.2 / 2026-03-24），CI 还在用一个不再收安全更新的运行时打包产物；本机开发环境 Node 22 与 CI 也不一致，容易出现「本地过、CI 挂」。当前最新 **LTS 是 26（Lithium，2026-10-28 发布，v26.13.0）**，27 仍是 alpha。
+- **取舍（D-8）**：选**最新 LTS 26**而不是 Current/alpha —— CI 要可复现、不追 nightly；同时不做「锁到 26.x.y 精确补丁」，`setup-node` 用 `"26"` 取该分支最新补丁。
+- **待观察**：Node 26 首次上 CI 若出现原生依赖/打包差异，按「大版本升级」流程回退 24 或加 `engines` 约束（`apps/client/package.json` 目前**未声明** `engines`，本地 Node 22 仍可构建，所以暂不锁死下限）。
+- **验证**：本地 Node v22.19.0 下 `npm run build`（`tsc --noEmit` + `vite build`）通过（3057 modules / 8.36s）；Node 26 的实跑结果待 CI 首跑确认。
+- **关联**：`docs/08` §4.7（CI 构建）、`apps/client/package.json`（Vite 6 / Tauri CLI 2）。
 
 ---
 
@@ -364,7 +381,46 @@
 
 ---
 
-## 附录 A. 决策记录（2026-11-02 已拍板）
+## 五、已完成 · 2026-11-04（§38–§40）
+
+> 三件事都是「规则/判据在跑，但输入漏了」：§38 数据 + 覆盖范围、§39 触发输入、§40 两套算法口径。
+> 测试：`pytest` 172 项、`ruff F,E9`、`tsc --noEmit` + `npm run build`、`dotnet build` 全绿。
+
+### 38. 抽班翼展规则的三处漏洞（CYXY 放行 A359）
+
+- **背景**：A359 抽班（`follow_routes=false`、`consider_wingspan=true`）出现 CYXY（最长跑道 2895.6 m ≥ `min_runway_m` 2400 不拦、宽 45.1 m → 上限 52 m）。规则代码在跑，根因是**老库数据没刷新** + **遵循航线分支没校验**。
+- **落地**：
+  1. **P0 老库翼展同步**：`specs.builtin_wingspans()` 与 `build_aircraft_types()` 同源给真值；`_seed_types()` 末尾调 `_sync_builtin_wingspans()`，只覆盖 `source='BUILTIN'` 的行（`CUSTOM` 不动），`ops_meta.wingspan_sync=v1` 只跑一次（改口径时提升版本号即可重跑）。同时把 `WINGSPAN_OVERRIDES` 补全到目录里全部机型（B763 47.6 / B772 60.9 / B78X 60.1 / A339 64.0 / B744 64.4、A20N/A21N/B737 35.8、CRJ7/E170/E75L/DH8D/SF34 与公务机…），新建库的 wide 兜底 65 m 也不再误伤 767。
+  2. **P1 遵循航线也查跑道**：抽出 `_runway_operable()`（到达跑道够长 + 翼展 ≤ `max_wingspan_m`），`_can_operate()`（机型替换，另含航程）复用它；`_build_chains()` 在「班期机型 == 飞机机型」分支也调它（受 `consider_wingspan` 控制，关掉回旧行为），被挡的航段计入 `_runway_blocked`，`_no_candidate_reason()` 显示「N 个航段的目的地跑道不够长/不够宽」。放宽阶梯仍只放开航时，不放开翼展/跑道。
+  3. **P2 重置入口**：`OpsService.reset_type_wingspan()` + `POST /local/ops/aircraft-types/{id}/reset-wingspan`（写审计 `TYPE_WINGSPAN_FIX`；`CUSTOM` 本来就能直接编辑，这里返回 `INVALID_STATE`），机型模板抽屉加「翼展」列与「重置翼展」按钮 —— 内置行仍只读（选方案 ②，不需要额外的 `wingspan_source` 字段）。
+- **测试**：`tests/test_ops.py::test_old_builtin_wingspan_is_synced_once`（模拟老库 52/60.3 → 64.8/79.8，`CUSTOM` 不动，已同步不再覆盖）、`::test_reset_builtin_wingspan_restores_truth_and_audits`、`::test_follow_routes_checks_destination_runway`（A359 + 45 m 跑道抽不到、B738 正常、关掉开关回旧行为）；§26 的 `test_draw_respects_runway_width_for_wingspan` / `test_missing_width_column_means_no_limit` 仍绿。
+- **关联**：§26（翼展/跑道宽度）、§36（场景库跑道影响 `max_wingspan_m`）、§23（同一处军用机场过滤）、§34（放宽阶梯）、`ops/specs.py::builtin_wingspans/WINGSPAN_OVERRIDES`、`ops/service.py::_sync_builtin_wingspans/_seed_types/_runway_operable/_build_chains/_no_candidate_reason`。
+
+### 39. 发动机启动即视为「已推出」
+
+- **落地（`apps/simlink/Engine.cs`）**：
+  1. `TrackPushback()` 拆成「判据 + 定稿」：第一判据是**发动机启动上升沿**满 `AutoStartHoldS`（10s）且 `OnGround && !_hasTakeoff` → `pushback_source=engine`；地速分支（GS ≥ 5kt 连续 3s）保留为兜底 → `pushback_source=gs`（旧值 `pushback` 由 core 的 `_pushback_source()` 按别名映射到 `gs`）。
+  2. 定稿语义不变（`FinalizePushback()`）：近 5 帧中位数、相邻帧跳变 >10% 重新起表、`_pushbackZfw != null` 后不再覆盖；`pushback` 事件加 `source`。
+  3. 只认上升沿：`OnConnectionChanged()` 重新点亮的是「接入时就在转」（`_engineOnFromConnect`），进程第一帧就看到发动机在转同样按接入处理；瞬移重置也把该标记置成当前状态 —— 这几种都不产生 `engine` 快照，仍走 `start` / `gs`。
+  4. 开录不再清 `_engineOnSince`（自动开录本身就是「发动机运转 10s」触发的，清掉的话 engine 分支永远等不到）；每段录制仍在 `StartRecording` 清 `_pushback*`，`StopLocked` / 瞬移照旧清空。
+  5. 协议/展示：`pushback_source` 枚举写清 `engine|gs|start`（`aoc_protocol/schemas.py`），`/local/ops/flight-status` 的 `zfw_source` 透传，执行页「实际 ZFW（推出后定稿）」按来源打标签（发动机启动 / 地速推出 / 开录首帧 / 推出前临时值）。
+- **风险（已知并保留）**：怠速等货先点火 → 定稿值偏低，靠 10% 跳变重起表缓解；快照落定后再装货不会更新。
+- **测试**：`tests/test_ops.py::test_pushback_source_accepts_legacy_alias`（老值别名）；`dotnet build` 通过。实机五项验收见 1.5。
+- **关联**：§27（自动开录同一条沿）、§32（推出定稿只换触发输入）、§33（位置闸 / 瞬移重置 / 重连点亮发动机）、V-5、`aoc_core/service.py::_pushback_source/flight_status`。
+
+### 40. 实际 ZFW 与配载单一致时显示「-0 kg」
+
+- **落地**：
+  1. `ops/service.py::zfw_check()` 归一化：`abs(delta) < 0.5 kg` 直接归 `0.0`（`round(x, 1)` 出来的 `-0.0` 一并折成 `+0.0`），且 `delta > -1 kg` 不再发「偏低」警告（与 `zfw_state` 的 ±1 kg 同一阈值）。
+  2. `/local/ops/flight-status` 新增 `zfw_delta_kg`，与 `zfw_state` 用同一个 `zfw_check()` 算；前端不再自己相减。
+  3. 前端 `utils.ts::fmtSignedKg(delta, digits=0)`：按显示精度先归零，输出 `0 kg` / `+300 kg` / `-5,000 kg`，永不出现 `-0`。执行页「差异」与日志详情「实际 ZFW（…）」都走它。
+- **背景**：执行页原来自己算 `num(actual - planned)`，`toLocaleString` 把 -0.4 舍成 `"-0"`；后端同一份数据判 `ok`，两边口径不一致。差异本身来自 SimLink `TotalWeight − FuelWeight` 的浮点求和（0.1–0.5 kg）。
+- **测试**：`tests/test_ops.py::test_zfw_check_zeroes_float_noise`、`::test_flight_status_reports_normalized_zfw_delta`（±0.4 → `0 kg`/`ok`，-5000 → `short`）、`tests/test_api.py::test_ops_flight_status_and_free_airports` 断言新字段；`tsc --noEmit` + `npm run build` 通过。
+- **关联**：§32、C-08（推出前只提示不阻断）、`apps/client/src/pages/ops/OpsExecute.tsx`、`apps/client/src/pages/LogDetail.tsx`、`aoc_core/ops/service.py::zfw_check`、`aoc_core/service.py::flight_status`。
+
+---
+
+## 附录 A. 决策记录（2026-11-02 已拍板；D-8 于 2026-11-03 追加）
 
 | 编号 | 议题 | 结论 |
 |---|---|---|
@@ -375,6 +431,7 @@
 | D-5 | §32 方案 B 参数 | `GS ≥ 5kt` 连续 3s、5 帧中位数、跳变 >10% 继续等；`POST /local/recording/start` **彻底移除** `actual_zfw_kg`（单一来源） |
 | D-6 | §35 快速调机参数 | 允许透支（不拦负余额）；`fast_ferry_hold` 默认关；`fast_ferry_fee_per_nm = 12.0`、`fast_ferry_fixed_fee = 1000.0`（运营规则页可改） |
 | D-7 | §36 数据源路线 | **场景库优先**（按 V-3 改判）：跑道几何取 Little Navmap 的 `little_navmap_msfs24.sqlite`，缺失回落 navdata，手工覆盖表兜底（未做，见 1.4）；SimConnect facility 降为后续可选 |
+| D-8 | §37 CI 的 Node 版本 | 升到**最新 LTS 26**（Lithium）；不用 Current/alpha，不锁精确补丁（`setup-node` 用 `"26"`）；Node 20 已 EOL |
 
 ---
 

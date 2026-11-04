@@ -98,6 +98,21 @@ export function fmtWeight(kg?: number | null, units?: Settings["units"]): string
   return `${Math.round(kg)} kg`;
 }
 
+/**
+ * 带符号的重量差异（执行页「差异」/ 日志详情「实际 ZFW（…）」共用，§40）。
+ *
+ * 先按显示精度归零再取符号：`toLocaleString` 会把 -0.4 舍成 "-0"，看起来像少装了货。
+ * 输出 `0 kg` / `+120 kg` / `-5,000 kg`，永远不会出现 `-0`。
+ */
+export function fmtSignedKg(delta?: number | null, digits = 0): string {
+  if (delta === null || delta === undefined || Number.isNaN(delta)) return "—";
+  const step = 10 ** -Math.max(0, digits);
+  const value = Math.abs(delta) < step / 2 ? 0 : delta;
+  // 0 统一输出「0 kg」（避免 -0 / "-0"）；负数的减号交给 toLocaleString
+  const text = value === 0 ? "0" : value.toLocaleString(undefined, { maximumFractionDigits: digits });
+  return `${value > 0 ? "+" : ""}${text} kg`;
+}
+
 export const ratingLabels: Record<string, { zh: string; en: string; color: string }> = {
   GREAT: { zh: "优秀", en: "Great", color: "success" },
   GOOD: { zh: "良好", en: "Good", color: "cyan" },

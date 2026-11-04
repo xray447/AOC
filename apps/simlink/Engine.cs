@@ -28,6 +28,10 @@ public sealed class Engine : IDisposable
     private const double PushbackGsKt = 5.0;
     private const double PushbackHoldS = 3.0;
     private const int PushbackMedianFrames = 5;
+    /// <summary>§39：地速兜底判据的来源标记（旧版只有 "pushback"，读端按别名兼容）。</summary>
+    private const string PushbackSourceGs = "gs";
+    private const string PushbackSourceEngine = "engine";
+    private const string PushbackSourceStart = "start";
 
     private readonly ISimSource _source;
     private readonly string _queueRoot;
@@ -52,6 +56,11 @@ public sealed class Engine : IDisposable
     private double? _airborneSince;
     // 自动开录/收尾的计时器（§27/§30）：停稳与滑行必须分开计，不能用「接地后」当「停稳」
     private double? _engineOnSince;
+    /// <summary>
+    /// §39：`_engineOnSince` 是「接入时发动机已在转」重新点亮的（§33 / V-1 的修复），
+    /// 不是真的启动上升沿 —— 这种不能算作推出，仍走 source=start / gs。
+    /// </summary>
+    private bool _engineOnFromConnect;
     private double? _taxiSince;
     private double? _stoppedSince;
     private double? _parkingBrakeSince;
@@ -218,8 +227,9 @@ public sealed class Engine : IDisposable
             _nextSampleT = 0;
             _recording = true;
             _engineOffSince = null;
-            // 开录后重新计时，避免同一个「已满足条件」的计时器反复触发
-            _engineOnSince = null;
+            // 开录后重新计时，避免同一个「已满足条件」的计时器反复触发。
+            // §39 例外：发动机启动时刻要留着 —— 它就是「推出」的第一判据（自动开录本身就是
+            // 发动机运转 10s 触发的，清掉的话 engine 分支永远等不到）。
             _taxiSince = null;
             _stoppedSince = null;
             _parkingBrakeSince = null;
@@ -239,7 +249,7 @@ public sealed class Engine : IDisposable
                 _pushbackZfw = foot.TotalWeightKg - foot.FuelWeightKg;
                 _pushbackFuel = foot.FuelWeightKg;
                 _pushbackAt = _startedAt;
-                _pushbackSource = "start";
+                _pushbackSource = PushbackSourceStart;
             }
             if (_landed)
             {
@@ -293,6 +303,7 @@ public sealed class Engine : IDisposable
         if (!_recording) return Status();
         _recording = false;
         _engineOnSince = null;
+        _engineOnFromConnect = false;
         _taxiSince = null;
         _stoppedSince = null;
         _parkingBrakeSince = null;
@@ -347,6 +358,8 @@ public sealed class Engine : IDisposable
             _phase = "PREFLIGHT";
             // 重连时发动机若仍在转，重新点亮自动开录计时（否则永远等不到新的启动沿）
             _engineOnSince = connected && _engineRunning ? (_prevFrame?.T ?? 0) : null;
+            // §39：这是「接入时就在转」，不是刚启动 —— 不能算作推出（否则中途接入会立刻定稿）
+            _engineOnFromConnect = _engineOnSince != null;
         }
     }
 
@@ -431,6 +444,8 @@ public sealed class Engine : IDisposable
         _pushbackAt = null;
         _pushbackSource = null;
         _recent.Clear();
+        // §39：瞬移后发动机本来就在转，不算新的启动沿（仍走 start / gs），避免跨航段污染
+        _engineOnFromConnect = _engineRunning;
         if (recording)
         {
             AddEvent(Math.Max(0, s.T - _recStartT), "teleport", new()
@@ -441,14 +456,24 @@ public sealed class Engine : IDisposable
     }
 
     /// <summary>
-    /// 推出判定（§32 方案 B / V-5）：`GS ≥ 5kt` 连续 3s 后取最近 5 帧的 ZFW 与油量中位数，
+    /// 推出判定（§32 方案 B / V-5，§39 改判据）：
+    /// ① 发动机启动上升沿起算 `AutoStartHoldS`（10s）就算推出 —— 拖车推出 GS 常 &lt; 5kt；
+    /// ② 兜底：`GS ≥ 5kt` 连续 3s。两条都取最近 5 帧的 ZFW 与油量中位数，
     /// 相邻帧跳变 &gt; 10% 就继续等稳定；只在「地面且未起飞」时计时，空中接入不参与。
     /// </summary>
     private void TrackPushback(Sample s)
     {
-        if (_pushbackZfw != null || _hasTakeoff || !s.OnGround)
+        if (_pushbackZfw != null) return;
+        if (_hasTakeoff || !s.OnGround)
         {
-            if (!s.OnGround || _hasTakeoff) _pushbackSince = null;
+            _pushbackSince = null;
+            return;
+        }
+        // 第一判据（§39）：只认真正的启动上升沿；「接入时就在转」走 start / gs
+        if (!_engineOnFromConnect && _engineOnSince != null
+            && s.T - _engineOnSince >= AutoStartHoldS)
+        {
+            FinalizePushback(s, PushbackSourceEngine);
             return;
         }
         if (s.GsKt < PushbackGsKt)
@@ -459,6 +484,15 @@ public sealed class Engine : IDisposable
         _pushbackSince ??= s.T;
         // 候选帧起表，等 t - since ≥ 3s 再取值（V-5：不能用「3s 窗口内全满足」，实测帧间隔 0.98–2.0s）
         if (s.T - _pushbackSince < PushbackHoldS) return;
+        FinalizePushback(s, PushbackSourceGs);
+    }
+
+    /// <summary>
+    /// 定稿 ZFW / 油量（§32 语义不变，只是触发输入多了一条）：
+    /// 取近 5 帧中位数；相邻帧跳变 &gt; 10% 视为还在装货/加油，重新起表再等。
+    /// </summary>
+    private void FinalizePushback(Sample s, string source)
+    {
         var frames = _recent.Where(f => f.OnGround).ToList();
         if (frames.Count == 0) return;
         var zfws = frames.Select(f => f.TotalWeightKg - f.FuelWeightKg).ToList();
@@ -475,7 +509,7 @@ public sealed class Engine : IDisposable
         _pushbackZfw = zfw;
         _pushbackFuel = Median(frames.Select(f => f.FuelWeightKg).ToList());
         _pushbackAt = TimeUtil.Iso(DateTime.UtcNow);
-        _pushbackSource = "pushback";
+        _pushbackSource = source;
         if (_recording)
         {
             AddEvent(Math.Max(0, s.T - _recStartT), "pushback", new()
@@ -483,6 +517,7 @@ public sealed class Engine : IDisposable
                 ["zfw_kg"] = Math.Round(zfw, 1),
                 ["fuel_kg"] = Math.Round(_pushbackFuel ?? 0, 1),
                 ["gs_kt"] = s.GsKt,
+                ["source"] = source,
             });
         }
     }
@@ -630,8 +665,12 @@ public sealed class Engine : IDisposable
             if (!_engineRunning)
             {
                 _engineRunning = true;
-                // 新的发动机启动：自动开录从这一刻起算（§27），发动机计时也从零开始
+                // 新的发动机启动：自动开录从这一刻起算（§27），发动机计时也从零开始；
+                // §39：真正的启动上升沿 —— 10s 后就算「已推出」。
+                // 例外：进程的第一帧就看到发动机在转 = 中途接入（SimLink 连上时已在转），
+                // 不能算推出，否则「中途接入」会被当成刚推出（验收④）。
                 _engineOnSince = s.T;
+                _engineOnFromConnect = _prevFrame == null;
                 _engineSeconds = 0;
                 _engineEstimated = fallbackRunning && !rpmRunning;
                 if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_start", new());
@@ -647,6 +686,7 @@ public sealed class Engine : IDisposable
         _engineRunning = false;
         _engineOffSince = null;
         _engineOnSince = null;
+        _engineOnFromConnect = false;
         if (_recording) AddEvent(Math.Max(0, s.T - _recStartT), "engine_stop", new());
     }
 
