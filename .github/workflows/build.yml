@@ -67,7 +67,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "26" # 当前 LTS（Lithium）；Node 20 已 EOL（2026-04）
           cache: npm
           cache-dependency-path: apps/client/package-lock.json
 
@@ -164,7 +164,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "26"
           cache: npm
           cache-dependency-path: apps/client/package-lock.json
 
@@ -217,7 +217,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "26"
           cache: npm
           cache-dependency-path: apps/client/package-lock.json
 

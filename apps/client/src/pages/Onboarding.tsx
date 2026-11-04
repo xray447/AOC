@@ -91,8 +91,8 @@ export function Onboarding({ open, onClose, onDone }: Props) {
         <div className="wizard-navdata">
           <Paragraph className="muted" style={{ margin: 0 }}>
             {tr(
-              "AOC 不随包分发导航数据。请选择本机 Little Navmap / Navigraph 的 SQLite（AIRAC 版本会自动识别）；不提供也能记录飞行，但航路生成会直接给 SimBrief。",
-              "AOC does not bundle navdata. Point to your Little Navmap / Navigraph SQLite (AIRAC is detected). Without it you can still record flights, but route generation falls back to SimBrief.",
+              "AOC 不随包分发导航数据。请选择本机 Navigraph 的 Little Navmap 的 SQLite（AIRAC 版本会自动识别），如果没有，请自行获得，只需要navigraph的数据库就行，不需要安装Little Navmap；不提供也能记录飞行，但航路生成会直接给 SimBrief。",
+              "AOC does not bundle navdata. Point to your Little Navmap 's Navigraph SQLite (AIRAC is detected), get it by yourself. Without it you can still record flights, but route generation falls back to SimBrief.",
             )}
           </Paragraph>
           <Input
