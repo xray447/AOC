@@ -9,6 +9,7 @@ import { api } from "../../api";
 import { AirportMultiSelect } from "../../components/AirportMultiSelect";
 import { AirportSelect } from "../../components/AirportSelect";
 import { SimBriefButton } from "../../components/SimBriefButton";
+import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { fmtBlock, fmtUtc, legStatus, money, rosterStatus } from "../../ops";
 import type { OpsAircraftType, OpsCandidate, OpsDrawResult, OpsRoster } from "../../types";
@@ -39,6 +40,7 @@ const DEFAULTS = {
 export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
   const navigate = useNavigate();
+  const { recording } = useApp();
   const [roster, setRoster] = useState<OpsRoster | null>(null);
   const [draw, setDraw] = useState<OpsDrawResult | null>(null);
   const [types, setTypes] = useState<OpsAircraftType[]>([]);
@@ -116,9 +118,30 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
 
   const startLeg = async (sequence: number) => {
     if (!roster) return;
+    // §41：SimLink 自动开录可能已经建了一条无主记录，开始本段会把它改绑过来 —— 先说清楚
+    if (recording.active) {
+      const ok = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: tr("已经在录制中", "A recording is already running"),
+          content: tr(
+            "检测到 SimLink 已在录制（自动开录）。开始本段后，这条记录会改绑到本航段，"
+            + "包含起飞前已录制的部分；若这条记录属于别的任务，请先结束它。",
+            "SimLink is already recording (auto start). Starting the leg will bind that recording "
+            + "to this leg, including the part recorded before you started it. If it belongs to "
+            + "another task, stop it first."),
+          okText: tr("改绑并开始本段", "Bind & start leg"),
+          cancelText: tr("返回", "Back"),
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!ok) return;
+    }
     setBusy(true);
     try {
-      await api(`/local/ops/rosters/${roster.id}/legs/${sequence}/start`, { method: "POST" });
+      const res = await api<{ warnings?: string[] }>(
+        `/local/ops/rosters/${roster.id}/legs/${sequence}/start`, { method: "POST" });
+      (res.warnings || []).forEach((w) => message.warning(w));
       message.success(tr("航段已开始，配载已固化", "Leg started, load sheet frozen"));
       navigate("/ops/execute");
     } catch (e) {

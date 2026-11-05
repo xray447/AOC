@@ -1443,3 +1443,75 @@ def test_virtual_flight_number_skips_existing_and_falls_back(ops: PersonalServic
         fallback = ops.ops._virtual_flight_number(con, "OVO", dep)
     assert fallback.startswith("OVO") and len(fallback) > 3
     assert re.fullmatch(r"OVO[A-Z0-9]{3}", fallback)
+
+
+# --------------------------------------------------------- §41 录制与任务错序
+def _auto_recording(service: PersonalService, flight_id: str = "rec-auto-1") -> dict:
+    """模拟 SimLink 抢在「开始本段」之前自动开录：一条无主的 PERSONAL 记录 + 活跃指针。"""
+    record = service.db.insert_flight({
+        "id": flight_id, "mode": "PERSONAL", "status": "RECORDING",
+        "callsign": "AOC001", "aircraft_type": "A359",
+        "block_off_utc": "2026-11-05T10:16:59Z", "created_at": "2026-11-05T10:16:59Z",
+    })
+    service.db.setting_set("active_recording",
+                           {"flight_id": record["id"], "started_at": record["block_off_utc"]})
+    return record
+
+
+def test_start_leg_adopts_auto_recording(ops: PersonalService):
+    """§41：自动开录抢先建档时，开始本段应把它改绑过来（否则整段会记成自由飞行）。"""
+    roster, _ = _confirm(ops)
+    leg = next(l for l in roster["legs"] if int(l["sequence"]) == 1)
+    record = _auto_recording(ops)
+    started = ops.ops.start_leg(roster["id"], 1)
+    assert started["adopted_recording"] is True
+    assert started["task"]["flight_record_id"] == record["id"]
+    adopted = ops.db.get_flight(record["id"])
+    assert adopted["mode"] == "ROSTER"
+    assert adopted["roster_leg_id"] == leg["id"]
+    assert adopted["aircraft_id"] == roster["aircraft_id"]
+    assert adopted["aircraft_type"] == started["task"]["aircraft_type"]
+    assert adopted["callsign"] == started["task"]["callsign"]
+
+    # 落地收尾后照常结算到本航段（不再落到个人记录）
+    flight = ops.db.update_flight(record["id"], {
+        "status": "COMPLETED", "dep_icao": leg["dep_icao"], "arr_icao": leg["arr_icao"],
+        "block_off_utc": "2026-11-05T10:16:59Z", "block_on_utc": "2026-11-05T12:47:00Z",
+        "takeoff_utc": "2026-11-05T10:48:00Z", "landing_utc": "2026-11-05T12:42:00Z",
+        "block_minutes": 150.0, "distance_nm": 612.4, "fuel_used_kg": 5210,
+        "fuel_start_kg": 9000, "fuel_end_kg": 3790, "validation_status": "VALID",
+    })
+    settlement = ops.ops.on_flight_finalized(flight)
+    assert settlement and settlement["flight_record_id"] == record["id"]
+    finished = ops.ops.roster(roster["id"])
+    assert next(l for l in finished["legs"] if int(l["sequence"]) == 1)["status"] == "COMPLETED"
+
+
+def test_start_leg_rejects_recording_bound_to_other_task(ops: PersonalService):
+    """§41：录制已经绑在别的任务上时，开始本段必须明确报错，不能静默降级。"""
+    roster, _ = _confirm(ops)
+    free = _free_flight(ops, "B-1672", "ZBAA", "ZSSS")
+    record = ops.db.insert_flight({
+        "id": "rec-bound-1", "mode": "FREE", "status": "RECORDING",
+        "callsign": "AOC900", "aircraft_type": "A320",
+        "block_off_utc": "2026-11-05T10:16:59Z", "created_at": "2026-11-05T10:16:59Z",
+    })
+    with ops.ops._tx() as con:
+        con.execute("update free_flight set flight_record_id=? where id=?",
+                    (record["id"], free["id"]))
+    ops.db.setting_set("active_recording", {"flight_id": record["id"]})
+    with pytest.raises(OpsError) as exc:
+        ops.ops.start_leg(roster["id"], 1)
+    assert exc.value.code == "RECORDING_IN_PROGRESS"
+    assert ops.ops.roster(roster["id"])["legs"][0]["status"] == "PLANNED"
+
+
+def test_start_leg_rejects_expired_roster(ops: PersonalService):
+    """§41：首段必须在执行窗口内开始（过期班表不能再起飞）。"""
+    roster, _ = _confirm(ops)
+    with ops.ops._tx() as con:
+        con.execute("update roster set expires_at='2020-01-01T00:00:00Z' where id=?",
+                    (roster["id"],))
+    with pytest.raises(OpsError) as exc:
+        ops.ops.start_leg(roster["id"], 1)
+    assert exc.value.code == "ROSTER_EXPIRED"

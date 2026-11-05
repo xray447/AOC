@@ -193,6 +193,8 @@ def create_app(config: CoreConfig) -> FastAPI:
     OPS_CONFLICT = {"AIRCRAFT_LOCKED", "INVALID_STATE", "TASK_IN_PROGRESS", "INSTANCE_UNAVAILABLE",
                     "CANDIDATE_EXPIRED", "LOCK_EXPIRED", "DUPLICATE_REGISTRATION", "DUPLICATE_ROUTE",
                     "DUPLICATE_TYPE", "AIRCRAFT_TYPE_IN_USE",
+                    # §41：录制与任务错序 / 班表过期
+                    "RECORDING_IN_PROGRESS", "ROSTER_EXPIRED",
                     "CONFIG_VERSION_CONFLICT", "VERSION_CONFLICT", "INVALID_TOKEN"}
 
     @app.exception_handler(OpsError)

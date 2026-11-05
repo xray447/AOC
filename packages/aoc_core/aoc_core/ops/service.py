@@ -78,6 +78,9 @@ LEDGER_TYPES = (
 )
 ACTIVE_TASK_KEY = "ops_active_task"
 NO_SHOW_KEY = "ops_no_show_count"
+# §41：FlightService 持久化的「正在录制」指针（`aoc_core/flights.py::ACTIVE_KEY`），
+# 用来判断 SimLink 是否已经自动开录、而任务还没开始
+RECORDING_KEY = "active_recording"
 # §38 P0：内置机型翼展一次性纠偏的标记（老库迁移后只跑一次，改口径时提升版本号）
 WINGSPAN_SYNC_KEY = "wingspan_sync"
 WINGSPAN_SYNC_VERSION = "v1"
@@ -2304,6 +2307,31 @@ class OpsService:
             return None
         return task
 
+    def _live_recording(self) -> dict[str, Any] | None:
+        """当前真的在录制的那条记录（§41）。
+
+        以 `FlightService` 写进 `app_setting` 的指针为准：只看 `flight_record.status`
+        会把上次崩溃/强杀留下的 RECORDING 也当成「正在录」。
+        """
+        try:
+            active = self.db.setting_get(RECORDING_KEY)
+        except Exception:  # noqa: BLE001
+            return None
+        flight_id = active.get("flight_id") if isinstance(active, dict) else None
+        if not flight_id:
+            return None
+        row = self._one("select * from flight_record where id=?", (flight_id,))
+        return row if row and row.get("status") == "RECORDING" else None
+
+    def _unbound_recording(self) -> dict[str, Any] | None:
+        """正在录制、但还没绑到任何任务/航段上的记录（自动开录抢先建档，§41）。"""
+        row = self._live_recording()
+        if not row:
+            return None
+        if row.get("roster_leg_id") or row.get("flight_instance_id"):
+            return None
+        return None if self._task_for_flight(row["id"]) else row
+
     def start_leg(self, roster_id: str, sequence: int,
                   actual_zfw_kg: Any = None) -> dict[str, Any]:
         roster = self.roster(roster_id)
@@ -2321,6 +2349,13 @@ class OpsService:
             raise OpsError("INVALID_STATE", "请先完成前序航段")
         if roster["status"] == "LOCKED" and int(sequence) != 1:
             raise OpsError("INVALID_STATE", "班表必须先开始第一段")
+        # §41：首段必须在执行窗口内开始（过期班表仍能起飞是 §41 的次因之一）
+        soft_warnings: list[str] = []
+        expires = roster.get("expires_at")
+        if expires and eco.parse_utc(expires) < _now():
+            if roster["status"] == "LOCKED":
+                raise OpsError("ROSTER_EXPIRED", "班表已超出执行窗口，请重新抽班")
+            soft_warnings.append(f"本班表已超出执行窗口（{expires}），仍按计划继续执行")
         aircraft = self.get_aircraft(roster["aircraft_id"])
         if not aircraft:
             raise OpsError("NOT_FOUND", "飞机不存在")
@@ -2330,8 +2365,20 @@ class OpsService:
                            f"飞机当前在 {aircraft.get('current_airport_icao')}，无法从 {dep} 起飞")
         if self.active_task():
             raise OpsError("TASK_IN_PROGRESS", "已有正在执行的任务")
+        # §41：SimLink 的自动开录可能已经建了一条「无任务」的记录。绑到别的任务上就拒绝；
+        # 还是一条没主的 PERSONAL 记录就改绑过来，别让整段飞行静默落成自由飞行。
+        live = self._live_recording()
+        adopt = self._unbound_recording() if live else None
+        if live and adopt is None:
+            raise OpsError(
+                "RECORDING_IN_PROGRESS",
+                f"正在录制 {live.get('callsign') or '另一段航班'}（{live.get('dep_icao') or '?'}"
+                f"→{live.get('arr_icao') or '?'}），请先在执行页结束/中止该记录")
         type_row = self.get_type(aircraft["type_id"]) or {}
-        flight_id = new_id()
+        flight_id = adopt["id"] if adopt else new_id()
+        if adopt:
+            soft_warnings.append(
+                "检测到已在录制：本次飞行将改绑到本航段（含起飞前已录制的部分）")
         params, policy = self.economy_params(), self.settlement_policy()
         policy_row, sources = resolve_policy(policy, aircraft_type=type_row, aircraft=aircraft)
         version = int((self._one("select max(version) as v from ops_config_version") or {}).get("v") or 0)
@@ -2373,6 +2420,21 @@ class OpsService:
                 (new_id(), flight_id, version, json.dumps(params, ensure_ascii=False),
                  json.dumps(policy_row, ensure_ascii=False),
                  json.dumps(sources, ensure_ascii=False), stamp))
+            if adopt:
+                # §41：把自动开录建的那条 PERSONAL 记录改绑到本航段（block_off 仍是真实推出时刻）
+                con.execute(
+                    "update flight_record set mode='ROSTER', roster_leg_id=?, flight_instance_id=?, "
+                    "aircraft_id=?, callsign=?, aircraft_type=?, dep_icao=?, arr_icao=?, "
+                    "mission_type=?, scheduled_dep_utc=?, "
+                    "actual_zfw_kg=coalesce(actual_zfw_kg, ?), zfw_delta_kg=coalesce(zfw_delta_kg, ?), "
+                    "updated_at=? where id=?",
+                    (leg["id"], leg.get("flight_instance_id"), aircraft["id"], task["callsign"],
+                     type_row.get("icao") or adopt.get("aircraft_type"),
+                     leg.get("dep_icao"), leg.get("arr_icao"), task["mission_type"],
+                     task["scheduled_dep_utc"], actual_zfw, zfw_delta, stamp, flight_id))
+                self._audit(con, "LEG_ADOPT_RECORDING", "roster_leg", leg["id"],
+                            {"flight_record_id": flight_id, "mode": adopt.get("mode")},
+                            {"block_off_utc": adopt.get("block_off_utc")})
             con.execute("update roster_leg set status='IN_PROGRESS', flight_record_id=?, "
                         "actual_dep_utc=?, updated_at=? where id=?", (flight_id, stamp, stamp, leg["id"]))
             con.execute("update roster set status='IN_PROGRESS', started_at=coalesce(started_at, ?), "
@@ -2386,7 +2448,8 @@ class OpsService:
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "LEG_START", "roster_leg", leg["id"], "PLANNED", "IN_PROGRESS")
         return {"task": task, "load_sheet": self.load_sheet(flight_id),
-                "roster": self.roster(roster_id), "warnings": warnings}
+                "roster": self.roster(roster_id),
+                "adopted_recording": bool(adopt), "warnings": [*soft_warnings, *warnings]}
 
     def start_free_flight(self, free_id: str, actual_zfw_kg: Any = None) -> dict[str, Any]:
         free = self.free_flight(free_id)
@@ -2400,7 +2463,19 @@ class OpsService:
         type_row = self.get_type(aircraft.get("type_id")) or {}
         if (aircraft.get("current_airport_icao") or "").upper() != free["dep_icao"].upper():
             raise OpsError("AIRCRAFT_NOT_AT_DEPARTURE", "飞机不在出发机场")
-        flight_id = new_id()
+        # §41：与班段同一套规则 —— 抢跑的自动开录要么改绑，要么明确拒绝
+        live = self._live_recording()
+        adopt = self._unbound_recording() if live else None
+        if live and adopt is None:
+            raise OpsError(
+                "RECORDING_IN_PROGRESS",
+                f"正在录制 {live.get('callsign') or '另一段航班'}（{live.get('dep_icao') or '?'}"
+                f"→{live.get('arr_icao') or '?'}），请先在执行页结束/中止该记录")
+        flight_id = adopt["id"] if adopt else new_id()
+        soft_warnings: list[str] = []
+        if adopt:
+            soft_warnings.append(
+                "检测到已在录制：本次飞行将改绑到这次自由飞行（含起飞前已录制的部分）")
         params, policy = self.economy_params(), self.settlement_policy()
         policy_row, sources = resolve_policy(policy, aircraft_type=type_row, aircraft=aircraft)
         version = int((self._one("select max(version) as v from ops_config_version") or {}).get("v") or 0)
@@ -2435,6 +2510,19 @@ class OpsService:
                 (new_id(), flight_id, version, json.dumps(params, ensure_ascii=False),
                  json.dumps(policy_row, ensure_ascii=False),
                  json.dumps(sources, ensure_ascii=False), stamp))
+            if adopt:
+                # §41：把自动开录建的那条 PERSONAL 记录改绑到这次自由飞行
+                con.execute(
+                    "update flight_record set mode='FREE', aircraft_id=?, callsign=?, aircraft_type=?, "
+                    "dep_icao=?, arr_icao=?, mission_type='FREE', scheduled_dep_utc=?, "
+                    "actual_zfw_kg=coalesce(actual_zfw_kg, ?), zfw_delta_kg=coalesce(zfw_delta_kg, ?), "
+                    "updated_at=? where id=?",
+                    (aircraft.get("id"), task["callsign"], type_row.get("icao"),
+                     free["dep_icao"], free["arr_icao"], task["scheduled_dep_utc"],
+                     actual_zfw, zfw_delta, stamp, flight_id))
+                self._audit(con, "FREE_FLIGHT_ADOPT_RECORDING", "free_flight", free_id,
+                            {"flight_record_id": flight_id, "mode": adopt.get("mode")},
+                            {"block_off_utc": adopt.get("block_off_utc")})
             con.execute("update free_flight set status='IN_FLIGHT', flight_record_id=?, updated_at=? "
                         "where id=?", (flight_id, stamp, free_id))
             con.execute("update flight_instance set status='STARTED', updated_at=? where id=?",
@@ -2446,7 +2534,8 @@ class OpsService:
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "FREE_FLIGHT_START", "free_flight", free_id, "LOCKED", "IN_FLIGHT")
         return {"task": task, "load_sheet": self.load_sheet(flight_id),
-                "free_flight": self.free_flight(free_id), "warnings": warnings}
+                "free_flight": self.free_flight(free_id),
+                "adopted_recording": bool(adopt), "warnings": [*soft_warnings, *warnings]}
 
     def set_actual_zfw(self, actual_zfw_kg: Any, source: str = "preflight",
                        final: bool = False) -> list[str]:

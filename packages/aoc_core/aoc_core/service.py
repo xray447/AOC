@@ -40,7 +40,7 @@ from aoc_route.graph import GraphProvider
 from .aircraft import AircraftCatalog
 from .db import Database, utcnow
 from .flights import FlightService
-from .ops import OpsService
+from .ops import OpsError, OpsService
 from .ops.service import zfw_check
 from .paths import AppPaths
 from .recommend import recommend as build_recommend
@@ -695,6 +695,12 @@ class PersonalService:
         """开始录制。ZFW/油量不再在开录时取样（§32 方案 B）：由推出事件回传定稿值。"""
         if not self._simlink_client:
             raise RuntimeError("SimLink 未连接，无法开始记录；请确认模拟器和 SimLink 已启动")
+        # §41：任务已开始、但正在录的还是另一条记录 —— 明确报错，别静默返回旧状态
+        current = self.flights.status()
+        task = self.ops.active_task()
+        if current.active and task and current.flight_id != task.get("flight_record_id"):
+            raise OpsError("RECORDING_IN_PROGRESS",
+                           "已有一条记录在录制且不属于本次任务，请先结束它再开始记录")
         gate = self.position_gate()
         if not gate.get("ok") and not partial:
             raise PositionGateError(gate)

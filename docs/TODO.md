@@ -1,8 +1,9 @@
 # TODO
 
-> 状态（2026-11-04）：§31–§40 **全部实现**。本批新增 §38（抽班翼展三处漏洞）、§39（发动机启动即视为推出）、§40（ZFW 差异显示 `-0 kg`），见「五、已完成 · 2026-11-04」。
-> 其余事项只能**在真机上做**：干净 Windows 安装验收、MSFS 2024 实机复测（§39 的 engine 判据要实机验证）、低配机性能复核 —— 见「一、待办」1.1–1.3。
-> `pytest`（172 项）/ `ruff F,E9` / `tsc --noEmit` + `npm run build` / `dotnet build` 全绿。§37 是 CI 维护项（Node 20 → 26），不是功能项。
+> 状态（2026-11-05）：§31–§41 **全部实现**。本次新增 §41（SimLink 自动开录抢先建档 → 班表航段整段落成个人/自由飞行），见「六、已完成 · 2026-11-05」；§38–§40 见「五、已完成 · 2026-11-04」。
+> §41 只剩实机复测 3 条 + 三项遗留（陈旧 `IN_PROGRESS` 班表清理、改绑时回填推出 ZFW、卡死恢复入口），见「1.6」。
+> 其余事项只能**在真机上做**：干净 Windows 安装验收、MSFS 2024 实机复测（§39 的 engine 判据、§41 的三条错序场景）、低配机性能复核 —— 见「一、待办」1.1–1.3。
+> `pytest`（175 项）/ `ruff F,E9` / `tsc --noEmit` + `npm run build` 全绿（§41 只动 Python 与前端 TS，`dotnet build` 本次未涉及）。§37 是 CI 维护项（Node 20 → 26），不是功能项。
 >
 > 约定：`§编号`沿用历史编号，不重排（文档、提交记录和历史对话都在引用）；新条目接在最后一个编号之后。
 > 每条实现记录包含「落地（改了什么）」+「背景（为什么/怎么发现的）」+「关联」，实测数据集中在附录 B。
@@ -11,12 +12,13 @@
 
 | 章节 | 内容 |
 |---|---|
-| 一、待办 | 人工验收 / 实机复测 / 性能复核 / §36 遗留小项 |
+| 一、待办 | 人工验收 / 实机复测 / 性能复核 / §36 遗留小项 / **§41 残余（实机复测 3 条 + 3 项遗留）** |
 | 二、已完成 · 2026-11-02 ~ 11-03 | §31–§37（收尾批次：幽灵机、合计航时、推出定稿、SimBrief 单位、快速调机、场景库跑道、CI Node 升级） |
 | 三、已完成 · 2026-10-30 | §23–§30（功能改进） |
 | 四、已完成 · 2026-10-24 及更早 | §1–§22（含性能修复 D-26/D-27） |
 | 五、已完成 · 2026-11-04 | §38–§40（翼展真值同步 / 遵循航线查跑道、发动机启动即推出、ZFW 差异归一） |
-| 附录 A | 决策记录 D-1～D-7 |
+| 六、已完成 · 2026-11-05 | §41（自动开录抢先建档 → 班表航段落成自由飞行：无主录制改绑 + 已绑他处拒绝 + 班表过期拦截） |
+| 附录 A | 决策记录 D-1～D-9 |
 | 附录 B | 验证记录 V-1～V-5（含探针工具） |
 
 ---
@@ -42,6 +44,10 @@
 - [ ] **§32 推出快照**：开录 → 推出（GS ≥5kt 持续 3s）→ `/local/recording/status` 的 `zfw_at_pushback`/`fuel_at_pushback` 有值、`pushback` 事件出现；推出前继续加油加货不影响取值；地面已在滑行才开录时 `pushback_source=start`；空中接入为 null。
 - [ ] **§36 场景库**：设置页填 `%APPDATA%/ABarthel/little_navmap_db/little_navmap_msfs24.sqlite` → `GET /local/airports/WMKN` 返回 `runway_source=scenery`、长度 ≈3060 m（现实 navdata 3480 m）、接地区视图出现「游戏内 / 现实」对照提示。
 - [ ] **SimLink 自动重连**：先开 AOC 再开 MSFS，10s 内 `sim_connected=true`；飞行中退出再进，`/events` 有 `sim_disconnected`/`sim_connected`、记录不重复；重连后发动机仍在转时 10s 内自动开录（§33 顺带修复）。
+- [ ] **§41 录制早于任务（自动开录抢跑）**：
+  ① 先进 MSFS 起动发动机，等 SimLink 自动开录（10s）→ 再点「开始本段」：应弹「已经在录制中」确认，确认后航段记入班表、日志 `mode=ROSTER`、呼号是本段呼号；
+  ② 一段自由飞没结束又去点「开始本段」：应 409 `RECORDING_IN_PROGRESS`，航段保持 `PLANNED`；
+  ③ 过期班表点「开始本段」：应 409 `ROSTER_EXPIRED`。
 
 ### 1.3 性能复核（需低配机）
 
@@ -59,6 +65,14 @@
 > 实现记录见「五、已完成 · 2026-11-04」；只剩实机复测与可选的阈值语义调整：
 > - [ ] **§39 实机复测**：冷舱点火 10s 内 `zfw_at_pushback` / `pushback_source=engine`；拖车（GS <5kt）也能定稿；中途接入仍是 `start`。并入 1.2。
 > - [ ] **翼展上限阈值（先不动）**：`WINGSPAN_BY_WIDTH = (<45 → 36, <60 → 52, ≥60 → 80)`，CYXY 45.1 m 落在「52 m」档；而 ICAO 代码 E 的跑道标准宽度本就是 45 m（对应 52–65 m 翼展），即本规则把 45 m 跑道按 D 类处理。要放宽到「≥45 → 65」需先定清语义是「场道等级」还是「滑行道/停机位约束」，本次按保守值保留。
+
+### 1.6 §41 已落地（2026-11-05）
+
+> 实现记录（现场证据 / 根因 / 改法 / 数据修复）见「六、已完成 · 2026-11-05」；只剩实机复测与三项遗留：
+> - [ ] **实机复测**：① 进 MSFS 起动发动机等自动开录（10s）→ 再点「开始本段」：应弹确认、航段记到班表上且 `mode=ROSTER`；② 先开一段自由飞不结束，再点「开始本段」：应报 `RECORDING_IN_PROGRESS`；③ 过期班表点「开始本段」：应报 `ROSTER_EXPIRED`。并入 1.2。
+> - [ ] **陈旧班表清理**：`_expire_locks()` 只过期 `LOCKED` 班表，`IN_PROGRESS` 但窗口已过、无录制、无任务的班表不会被收尾（`test_a27` 明确保留「进行中不过期」语义，要动先定规则）。
+> - [ ] **改绑时回填推出 ZFW**：改绑时若推出已在「无任务」阶段发生，`set_actual_zfw()` 当时直接 `return []`，§32 的推出定稿值丢了 —— 现在只能退回配载单 ZFW；建议 `start_leg` 改绑时把 `flights.zfw_at_pushback` / `fuel_at_pushback` 一并写入（`OpsService` 需要一个取值回调）。
+> - [ ] **卡死恢复入口**：现可用 `void`（对 `IN_PROGRESS` 也可见）把卡死状态解开，但它把飞机位置写回本段出发机场并置 `HELD`，与真实位置不符；建议给「记录未绑定」一个显式一键作废入口，机队位置改为「保持现状」。
 
 ---
 
@@ -420,7 +434,40 @@
 
 ---
 
-## 附录 A. 决策记录（2026-11-02 已拍板；D-8 于 2026-11-03 追加）
+## 六、已完成 · 2026-11-05（§41）
+
+> 一类「规则都在跑，但先后顺序没人管」的链路：SimLink 自动开录早于「开始本段」，于是整段飞行落成 `mode=PERSONAL`，班表航段永远 `IN_PROGRESS`，而且**全程没有任何报错**。
+> 测试：`pytest` 175 项、`ruff F,E9`、`tsc --noEmit` + `npm run build` 全绿（本次未改 C#）。
+
+### 41. 班表航段没记上（自动开录抢先建档 → 整段变成个人/自由飞行）
+
+- **现场（2026-11-05，A359 `B-1090`，班表 `fcf5e5cd` 第 3 段 KAMA→KEWR / OVO517）**：
+  - 日志 `61dd0092`：`mode=PERSONAL`、呼号 `AOC001`、`roster_leg_id=NULL`、`created_at=block_off_utc=2026-11-05T10:16:59Z`、`block_off_source=preroll`、`late_join=0`（10:48 起飞 / 13:42 落地 / 210 min）。
+  - `ops_audit` 里 `LEG_START` 只有一条，时间 **10:25:11Z** —— 比开录晚 **8 分 12 秒**；`start_leg` 写进 `roster_leg.flight_record_id` 的 `c0907318` 在 `flight_record` 表里**根本不存在**。
+  - 连带卡死：`roster`/`roster_leg` 停在 `IN_PROGRESS`（`expires_at` 已过 1 天）、`flight_instance` 停在 `STARTED`、`B-1090` 停在 `KAMA`+`IN_FLIGHT`（真实在 KEWR）、`ops_active_task` 还挂着已飞完的任务。
+  - 执行页的表现：记录 id ≠ 任务 id → 一直显示「开始记录」，点了也没用（`FlightService.start()` 直接返回旧状态）。
+- **根因（三处叠加，任缺一处都不会发生）**：
+  1. **SimLink 先自动开录**：§27/§39 的自动开录在「发动机运转 10s」就触发，此时 `ops_context()` 为空 → `FlightService.start()` 建 `mode=PERSONAL` + 默认呼号（`flights.py:470-503`）。
+  2. **`FlightService.start()` 没有改绑通路**：`if self.recorder is not None: return self.status()`（`flights.py:439`），之后点「开始记录」也调不动。
+  3. **`start_leg()` 不校验「已在录制」**：只查 `active_task()` / 航段状态 / 飞机位置（`ops/service.py`），航段照样置 `IN_PROGRESS`；收尾时 `on_flight_finalized()` 发现 `flight_record_id` 与任务不符就 `return None` → 不结算、不更新机队位置、不清任务。
+  4. **次因**：`start_leg()` 不校验 `roster.expires_at`（11-03 抽的班表 11-05 还能开始）；`_expire_locks()` 只过期 `LOCKED` 班表。
+- **落地（D-9：无主录制改绑，而不是一律拒绝）**：
+  1. `OpsService._live_recording()`：以 `app_setting.active_recording`（`FlightService` 持久化指针）+ `flight_record.status='RECORDING'` 双条件判断「真的在录」，崩溃/强杀残留的 `RECORDING` 行不会被误判。
+  2. `_unbound_recording()`：再判「没绑任何任务」——`roster_leg.flight_record_id`、`flight_instance_id`、`_task_for_flight()` 全空才算无主。
+  3. `start_leg` / `start_free_flight`：无主 → **沿用原 `flight_id` 改绑**（`mode` → `ROSTER`/`FREE`，补 `roster_leg_id`/`flight_instance_id`/`aircraft_id`/`callsign`/`dep`/`arr`/`mission_type`/`scheduled_dep_utc`），`block_off` 保持真实推出时刻，配载单与经济快照照常固化，返回 `adopted_recording=true` + `warnings[]`，审计 `LEG_ADOPT_RECORDING` / `FREE_FLIGHT_ADOPT_RECORDING`；**已绑别的任务 → `RECORDING_IN_PROGRESS`（409）**。
+  4. `PersonalService.start_recording()`：任务已开始但活跃记录 id 与任务不符 → `RECORDING_IN_PROGRESS`，不再静默返回旧状态。
+  5. 班表过期：`status=LOCKED`（首段）且 `expires_at < now` → `ROSTER_EXPIRED`（409）；`IN_PROGRESS` 超窗只给 `warnings[]`，不阻断后续航段。
+  6. 前端：`OpsRoster.startLeg()` 有录制时先 `Modal.confirm`（会改绑、含起飞前已录部分）并逐条展示 `warnings[]`；`OpsExecute` 在「记录 id ≠ 任务 id」时显示「有一条记录在录制，但没有绑定到本航段」。
+  7. 新错误码进 `main.py::OPS_CONFLICT`（409）；接口表 `docs/03` 的 `legs/{seq}/start`、`free-flights/{id}/start` 同步。
+- **数据修复（这一班，已执行）**：`void` 第 3 段 → 用新的改绑逻辑重新绑定真实记录 `61dd0092` → 走正式 `settle_flight()`。结果：航段/班表 `COMPLETED`、`B-1090` → `KEWR`+`ACTIVE`（11.4 h / 12 cycles）、任务 `finished`、`active_recording` 清空、结算 `SETTLED`（收入 63,742.92 / 成本 64,193.65 / 利润 **−450.73**，1.5 天晚到按策略扣分）。改前备份 `backups/aoc-before-s41-20261105-142449.db`。
+- **测试**：`tests/test_ops.py::test_start_leg_adopts_auto_recording`（改绑后照常结算到本段）、`::test_start_leg_rejects_recording_bound_to_other_task`、`::test_start_leg_rejects_expired_roster`。
+- **取舍**：不采用「一律拒绝」——先推飞机再点「开始本段」是常见顺序，拒绝只会让人白飞；也不做「在自动开录时自动绑定」（分不清玩家是在飞自由飞还是班表）。只在「无主的 PERSONAL 记录」这一确定态上改绑，其余情况明确报错。
+- **残余（见 1.6）**：实机复测 3 条、陈旧 `IN_PROGRESS` 班表清理、改绑时回填推出 ZFW、卡死恢复入口。
+- **关联**：§27（自动开录提前到发动机启动）、§32（ZFW 定稿依赖 task 上下文）、§33（位置闸 / 记录与任务绑定）、§35（快速调机改位置）、`flights.py::start/ingest`、`ops/service.py::start_leg/start_free_flight/on_flight_finalized/_expire_locks`、`apps/client/src/pages/ops/OpsRoster.tsx`、`apps/client/src/pages/ops/OpsExecute.tsx`。
+
+---
+
+## 附录 A. 决策记录（2026-11-02 已拍板；D-8 于 2026-11-03、D-9 于 2026-11-05 追加）
 
 | 编号 | 议题 | 结论 |
 |---|---|---|
@@ -432,6 +479,7 @@
 | D-6 | §35 快速调机参数 | 允许透支（不拦负余额）；`fast_ferry_hold` 默认关；`fast_ferry_fee_per_nm = 12.0`、`fast_ferry_fixed_fee = 1000.0`（运营规则页可改） |
 | D-7 | §36 数据源路线 | **场景库优先**（按 V-3 改判）：跑道几何取 Little Navmap 的 `little_navmap_msfs24.sqlite`，缺失回落 navdata，手工覆盖表兜底（未做，见 1.4）；SimConnect facility 降为后续可选 |
 | D-8 | §37 CI 的 Node 版本 | 升到**最新 LTS 26**（Lithium）；不用 Current/alpha，不锁精确补丁（`setup-node` 用 `"26"`）；Node 20 已 EOL |
+| D-9 | §41 录制早于任务的处理 | **改绑**而不是拒绝：只有「无主的 PERSONAL 记录」才自动改绑到任务（`adopted_recording=true` + 前端确认）；已绑别的任务一律 409 `RECORDING_IN_PROGRESS`；不做「开录时自动绑定」（分不清自由飞与班表） |
 
 ---
 

@@ -325,6 +325,18 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                 </>
               )}
             </Space>
+            {recording.active && recording.flight_id !== task.flight_record_id ? (
+              <Alert
+                style={{ marginTop: 8 }}
+                type="warning"
+                showIcon
+                message={tr("有一条记录正在录制，但没有绑定到本航段",
+                  "A recording is running but not bound to this leg")}
+                description={tr(
+                  "这段飞行不会计入本航段。请先结束那条记录，再回到班表重新「开始本段」。",
+                  "This flight will not count for this leg. Stop that recording first, then start the leg again.")}
+              />
+            ) : null}
             {!recording.active && flightStatus && flightStatus.position_ok === false ? (
               <Alert
                 style={{ marginTop: 8 }}
