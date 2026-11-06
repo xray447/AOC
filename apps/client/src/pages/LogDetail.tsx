@@ -4,11 +4,13 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, download } from "../api";
 import { LandingReport } from "../components/LandingReport";
+import { SettlementSummary } from "../components/SettlementSummary";
 import { TrackMap } from "../components/TrackMap";
 import { projectOnRunway } from "../components/RunwayTouchdown";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
-import type { AirportDetail, AirportRunway, FlightRecord, TrackData } from "../types";
+import { anomalyLabel, eventLabel } from "../ops";
+import type { AirportDetail, AirportRunway, FlightRecord, OpsSettlement, TrackData } from "../types";
 import {
   fmtAltitude, fmtDateTime, fmtDistance, fmtMinutes, fmtSignedKg, fmtWeight, ratingLabels, statusLabels,
 } from "../utils";
@@ -48,44 +50,58 @@ function pickRunway(airport: AirportDetail | null, ident?: string | null,
 export function LogDetail() {
   const { id } = useParams<{ id: string }>();
   const { tr } = useI18n();
-  const { settings, dark, recording } = useApp();
+  const { settings, dark, refreshKey } = useApp();
   const navigate = useNavigate();
   const [flight, setFlight] = useState<FlightRecord | null>(null);
   const [track, setTrack] = useState<TrackData | null>(null);
   const [airport, setAirport] = useState<AirportDetail | null>(null);
   const [notes, setNotes] = useState("");
+  // IA-05：同一条航班的「轨迹」与「结算」不再分在两页，详情里直接折叠展示
+  const [settlement, setSettlement] = useState<OpsSettlement | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
     setLoading(true);
+    setLoadError(null);
+    let row: FlightRecord;
     try {
-      const [f, t] = await Promise.all([
-        api<FlightRecord>(`/local/flights/${id}`),
-        api<TrackData>(`/local/flights/${id}/track`),
-      ]);
-      setFlight(f);
-      setTrack(t);
-      setNotes(f.notes || "");
-      // 到达机场跑道几何（入口坐标/真航向/长度）：接地区俯视图用；无 navdata 时降级
-      if (f.arr_icao) {
-        try {
-          setAirport(await api<AirportDetail>(`/local/airports/${encodeURIComponent(f.arr_icao)}`));
-        } catch {
-          setAirport(null);
-        }
-      } else {
+      row = await api<FlightRecord>(`/local/flights/${id}`);
+    } catch (e) {
+      // UI-03：只有「记录本身」取不到才算不存在；轨迹失败只降级地图
+      setLoadError((e as Error).message);
+      setLoading(false);
+      return;
+    }
+    setFlight(row);
+    setNotes(row.notes || "");
+    try {
+      setTrack(await api<TrackData>(`/local/flights/${id}/track`));
+    } catch {
+      setTrack(null);
+    }
+    // 结算只在运营模式的记录里存在（个人/自由飞没结算时静默跳过）
+    try {
+      setSettlement(await api<OpsSettlement>(`/local/ops/flights/${id}/settlement`));
+    } catch {
+      setSettlement(null);
+    }
+    // 到达机场跑道几何（入口坐标/真航向/长度）：接地区俯视图用；无 navdata 时降级
+    if (row.arr_icao) {
+      try {
+        setAirport(await api<AirportDetail>(`/local/airports/${encodeURIComponent(row.arr_icao)}`));
+      } catch {
         setAirport(null);
       }
-    } catch (e) {
-      message.error((e as Error).message);
-    } finally {
-      setLoading(false);
+    } else {
+      setAirport(null);
     }
+    setLoading(false);
   }, [id]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
 
   const saveNotes = async () => {
     if (!id) return;
@@ -112,6 +128,19 @@ export function LogDetail() {
   };
 
   if (loading) return <div className="page"><Spin size="large" /></div>;
+  if (loadError) {
+    return (
+      <div className="page">
+        <Alert
+          type="error"
+          showIcon
+          message={tr("记录加载失败（接口出错，不等于记录不存在）", "Failed to load the flight (API error, not a missing record)")}
+          description={loadError}
+          action={<Button onClick={() => void load()}>{tr("重试", "Retry")}</Button>}
+        />
+      </div>
+    );
+  }
   if (!flight) return <div className="page"><Empty description={tr("记录不存在", "Flight not found")} /></div>;
 
   const rating = flight.landing_rating ? ratingLabels[flight.landing_rating] : null;
@@ -125,7 +154,7 @@ export function LogDetail() {
         <Space align="start">
           <Button icon={<ArrowLeftOutlined />} onClick={() => navigate("/logs")} />
           <div>
-            <h2>{flight.dep_icao || "????"} → {flight.arr_icao || "????"}</h2>
+            <h2>{flight.dep_icao || "—"} → {flight.arr_icao || "—"}</h2>
             <p>
               {fmtDateTime(flight.block_off_utc)} · {flight.aircraft_type || "—"} · {flight.callsign || "—"}
               {flight.aircraft_title ? <span className="muted"> · {flight.aircraft_title}</span> : null}
@@ -166,7 +195,16 @@ export function LogDetail() {
           type="warning"
           showIcon
           message={tr("检测到异常数据（个人模式只提示，不惩罚）", "Anomalies detected (personal mode only warns)")}
-          description={flight.anomaly_flags.join(" · ")}
+          // UI-13：异常枚举本地化（以前是 DATA_GAP · SIM_RATE 原文）
+          description={(
+            <Space size={4} wrap>
+              {flight.anomaly_flags.map((flag) => (
+                <Tag key={flag} color="orange">
+                  {anomalyLabel[flag] ? tr(anomalyLabel[flag].zh, anomalyLabel[flag].en) : flag}
+                </Tag>
+              ))}
+            </Space>
+          )}
         />
       ) : null}
 
@@ -176,7 +214,7 @@ export function LogDetail() {
         runway={runway}
         arrElevFt={airport?.elev_ft ?? null}
         aircraftTitle={flight.aircraft_title}
-        dataSource={recording?.simlink_source || flight.mode || "AOC"}
+        dataSource={flight.data_source || flight.mode || "AOC"}
       />
 
       <Card className="panel" variant="borderless" title={tr("轨迹回放", "Track replay")} extra={<Text className="muted">{track?.total_points ?? 0} {tr("点", "pts")} · {track?.encoding}</Text>}>
@@ -193,8 +231,15 @@ export function LogDetail() {
       </Card>
 
       <Collapse
-        defaultActiveKey={["details"]}
-        items={[{
+        defaultActiveKey={["details", ...(settlement ? ["settlement"] : [])]}
+        items={[
+          ...(settlement ? [{
+            key: "settlement",
+            // IA-05：同一航班的结算就在这里，不用再跳去「财务 → 结算」
+            label: tr("结算（收入 / 成本 / 账本）", "Settlement (revenue / costs / ledger)"),
+            children: <SettlementSummary settlement={settlement} detailed />,
+          }] : []),
+          {
           key: "details",
           label: tr("详细信息（飞行参数 / 事件 / 备注）", "Details (parameters / events / notes)"),
           children: (
@@ -268,7 +313,12 @@ export function LogDetail() {
                           },
                           width: 80,
                         },
-                        { title: tr("类型", "Type"), dataIndex: "type", render: (v: string) => <Tag>{v}</Tag> },
+                        {
+                          title: tr("类型", "Type"), dataIndex: "type",
+                          render: (v: string) => (
+                            <Tag>{eventLabel[v] ? tr(eventLabel[v].zh, eventLabel[v].en) : v}</Tag>
+                          ),
+                        },
                         { title: tr("数据", "Data"), dataIndex: "payload", render: (v: Record<string, unknown>) => <span className="muted" style={{ fontSize: 11 }}>{JSON.stringify(v)}</span> },
                       ]}
                     />
@@ -284,7 +334,8 @@ export function LogDetail() {
               </Card>
             </Space>
           ),
-        }]}
+          },
+        ]}
       />
     </div>
   );

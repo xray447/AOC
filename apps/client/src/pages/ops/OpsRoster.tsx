@@ -5,7 +5,7 @@ import {
 } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../../api";
+import { api, type ApiError } from "../../api";
 import { AirportMultiSelect } from "../../components/AirportMultiSelect";
 import { AirportSelect } from "../../components/AirportSelect";
 import { SimBriefButton } from "../../components/SimBriefButton";
@@ -40,7 +40,7 @@ const DEFAULTS = {
 export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
   const navigate = useNavigate();
-  const { recording } = useApp();
+  const { recording, refreshKey } = useApp();
   const [roster, setRoster] = useState<OpsRoster | null>(null);
   const [draw, setDraw] = useState<OpsDrawResult | null>(null);
   const [types, setTypes] = useState<OpsAircraftType[]>([]);
@@ -59,19 +59,18 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
     setTypes(t.items.filter((x) => x.allow_scheduled));
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load, refreshKey]);
 
-  const runDraw = async (redraw = false) => {
+  /** UI-01 / D-10：抽班只生成候选（不落库/不锁机），确认前可以一直重抽。 */
+  const runDraw = async () => {
     const values = await form.validateFields();
     setBusy(true);
     try {
-      const path = redraw && roster ? `/local/ops/rosters/${roster.id}/redraw` : "/local/ops/rosters/draw";
-      const result = await api<OpsDrawResult>(path, {
+      const result = await api<OpsDrawResult>("/local/ops/rosters/draw", {
         method: "POST",
-        body: redraw ? undefined : JSON.stringify(values),
+        body: JSON.stringify(values),
       });
       setDraw(result);
-      await load();
       if (!result.candidates.length) {
         message.warning(tr("没有满足条件的候选，试试放宽航段数/窗口或调整过站时间",
           "No candidates — relax legs, window or turnaround limits"));
@@ -99,18 +98,47 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
     }
   };
 
-  const confirm = async (candidate: OpsCandidate, index: number) => {
+  const confirm = async (candidate: OpsCandidate, index: number, replace = false) => {
     setBusy(true);
     try {
       const created = await api<OpsRoster>("/local/ops/rosters/confirm", {
         method: "POST",
-        body: JSON.stringify({ candidate_token: candidate.candidate_token, candidate_index: index }),
+        body: JSON.stringify({
+          candidate_token: candidate.candidate_token, candidate_index: index, replace,
+        }),
       });
       setDraw(null);
       setRoster(created);
       message.success(tr("班表已锁定，飞机已占用", "Roster locked and aircraft held"));
     } catch (e) {
-      message.error((e as Error).message);
+      const err = e as ApiError;
+      // UI-01：已有 LOCKED/IN_PROGRESS 班表 → 引导「重抽（替换）」或先取消；IN_PROGRESS 不能替换
+      if (err.code === "ROSTER_EXISTS") {
+        const status = String(err.details?.status || "");
+        const oldId = String(err.details?.roster_id || "");
+        if (!replace && status === "LOCKED") {
+          Modal.confirm({
+            title: tr("已有一张未开始的班表", "There is already a locked roster"),
+            content: tr(
+              "确认新班表会替换掉当前这张（首段还没开始，不收取消费也不记失约）。",
+              "Taking this one replaces the current roster (no leg started yet, so no cancel fee or no-show).",
+            ),
+            okText: tr("替换并确认", "Replace & take it"),
+            cancelText: tr("返回", "Back"),
+            onOk: () => confirm(candidate, index, true),
+          });
+        } else {
+          Modal.error({
+            title: tr("不能替换当前班表", "This roster cannot be replaced"),
+            content: status === "IN_PROGRESS"
+              ? tr(`班表 ${oldId.slice(0, 8)} 首段已开始：请先飞完或「取消班表」。`,
+                `Roster ${oldId.slice(0, 8)} already started: finish it or cancel it first.`)
+              : err.message,
+          });
+        }
+      } else {
+        message.error(err.message);
+      }
     } finally {
       setBusy(false);
     }
@@ -198,6 +226,10 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
 
   const nextLeg = roster?.legs.find((l) => l.status === "PLANNED");
   const completed = roster ? roster.legs.filter((l) => l.status === "COMPLETED").length : 0;
+  // UI-01 / D-10：抽班只生成候选，确认前一直可重抽；拦截在「确认」。
+  // 首段已开始（IN_PROGRESS）时重抽没有意义，按钮文案改成提示先飞完或取消。
+  const rosterActive = Boolean(roster && (roster.status === "LOCKED" || roster.status === "IN_PROGRESS"));
+  const canRedraw = roster?.status === "LOCKED";
 
   return (
     <div className={embedded ? "ops-embedded" : "page"}>
@@ -209,9 +241,10 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
           </div>
           <Space>
             <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
-            {roster?.status === "LOCKED" ? (
-              <Button loading={busy} onClick={() => void runDraw(true)}>{tr("重抽", "Redraw")}</Button>
-            ) : null}
+            {/* UI-01：抽班只生成候选，确认前可以一直重抽（拦截在「确认」） */}
+            <Button loading={busy} disabled={roster?.status === "IN_PROGRESS"} onClick={() => void runDraw()}>
+              {canRedraw ? tr("重抽（替换当前班表）", "Redraw (replaces current)") : tr("抽班", "Draw")}
+            </Button>
           </Space>
         </div>
       )}
@@ -490,11 +523,25 @@ export function OpsRosterPage({ embedded = false }: { embedded?: boolean }) {
                   </Form.Item>
                 </Col>
               </Row>
-              <Button type="primary" block icon={<ThunderboltOutlined />} loading={busy} onClick={() => void runDraw(false)}>
-                {roster && roster.status === "LOCKED" ? tr("先取消/重抽再抽新班", "Redraw current roster") : tr("抽班", "Draw")}
+              {/* UI-01 / D-10：抽班只生成候选，确认前可以一直重抽；首段开始后不能再抽 */}
+              <Button type="primary" block icon={<ThunderboltOutlined />} loading={busy}
+                disabled={roster?.status === "IN_PROGRESS"}
+                onClick={() => void runDraw()}>
+                {roster?.status === "IN_PROGRESS"
+                  ? tr("班表执行中：先飞完或取消", "Roster in progress — finish or cancel it")
+                  : canRedraw
+                    ? tr("重抽（替换当前班表）", "Redraw (replaces the current roster)")
+                    : tr("抽班", "Draw")}
               </Button>
               <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-                {tr("重抽无冷却/费用/次数限制；首段开始后不可重抽。", "Redraws are free and unlimited before the first leg; locked once the first leg starts.")}
+                {roster?.status === "IN_PROGRESS"
+                  ? tr("首段已经开始：确认新班表会被拒绝，先飞完或「取消班表」。",
+                    "The first leg has started: confirming a new roster is rejected — finish it or cancel it.")
+                  : canRedraw
+                    ? tr("重抽无冷却/费用/次数限制；点「确认」时才会替换当前这张班表。",
+                      "Redraws are free and unlimited; the current roster is only replaced when you confirm.")
+                    : tr("抽班只生成候选：确认前可以一直重抽，确认时才锁飞机。",
+                      "Drawing only generates candidates — redraw freely until you confirm; the aircraft is held at confirm.")}
               </div>
             </Form>
           </Card>

@@ -77,6 +77,7 @@ export function TrackMap({ points, events = [], dark = true, height = 420, tiles
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(30);
   const [currentT, setCurrentT] = useState(0);
+  const [showAllEvents, setShowAllEvents] = useState(false);
   const currentRef = useRef(0);
 
   const start = points.length ? points[0].t : 0;
@@ -190,7 +191,17 @@ export function TrackMap({ points, events = [], dark = true, height = 420, tiles
 
   const index = indexAt(currentT);
   const p = points[index];
-  const eventList = events.slice(0, 6);
+  // UI-18：以前只列前 6 条事件且没有「更多」
+  const eventList = showAllEvents ? events : events.slice(0, 6);
+
+  /** 播放到结尾后再点「播放」：回到起点重播，而不是毫无反应（用户得先拖滑块）。 */
+  const togglePlay = () => {
+    if (!playing && currentRef.current >= end) {
+      currentRef.current = start;
+      setCurrentT(start);
+    }
+    setPlaying((v) => !v);
+  };
 
   return (
     <div className="track-replay">
@@ -212,8 +223,12 @@ export function TrackMap({ points, events = [], dark = true, height = 420, tiles
       </div>
       <div className="track-controls">
         <Space wrap>
-          <Button type={playing ? "default" : "primary"} onClick={() => setPlaying((v) => !v)}>
-            {playing ? tr("暂停", "Pause") : tr("播放", "Play")}
+          <Button type={playing ? "default" : "primary"} onClick={togglePlay}>
+            {playing
+              ? tr("暂停", "Pause")
+              : currentT >= end
+                ? tr("重播", "Replay")
+                : tr("播放", "Play")}
           </Button>
           <Select
             size="small"
@@ -243,6 +258,13 @@ export function TrackMap({ points, events = [], dark = true, height = 420, tiles
                 {e.type} {fmtClock(t)}
               </Tag>;
             })}
+            {events.length > 6 ? (
+              <Button size="small" type="link" onClick={() => setShowAllEvents((v) => !v)}>
+                {showAllEvents
+                  ? tr("收起", "Show less")
+                  : tr(`更多（${events.length - 6}）`, `More (${events.length - 6})`)}
+              </Button>
+            ) : null}
           </Space>
         ) : null}
       </div>

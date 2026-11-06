@@ -201,6 +201,8 @@ def _actual_zfw(value: Any) -> float | None:
 ZFW_DELTA_ZERO_KG = 0.5
 # 差异小于 1 kg 不报警（与 zfw_state 的 ±1 kg 同一阈值，避免「状态 ok + 少 0 kg」）
 ZFW_WARN_THRESHOLD_KG = 1.0
+# §32 边界（1.6）：推出定稿之后又改动超过这个量级，不覆盖记录值，只补事件供人工核对
+ZFW_CHANGE_ALERT_KG = 1000.0
 
 
 def zfw_check(actual_zfw_kg: Any, planned_zfw_kg: Any) -> tuple[float | None, float | None, list[str]]:
@@ -235,6 +237,8 @@ class OpsService:
         self._expiring = False
         # §38 P1：本轮抽班被跑道宽度/长度挡掉的航段数（只用于「无候选」原因提示）
         self._runway_blocked = 0
+        # §41 残余 / 1.6：改绑「无主自动开录」时回填推出定稿值（由 PersonalService 提供）
+        self.pushback_provider = None
         ensure_schema(db)
         self._seed_types()
         self._seed_profile()
@@ -845,9 +849,26 @@ class OpsService:
         before = self.get_aircraft(aircraft_id)
         if not before:
             raise OpsError("NOT_FOUND", "飞机不存在")
-        allowed = {k: v for k, v in (patch or {}).items() if k in (
+        patch = dict(patch or {})
+        force = bool(patch.pop("force", False))
+        # §35 收口（1.4）：位置只能由飞行/快速调机写入。手工改位置属于「免费瞬移、无费用无审计」，
+        # 确需修正时必须显式 `force=true`，并写一条 AIRCRAFT_FIX_POSITION 审计。
+        fix_position = None
+        if "current_airport_icao" in patch:
+            target = (str(patch.pop("current_airport_icao") or "").strip().upper()) or None
+            if target and (len(target) != 4 or not re.fullmatch(r"[A-Z0-9]{4}", target)):
+                raise OpsError("VALIDATION", "机场必须是 4 字码", {"key": "current_airport_icao"})
+            if not force:
+                raise OpsError(
+                    "VALIDATION",
+                    "当前位置由飞行/快速调机写入，不能直接改；确需修正请带 force=true（会写审计）",
+                    {"key": "current_airport_icao"})
+            fix_position = target
+        allowed = {k: v for k, v in patch.items() if k in (
             "base_airport_icao", "current_airport_icao", "status", "fuel_kg", "livery",
             "tail_number", "lease_per_hour", "condition_pct", "version")}
+        if fix_position is not None:
+            allowed["current_airport_icao"] = fix_position
         if not allowed:
             return before
         if "status" in allowed:
@@ -867,6 +888,10 @@ class OpsService:
                 f"update aircraft set {','.join(f'{k}=?' for k in allowed)} where id=?",
                 (*allowed.values(), aircraft_id))
             self._audit(con, "AIRCRAFT_UPDATE", "aircraft", aircraft_id, before, allowed)
+            if fix_position is not None:
+                self._audit(con, "AIRCRAFT_FIX_POSITION", "aircraft", aircraft_id,
+                            {"current_airport_icao": before.get("current_airport_icao")},
+                            {"current_airport_icao": fix_position})
         return self.get_aircraft(aircraft_id) or {}
 
     def fast_ferry(self, aircraft_id: str, to_icao: str,
@@ -953,6 +978,81 @@ class OpsService:
                         "where aircraft_id=? and status in ('LOCKED','IN_FLIGHT')", (stamp, aircraft_id))
             self._audit(con, "AIRCRAFT_RELEASE", "aircraft", aircraft_id, {"locked": True}, None, reason)
         return self.get_aircraft(aircraft_id) or {}
+
+    # ------------------------------------------------------ 手工跑道覆盖（§36 兜底 C）
+    @staticmethod
+    def _runway_key(icao: Any, ident: Any) -> tuple[str, str]:
+        code = str(icao or "").strip().upper()
+        name = str(ident or "").strip().upper()
+        if len(code) != 4 or not re.fullmatch(r"[A-Z0-9]{4}", code):
+            raise OpsError("VALIDATION", "机场必须是 4 字码", {"key": "icao"})
+        if not name:
+            raise OpsError("VALIDATION", "跑道号不能为空", {"key": "ident"})
+        return code, name
+
+    def runway_overrides(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """`{icao: {ident: {length_m, width_m, threshold_lat, threshold_lon, hdg}}}`。"""
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in self._rows("select * from airport_runway_override order by icao, ident"):
+            icao = (row["icao"] or "").upper()
+            out.setdefault(icao, {})[(row["ident"] or "").upper()] = {
+                "length_m": row.get("length_m"), "width_m": row.get("width_m"),
+                "threshold_lat": row.get("threshold_lat"),
+                "threshold_lon": row.get("threshold_lon"), "hdg": row.get("hdg"),
+                "updated_at": row.get("updated_at"),
+            }
+        return out
+
+    def set_runway_override(self, icao: Any, ident: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """写入/更新一条手工跑道覆盖；越界或非数字直接拒绝（不静默存半截数据）。"""
+        code, name = self._runway_key(icao, ident)
+
+        def number(key: str, low: float, high: float) -> float | None:
+            value = (data or {}).get(key)
+            if value in (None, ""):
+                return None
+            try:
+                num = float(value)
+            except (TypeError, ValueError) as exc:
+                raise OpsError("PARAM_OUT_OF_RANGE", f"{key} 必须是数字",
+                               {"key": key}) from exc
+            if not (low <= num <= high):
+                raise OpsError("PARAM_OUT_OF_RANGE", f"{key} 需在 {low}–{high} 之间",
+                               {"key": key})
+            return num
+
+        values = {
+            "length_m": number("length_m", 300, 6000),
+            "width_m": number("width_m", 15, 100),
+            "threshold_lat": number("threshold_lat", -90, 90),
+            "threshold_lon": number("threshold_lon", -180, 180),
+            "hdg": number("hdg", 0, 360),
+        }
+        if (values["threshold_lat"] is None) != (values["threshold_lon"] is None):
+            raise OpsError("VALIDATION", "入口纬度和经度要一起填", {"key": "threshold_lat"})
+        stamp = utcnow()
+        with self._tx() as con:
+            before = con.execute("select * from airport_runway_override where icao=? and ident=?",
+                                 (code, name)).fetchone()
+            con.execute(
+                "insert or replace into airport_runway_override(icao, ident, length_m, width_m, "
+                "threshold_lat, threshold_lon, hdg, updated_at) values(?,?,?,?,?,?,?,?)",
+                (code, name, values["length_m"], values["width_m"], values["threshold_lat"],
+                 values["threshold_lon"], values["hdg"], stamp))
+            self._audit(con, "RUNWAY_OVERRIDE_SET", "airport_runway", f"{code}/{name}",
+                        dict(before) if before else None, {**values, "updated_at": stamp})
+        return {"ok": True, "overrides": self.runway_overrides()}
+
+    def delete_runway_override(self, icao: Any, ident: Any) -> dict[str, Any]:
+        code, name = self._runway_key(icao, ident)
+        with self._tx() as con:
+            before = con.execute("select * from airport_runway_override where icao=? and ident=?",
+                                 (code, name)).fetchone()
+            con.execute("delete from airport_runway_override where icao=? and ident=?", (code, name))
+            if before:
+                self._audit(con, "RUNWAY_OVERRIDE_DELETE", "airport_runway", f"{code}/{name}",
+                            dict(before), None)
+        return {"ok": True, "deleted": bool(before), "overrides": self.runway_overrides()}
 
     # ------------------------------------------------------------------ 航线/班期
     def list_routes(self) -> list[dict[str, Any]]:
@@ -1249,6 +1349,9 @@ class OpsService:
         return out
 
     def draw(self, req: dict[str, Any] | None) -> dict[str, Any]:
+        # UI-01 / D-10（2026-11-06 修订）：抽班只生成候选，不落库、不锁机，确认前可以一直重抽。
+        # 拦截放在 confirm_roster()：已有 LOCKED/IN_PROGRESS 班表时返回 409 ROSTER_EXISTS
+        # （否则会再锁一架飞机，而 current_roster() 只取最新一条，前一张会从界面上消失）。
         constraints = self._constraints(req)
         self._expire_locks()
         types = self._type_map()
@@ -1762,7 +1865,25 @@ class OpsService:
             raise OpsError("CANDIDATE_EXPIRED", "候选已过期，请重新抽班")
         return payload
 
-    def confirm_roster(self, candidate_token: str, candidate_index: int = 0) -> dict[str, Any]:
+    def confirm_roster(self, candidate_token: str, candidate_index: int = 0,
+                       replace: bool = False) -> dict[str, Any]:
+        """确认候选并锁机（UI-01 / D-10：拦截点在这里，而不是 draw()）。
+
+        `replace=True` 时，若已有一张**尚未开始首段**（LOCKED）的班表，会先按「重抽」口径
+        取消它（不收费、不记失约），再落新的班表；`IN_PROGRESS`（首段已开始）一律拒绝。
+        """
+        self._expire_locks()
+        existing = self._one(
+            "select id, status from roster where status in ('LOCKED','IN_PROGRESS') "
+            "order by created_at desc limit 1")
+        if existing:
+            if replace and existing["status"] == "LOCKED":
+                self._cancel_roster(existing["id"], reason="重抽（替换）", redraw=True)
+            else:
+                raise OpsError(
+                    "ROSTER_EXISTS",
+                    "已有未完成的班表：请先取消旧班表，或重抽替换（首段开始后不能替换）",
+                    {"roster_id": existing["id"], "status": existing["status"]})
         payload = self._verify(candidate_token)
         candidates = payload.get("candidates") or []
         if not candidates:
@@ -2332,6 +2453,21 @@ class OpsService:
             return None
         return None if self._task_for_flight(row["id"]) else row
 
+    def _pushback_snapshot(self) -> dict[str, Any]:
+        """§41 残余：改绑时把「无任务阶段」已经定稿的推出 ZFW/油量带进新任务。
+
+        `set_actual_zfw()` 在没有活动任务时直接返回，所以改绑前推出的定稿值只能从
+        `FlightService` 的运行时快照里取（`PersonalService` 注入 `pushback_provider`）。
+        """
+        provider = self.pushback_provider
+        if provider is None:
+            return {}
+        try:
+            data = provider() or {}
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def start_leg(self, roster_id: str, sequence: int,
                   actual_zfw_kg: Any = None) -> dict[str, Any]:
         roster = self.roster(roster_id)
@@ -2387,7 +2523,15 @@ class OpsService:
         # seed 与航段绑定（而非随机 flight_id），保证「开始前」的 SimBrief 配载与开始时固化的一致
         load = self._leg_load(leg, type_row, seed=f"roster-{leg['id']}", params=params)
         # 推出前 ZFW 校验：低于配载单只提示，不阻断（C-08）
-        actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
+        # 改绑（§41）时若已在「无任务」阶段推出，就以那次定稿值为准（1.6 遗留）
+        snapshot = self._pushback_snapshot() if adopt else {}
+        snapshot_zfw = _actual_zfw(snapshot.get("zfw_kg"))
+        if snapshot_zfw is not None:
+            actual_zfw, zfw_delta, warnings = zfw_check(snapshot_zfw, load.get("zfw_kg"))
+            zfw_source = str(snapshot.get("source") or "gs")
+        else:
+            actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
+            zfw_source = "preflight"
         task = {
             "kind": "ROSTER", "roster_id": roster_id, "roster_leg_id": leg["id"],
             "flight_instance_id": leg.get("flight_instance_id"), "flight_record_id": flight_id,
@@ -2398,6 +2542,7 @@ class OpsService:
             "mission_type": (instance or {}).get("mission_type") or "SCHEDULED",
             "started_at": utcnow(),
             "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
+            "zfw_source": zfw_source, "zfw_final": snapshot_zfw is not None,
         }
         stamp = utcnow()
         with self._tx() as con:
@@ -2422,19 +2567,29 @@ class OpsService:
                  json.dumps(sources, ensure_ascii=False), stamp))
             if adopt:
                 # §41：把自动开录建的那条 PERSONAL 记录改绑到本航段（block_off 仍是真实推出时刻）
+                # 1.6：无任务阶段推出的定稿 ZFW/油量一并回填，别退回配载单
                 con.execute(
                     "update flight_record set mode='ROSTER', roster_leg_id=?, flight_instance_id=?, "
                     "aircraft_id=?, callsign=?, aircraft_type=?, dep_icao=?, arr_icao=?, "
                     "mission_type=?, scheduled_dep_utc=?, "
-                    "actual_zfw_kg=coalesce(actual_zfw_kg, ?), zfw_delta_kg=coalesce(zfw_delta_kg, ?), "
+                    "actual_zfw_kg=coalesce(?, actual_zfw_kg), "
+                    "zfw_delta_kg=coalesce(?, zfw_delta_kg), "
+                    "fuel_start_kg=coalesce(?, fuel_start_kg), "
                     "updated_at=? where id=?",
                     (leg["id"], leg.get("flight_instance_id"), aircraft["id"], task["callsign"],
                      type_row.get("icao") or adopt.get("aircraft_type"),
                      leg.get("dep_icao"), leg.get("arr_icao"), task["mission_type"],
-                     task["scheduled_dep_utc"], actual_zfw, zfw_delta, stamp, flight_id))
+                     task["scheduled_dep_utc"], actual_zfw, zfw_delta, snapshot.get("fuel_kg"),
+                     stamp, flight_id))
                 self._audit(con, "LEG_ADOPT_RECORDING", "roster_leg", leg["id"],
                             {"flight_record_id": flight_id, "mode": adopt.get("mode")},
-                            {"block_off_utc": adopt.get("block_off_utc")})
+                            {"block_off_utc": adopt.get("block_off_utc"),
+                             "zfw_at_pushback": snapshot_zfw,
+                             "fuel_at_pushback": snapshot.get("fuel_kg"),
+                             "pushback_source": zfw_source if snapshot_zfw else None})
+                if snapshot_zfw is not None:
+                    soft_warnings.append(
+                        f"已回填推出定稿 ZFW {actual_zfw:.0f} kg（{zfw_source}）")
             con.execute("update roster_leg set status='IN_PROGRESS', flight_record_id=?, "
                         "actual_dep_utc=?, updated_at=? where id=?", (flight_id, stamp, stamp, leg["id"]))
             con.execute("update roster set status='IN_PROGRESS', started_at=coalesce(started_at, ?), "
@@ -2447,6 +2602,14 @@ class OpsService:
                         "where roster_id=? and status='HELD'", (stamp, roster_id))
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "LEG_START", "roster_leg", leg["id"], "PLANNED", "IN_PROGRESS")
+        if adopt and snapshot_zfw is not None:
+            # 这条记录在「无任务」阶段只写过 provisional 的 zfw_check，这里补一条定稿
+            self.db.add_events(flight_id, [{
+                "t_offset_ms": 0, "type": "zfw_check",
+                "payload": {"actual_zfw_kg": actual_zfw, "delta_kg": zfw_delta,
+                            "source": zfw_source, "final": True,
+                            "adopted_from_pushback": True},
+            }])
         return {"task": task, "load_sheet": self.load_sheet(flight_id),
                 "roster": self.roster(roster_id),
                 "adopted_recording": bool(adopt), "warnings": [*soft_warnings, *warnings]}
@@ -2480,7 +2643,16 @@ class OpsService:
         policy_row, sources = resolve_policy(policy, aircraft_type=type_row, aircraft=aircraft)
         version = int((self._one("select max(version) as v from ops_config_version") or {}).get("v") or 0)
         load = self._free_load(free, type_row, seed=f"free-{free_id}", params=params)
-        actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
+        # 1.6：改绑时沿用「无任务」阶段已定稿的推出值
+        snapshot = self._pushback_snapshot() if adopt else {}
+        snapshot_zfw = _actual_zfw(snapshot.get("zfw_kg"))
+        if snapshot_zfw is not None:
+            actual_zfw, zfw_delta, warnings = zfw_check(snapshot_zfw, load.get("zfw_kg"))
+            zfw_source = str(snapshot.get("source") or "gs")
+            soft_warnings.append(f"已回填推出定稿 ZFW {actual_zfw:.0f} kg（{zfw_source}）")
+        else:
+            actual_zfw, zfw_delta, warnings = zfw_check(actual_zfw_kg, load.get("zfw_kg"))
+            zfw_source = "preflight"
         task = {
             "kind": "FREE", "free_flight_id": free_id, "flight_record_id": flight_id,
             "aircraft_id": aircraft.get("id"), "dep_icao": free["dep_icao"],
@@ -2488,6 +2660,7 @@ class OpsService:
             "callsign": self._free_callsign(free_id), "scheduled_dep_utc": free.get("dep_time_utc"),
             "mission_type": "FREE", "started_at": utcnow(),
             "actual_zfw_kg": actual_zfw, "zfw_delta_kg": zfw_delta,
+            "zfw_source": zfw_source, "zfw_final": snapshot_zfw is not None,
         }
         stamp = utcnow()
         with self._tx() as con:
@@ -2515,14 +2688,19 @@ class OpsService:
                 con.execute(
                     "update flight_record set mode='FREE', aircraft_id=?, callsign=?, aircraft_type=?, "
                     "dep_icao=?, arr_icao=?, mission_type='FREE', scheduled_dep_utc=?, "
-                    "actual_zfw_kg=coalesce(actual_zfw_kg, ?), zfw_delta_kg=coalesce(zfw_delta_kg, ?), "
+                    "actual_zfw_kg=coalesce(?, actual_zfw_kg), "
+                    "zfw_delta_kg=coalesce(?, zfw_delta_kg), "
+                    "fuel_start_kg=coalesce(?, fuel_start_kg), "
                     "updated_at=? where id=?",
                     (aircraft.get("id"), task["callsign"], type_row.get("icao"),
                      free["dep_icao"], free["arr_icao"], task["scheduled_dep_utc"],
-                     actual_zfw, zfw_delta, stamp, flight_id))
+                     actual_zfw, zfw_delta, snapshot.get("fuel_kg"), stamp, flight_id))
                 self._audit(con, "FREE_FLIGHT_ADOPT_RECORDING", "free_flight", free_id,
                             {"flight_record_id": flight_id, "mode": adopt.get("mode")},
-                            {"block_off_utc": adopt.get("block_off_utc")})
+                            {"block_off_utc": adopt.get("block_off_utc"),
+                             "zfw_at_pushback": snapshot_zfw,
+                             "fuel_at_pushback": snapshot.get("fuel_kg"),
+                             "pushback_source": zfw_source if snapshot_zfw else None})
             con.execute("update free_flight set status='IN_FLIGHT', flight_record_id=?, updated_at=? "
                         "where id=?", (flight_id, stamp, free_id))
             con.execute("update flight_instance set status='STARTED', updated_at=? where id=?",
@@ -2533,6 +2711,13 @@ class OpsService:
                         "where free_flight_id=? and status='HELD'", (stamp, free_id))
             self._meta_set(ACTIVE_TASK_KEY, task, con)
             self._audit(con, "FREE_FLIGHT_START", "free_flight", free_id, "LOCKED", "IN_FLIGHT")
+        if adopt and snapshot_zfw is not None:
+            self.db.add_events(flight_id, [{
+                "t_offset_ms": 0, "type": "zfw_check",
+                "payload": {"actual_zfw_kg": actual_zfw, "delta_kg": zfw_delta,
+                            "source": zfw_source, "final": True,
+                            "adopted_from_pushback": True},
+            }])
         return {"task": task, "load_sheet": self.load_sheet(flight_id),
                 "free_flight": self.free_flight(free_id),
                 "adopted_recording": bool(adopt), "warnings": [*soft_warnings, *warnings]}
@@ -2551,12 +2736,24 @@ class OpsService:
         actual, delta, warnings = zfw_check(actual_zfw_kg, sheet.get("zfw_kg"))
         if actual is None:
             return []
+        flight_id = task.get("flight_record_id")
+        previous = task.get("actual_zfw_kg")
+        already_final = bool(task.get("zfw_final"))
+        # §32 边界（1.6）：推出定稿之后再改配载（罕见）不覆盖已定稿的记录值，
+        # 只在大幅变化（>1000 kg）时补一条事件供人工核对。
+        if (final and already_final and flight_id and previous is not None
+                and abs(actual - float(previous)) > ZFW_CHANGE_ALERT_KG):
+            self.db.add_events(flight_id, [{
+                "t_offset_ms": 0, "type": "zfw_changed_after_pushback",
+                "payload": {"previous_kg": round(float(previous), 1), "actual_kg": actual,
+                            "delta_kg": round(actual - float(previous), 1), "source": source},
+            }])
+            return warnings
         task["actual_zfw_kg"] = actual
         task["zfw_delta_kg"] = delta
         task["zfw_source"] = source
         task["zfw_final"] = bool(final)
         self._meta_set(ACTIVE_TASK_KEY, task)
-        flight_id = task.get("flight_record_id")
         if final and flight_id:
             self.db.update_flight(flight_id, {"actual_zfw_kg": actual, "zfw_delta_kg": delta})
             self.db.add_events(flight_id, [{
@@ -2963,6 +3160,61 @@ class OpsService:
         return {"ok": True, "roster": self.roster(roster_id), "flight_id": flight_id,
                 "settlement_id": (settlement or {}).get("id")}
 
+    def recover_task(self, reason: str | None = None) -> dict[str, Any]:
+        """卡死恢复入口（1.6）：解开「任务在、记录没绑上」的卡死状态。
+
+        与 `void_leg` 的区别：**不动机队位置**（飞机可能在真实机场，写回出发机场只会
+        让 AOC 与模拟器更不一致），也不冲销账本 —— 这段本来就没结算。只做：
+        航段退回 `PLANNED`（可重新开始）、实例回 `SCHEDULED`、释放飞机锁、清任务。
+        """
+        task = self.active_task()
+        if not task:
+            return {"ok": True, "recovered": False, "message": "没有正在执行的任务"}
+        stamp = utcnow()
+        aircraft_id = task.get("aircraft_id")
+        roster: dict[str, Any] | None = None
+        with self._tx() as con:
+            if task.get("kind") == "ROSTER" and task.get("roster_leg_id"):
+                leg = con.execute("select * from roster_leg where id=?",
+                                  (task["roster_leg_id"],)).fetchone()
+                flight_id = task.get("flight_record_id")
+                settlement = con.execute(
+                    "select status from settlement where flight_record_id=?",
+                    (flight_id,)).fetchone() if flight_id else None
+                if leg is not None and leg["status"] == "IN_PROGRESS" and (
+                        settlement is None or (settlement["status"] or "").upper() == "VOID"):
+                    con.execute(
+                        "update roster_leg set status='PLANNED', flight_record_id=NULL, "
+                        "actual_dep_utc=NULL, actual_arr_utc=NULL, updated_at=? where id=?",
+                        (stamp, leg["id"]))
+                    if leg["flight_instance_id"]:
+                        con.execute("update flight_instance set status='SCHEDULED', updated_at=? "
+                                    "where id=?", (stamp, leg["flight_instance_id"]))
+                    con.execute("update roster set status='IN_PROGRESS', completed_at=NULL, "
+                                "updated_at=? where id=?", (stamp, leg["roster_id"]))
+            if task.get("kind") == "FREE" and task.get("free_flight_id"):
+                con.execute("update free_flight set status='ABORTED', updated_at=? where id=?",
+                            (stamp, task["free_flight_id"]))
+                if task.get("flight_instance_id"):
+                    con.execute("update flight_instance set status='SCHEDULED', updated_at=? "
+                                "where id=?", (stamp, task["flight_instance_id"]))
+            if aircraft_id:
+                con.execute("update aircraft_lock set status='RELEASED', released_at=? "
+                            "where aircraft_id=? and status in ('HELD','IN_FLIGHT')",
+                            (stamp, aircraft_id))
+                # 位置保持现状：只把状态放回可用
+                con.execute("update aircraft set status='ACTIVE', updated_at=?, version=version+1 "
+                            "where id=? and status in ('HELD','IN_FLIGHT')", (stamp, aircraft_id))
+            self._meta_set(ACTIVE_TASK_KEY, {**task, "finished": True}, con)
+            self._audit(con, "TASK_RECOVER", task.get("kind") or "task",
+                        task.get("roster_id") or task.get("free_flight_id"), None,
+                        {"keep_position": True, "flight_record_id": task.get("flight_record_id")},
+                        reason or "记录未绑定/任务卡死")
+        if task.get("roster_id"):
+            roster = self.roster(task["roster_id"])
+        return {"ok": True, "recovered": True, "keep_position": True,
+                "roster": roster, "task": task}
+
     def _instance_dep(self, task: dict[str, Any] | None) -> str | None:
         if not task:
             return None
@@ -3272,6 +3524,8 @@ class OpsService:
             rosters = self._rows("select id from roster where status='LOCKED' and expires_at < ?", (now,))
             for row in rosters:
                 self.expire_roster(row["id"])
+            # 1.6：卡死的 IN_PROGRESS 班表（窗口已过、一段都没完成、无录制/任务）
+            self._close_stale_rosters(now)
             frees = self._rows("select id from free_flight where status='LOCKED' and lock_expires_at < ?",
                                (now,))
             for row in frees:
@@ -3303,6 +3557,68 @@ class OpsService:
             return
         finally:
             self._expiring = False
+
+    def _close_stale_rosters(self, now: str | None = None) -> int:
+        """收尾卡死的 `IN_PROGRESS` 班表（1.6）。
+
+        规则（与 `test_a27` 的「进行中不过期」语义并存）：
+        - 窗口已过（`expires_at < now`）；
+        - **一段都没完成**（有过已完成航段的中途班表等玩家继续/取消，不自动收尾）；
+        - 没有活跃录制绑在它的航段上，也没有活动任务属于它。
+        收尾时只释放锁与实例、不收费、不记失约，也不动机队位置。
+        """
+        if self._tx_depth:
+            return 0
+        now = now or utcnow()
+        rows = self._rows("select id, aircraft_id from roster where status='IN_PROGRESS' "
+                          "and expires_at is not null and expires_at < ?", (now,))
+        if not rows:
+            return 0
+        live = self._live_recording() or {}
+        live_id = live.get("id")
+        task = self.active_task() or {}
+        closed = 0
+        for row in rows:
+            legs = self._rows("select * from roster_leg where roster_id=?", (row["id"],))
+            if any((leg.get("status") or "").upper() == "COMPLETED" for leg in legs):
+                continue
+            if live_id and any(leg.get("flight_record_id") == live_id for leg in legs):
+                continue
+            if task.get("roster_id") == row["id"]:
+                continue
+            self._close_stale_roster(row, legs)
+            closed += 1
+        return closed
+
+    def _close_stale_roster(self, row: dict[str, Any], legs: list[dict[str, Any]]) -> None:
+        stamp = utcnow()
+        roster_id = row["id"]
+        with self._tx() as con:
+            con.execute("update roster set status='EXPIRED', updated_at=? where id=?",
+                        (stamp, roster_id))
+            for leg in legs:
+                if (leg.get("status") or "").upper() not in ("PLANNED", "IN_PROGRESS"):
+                    continue
+                con.execute("update roster_leg set status='CANCELLED', updated_at=? where id=?",
+                            (stamp, leg["id"]))
+                if leg.get("flight_instance_id"):
+                    con.execute(
+                        "update flight_instance set "
+                        "status=case when mission_type='FREE' then 'CANCELLED' else 'SCHEDULED' end, "
+                        "assigned_aircraft_id=NULL, roster_id=NULL, updated_at=? "
+                        "where id=? and status in ('ASSIGNED','STARTED','SCHEDULED')",
+                        (stamp, leg["flight_instance_id"]))
+            con.execute("update aircraft_lock set status='EXPIRED', released_at=? "
+                        "where roster_id=? and status in ('HELD','IN_FLIGHT')", (stamp, roster_id))
+            still_locked = con.execute(
+                "select count(*) from aircraft_lock where aircraft_id=? "
+                "and status in ('HELD','IN_FLIGHT')", (row["aircraft_id"],)).fetchone()[0]
+            if not still_locked:
+                con.execute("update aircraft set status='ACTIVE', updated_at=?, version=version+1 "
+                            "where id=? and status in ('HELD','IN_FLIGHT')",
+                            (stamp, row["aircraft_id"]))
+            self._audit(con, "ROSTER_STALE_EXPIRE", "roster", roster_id, "IN_PROGRESS", "EXPIRED",
+                        "窗口已过、一段未完成且无进行中的录制（自动收尾，不收费）")
 
     def reset(self) -> dict[str, Any]:
         """危险操作：清空运营数据并重新种演示数据（保留个人模式日志与轨迹）。"""

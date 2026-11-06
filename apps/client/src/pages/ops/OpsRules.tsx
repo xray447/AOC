@@ -1,22 +1,27 @@
 import { ReloadOutlined, RollbackOutlined, SaveOutlined, ThunderboltOutlined } from "@ant-design/icons";
 import {
-  Alert, Button, Card, Col, Divider, Form, Input, InputNumber, Modal, Row, Select, Space, Switch,
-  Table, Tabs, Tag, Typography, message,
+  Alert, Button, Card, Col, Divider, Form, Input, InputNumber, Modal, Popconfirm, Row, Select, Space,
+  Switch, Table, Tabs, Tag, Typography, message,
 } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
+import { LoadError } from "../../components/LoadError";
+import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { anomalyLabel, fmtUtc, money } from "../../ops";
 import type { OpsAudit, OpsConfig, OpsPolicy } from "../../types";
 
 const { Text } = Typography;
 
-const ACTIONS = [
-  { value: "ACCEPT", label: "ACCEPT（正常结算）" },
-  { value: "WEIGHTED", label: "WEIGHTED（按比例折算）" },
-  { value: "REVIEW", label: "REVIEW（进入复核队列）" },
-  { value: "REJECT", label: "REJECT（拒绝，收入 0）" },
-];
+/** UI-13：策略动作不再只有中文标签（英文模式下也一致）。 */
+function actionOptions(tr: (zh: string, en: string) => string) {
+  return [
+    { value: "ACCEPT", label: tr("ACCEPT（正常结算）", "ACCEPT (settle normally)") },
+    { value: "WEIGHTED", label: tr("WEIGHTED（按比例折算）", "WEIGHTED (scaled payout)") },
+    { value: "REVIEW", label: tr("REVIEW（进入复核队列）", "REVIEW (to review queue)") },
+    { value: "REJECT", label: tr("REJECT（拒绝，收入 0）", "REJECT (no revenue)") },
+  ];
+}
 
 interface Preview {
   economy: {
@@ -28,6 +33,10 @@ interface Preview {
 
 export function OpsRules() {
   const { tr } = useI18n();
+  // IA-07：联机模式下经济/策略由服务端维护，本页只读（不能预览/发布/回滚）
+  const { onlineMode: readOnly, refreshKey } = useApp();
+  const actions = useMemo(() => actionOptions(tr), [tr]);
+  const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState<OpsConfig | null>(null);
   const [amounts, setAmounts] = useState<Record<string, number>>({});
   const [policy, setPolicy] = useState<OpsPolicy | null>(null);
@@ -39,20 +48,25 @@ export function OpsRules() {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const [cfg, aud] = await Promise.all([
-      api<OpsConfig>("/local/ops/config"),
-      api<{ items: OpsAudit[] }>("/local/ops/audit?limit=50"),
-    ]);
-    setConfig(cfg);
-    const next: Record<string, number> = {};
-    for (const item of cfg.param_schema) next[item.key] = Number(cfg.economy[item.key] ?? 0);
-    setAmounts(next);
-    setPolicy(cfg.policy);
-    setOverridesText(JSON.stringify(cfg.policy.overrides || [], null, 2));
-    setAudit(aud.items);
+    try {
+      const [cfg, aud] = await Promise.all([
+        api<OpsConfig>("/local/ops/config"),
+        api<{ items: OpsAudit[] }>("/local/ops/audit?limit=50"),
+      ]);
+      setConfig(cfg);
+      const next: Record<string, number> = {};
+      for (const item of cfg.param_schema) next[item.key] = Number(cfg.economy[item.key] ?? 0);
+      setAmounts(next);
+      setPolicy(cfg.policy);
+      setOverridesText(JSON.stringify(cfg.policy.overrides || [], null, 2));
+      setAudit(aud.items);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
 
   const groups = useMemo(() => {
     const out: Record<string, OpsConfig["param_schema"]> = {};
@@ -130,7 +144,16 @@ export function OpsRules() {
     });
   };
 
-  if (!config || !policy) return <div className="page"><Card loading /></div>;
+  // UI-09：接口失败时给持久错误 + 重试（以前只有一条会消失的 toast，页面停在骨架屏）
+  if (!config || !policy) {
+    return (
+      <div className="page">
+        {error
+          ? <LoadError title={tr("运营规则加载失败", "Failed to load rules")} message={error} onRetry={() => void load()} />
+          : <Card loading />}
+      </div>
+    );
+  }
 
   return (
     <div className="page">
@@ -142,10 +165,19 @@ export function OpsRules() {
         <Space wrap>
           <Tag color="blue">v{config.version}</Tag>
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
-          <Button icon={<ThunderboltOutlined />} loading={busy} onClick={() => void runPreview()}>{tr("预览", "Preview")}</Button>
-          <Button type="primary" icon={<SaveOutlined />} onClick={() => setPublishOpen(true)}>{tr("发布", "Publish")}</Button>
+          <Button icon={<ThunderboltOutlined />} loading={busy} disabled={readOnly}
+            onClick={() => void runPreview()}>{tr("预览", "Preview")}</Button>
+          <Button type="primary" icon={<SaveOutlined />} disabled={readOnly}
+            onClick={() => setPublishOpen(true)}>{tr("发布", "Publish")}</Button>
         </Space>
       </div>
+
+      {readOnly ? (
+        <Alert type="info" showIcon
+          message={tr("联机模式：经济参数与结算策略由公司服务端维护", "Online mode: economy and policy are maintained by the company server")}
+          description={tr("预览/发布/回滚已禁用；关闭联机模式后仍可编辑本机规则。",
+            "Preview, publish and rollback are disabled in online mode; turn it off to edit local rules.")} />
+      ) : null}
 
       <Tabs
         items={[
@@ -191,23 +223,23 @@ export function OpsRules() {
                   <Col xs={12} lg={6}>
                     <Form.Item label={tr("作用范围", "Scope")}>
                       <Select value={policy.scope_mode} options={[
-                        { value: "COMPANY_ONLY", label: "COMPANY_ONLY（仅本机默认）" },
-                        { value: "ALLOW_OVERRIDES", label: "ALLOW_OVERRIDES（允许机型/单机覆盖）" },
+                        { value: "COMPANY_ONLY", label: tr("COMPANY_ONLY（仅本机默认）", "COMPANY_ONLY (company only)") },
+                        { value: "ALLOW_OVERRIDES", label: tr("ALLOW_OVERRIDES（允许机型/单机覆盖）", "ALLOW_OVERRIDES (type/aircraft)") },
                       ]} onChange={(v) => setPolicy({ ...policy, scope_mode: v })} />
                     </Form.Item>
                   </Col>
                   <Col xs={12} lg={6}>
                     <Form.Item label={tr("未列异常默认动作", "Default action")}>
-                      <Select value={policy.default_action} options={ACTIONS}
+                      <Select value={policy.default_action} options={actions}
                         onChange={(v) => setPolicy({ ...policy, default_action: v })} />
                     </Form.Item>
                   </Col>
                   <Col xs={12} lg={6}>
                     <Form.Item label={tr("REJECT 成本模式", "Reject cost mode")}>
                       <Select value={policy.reject_cost_mode} options={[
-                        { value: "FULL", label: "FULL（成本照扣）" },
-                        { value: "DIRECT_ONLY", label: "DIRECT_ONLY（只扣直接成本）" },
-                        { value: "NONE", label: "NONE（不扣，结算 VOID）" },
+                        { value: "FULL", label: tr("FULL（成本照扣）", "FULL (all costs)") },
+                        { value: "DIRECT_ONLY", label: tr("DIRECT_ONLY（只扣直接成本）", "DIRECT_ONLY (direct costs)") },
+                        { value: "NONE", label: tr("NONE（不扣，结算 VOID）", "NONE (void)") },
                       ]} onChange={(v) => setPolicy({ ...policy, reject_cost_mode: v })} />
                     </Form.Item>
                   </Col>
@@ -247,7 +279,7 @@ export function OpsRules() {
                     {
                       title: tr("动作", "Action"), key: "action", width: 220,
                       render: (_: unknown, row: { kind: string; rule: Record<string, unknown> }) => (
-                        <Select size="small" value={String(row.rule.action || "REVIEW")} options={ACTIONS}
+                        <Select size="small" value={String(row.rule.action || "REVIEW")} options={actions}
                           style={{ width: "100%" }}
                           onChange={(v) => setRule(row.kind, { action: v })} />
                       ),
@@ -326,9 +358,19 @@ export function OpsRules() {
                           title: "", key: "act", width: 90,
                           render: (_: unknown, row: { version: number }) => (
                             row.version === config.version ? <Tag color="green">{tr("当前", "current")}</Tag> : (
-                              <Button size="small" type="text" icon={<RollbackOutlined />} onClick={() => void rollback(row.version)}>
-                                {tr("回滚", "Rollback")}
-                              </Button>
+                              // UI-11：回滚会改掉当前生效的经济/策略，先确认
+                              <Popconfirm
+                                title={tr(`回滚到 v${row.version}？`, `Roll back to v${row.version}?`)}
+                                description={tr("回滚会发布一个新版本，历史结算不变。",
+                                  "Rollback publishes a new version; settled history is untouched.")}
+                                okText={tr("回滚", "Roll back")}
+                                cancelText={tr("返回", "Back")}
+                                onConfirm={() => void rollback(row.version)}
+                              >
+                                <Button size="small" type="text" icon={<RollbackOutlined />} disabled={readOnly}>
+                                  {tr("回滚", "Rollback")}
+                                </Button>
+                              </Popconfirm>
                             )
                           ),
                         },

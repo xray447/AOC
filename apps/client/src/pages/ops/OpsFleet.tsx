@@ -110,9 +110,12 @@ function typeFormValues(row: OpsAircraftType): TypeFormValues {
 
 export function OpsFleet() {
   const { tr } = useI18n();
-  const { recording } = useApp();
+  // IA-07：联机模式下机队由服务端维护，本页只读
+  const { recording, onlineMode: readOnly, refreshKey } = useApp();
   const [fleet, setFleet] = useState<OpsAircraft[]>([]);
   const [types, setTypes] = useState<OpsAircraftType[]>([]);
+  // UI-12：新增飞机的基地不再写死 ZBAA，默认跟本机档案的基地走
+  const [baseAirport, setBaseAirport] = useState("");
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm<AddForm>();
@@ -130,26 +133,35 @@ export function OpsFleet() {
   const [ferryRate, setFerryRate] = useState({ perNm: 12, fixed: 1000 });
 
   const load = useCallback(async () => {
-    const [f, t, cfg] = await Promise.all([
+    const [f, t, cfg, profile] = await Promise.all([
       api<{ items: OpsAircraft[] }>("/local/ops/fleet"),
       api<{ items: OpsAircraftType[] }>("/local/ops/aircraft-types"),
       api<{ economy?: Record<string, number> }>("/local/ops/config")
         .catch(() => ({ economy: {} as Record<string, number> })),
+      api<{ base_airport_icao?: string | null }>("/local/ops/profile").catch(() => ({ base_airport_icao: null })),
     ]);
     setFleet(f.items);
     setTypes(t.items);
+    setBaseAirport(profile.base_airport_icao || "");
     setFerryRate({
       perNm: Number(cfg.economy?.fast_ferry_fee_per_nm ?? 12),
       fixed: Number(cfg.economy?.fast_ferry_fixed_fee ?? 1000),
     });
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load, refreshKey]);
 
   const typeOptions = useMemo(() => types.map((t) => ({
     value: t.id,
     label: `${typeLabel(t)} · ${t.pax_capacity}${tr("座", "pax")}`,
   })), [types, tr]);
+
+  /** 打开「新增飞机」：基地默认用本机档案（UI-12，不再写死 ZBAA）。 */
+  const openAdd = () => {
+    form.resetFields();
+    form.setFieldsValue({ base_airport_icao: baseAirport || undefined });
+    setOpen(true);
+  };
 
   const add = async () => {
     const values = await form.validateFields();
@@ -331,9 +343,18 @@ export function OpsFleet() {
         <Space>
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
           <Button icon={<SettingOutlined />} onClick={() => setTypeOpen(true)}>{tr("机型模板", "Type templates")}</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>{tr("新增飞机", "Add aircraft")}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={readOnly} onClick={openAdd}>
+            {tr("新增飞机", "Add aircraft")}
+          </Button>
         </Space>
       </div>
+
+      {readOnly ? (
+        <Alert type="info" showIcon
+          message={tr("联机模式：机队由公司服务端维护", "Online mode: the fleet is maintained by the company server")}
+          description={tr("新增/送修/退役/调机与机型编辑都已禁用；未开启联机时保持可编辑。",
+            "Adding, maintenance, retirement, ferry and type editing are disabled in online mode.")} />
+      ) : null}
 
       {fleet.length === 0 ? (
         <Alert type="info" showIcon message={tr("机队为空", "Fleet is empty")}
@@ -387,16 +408,16 @@ export function OpsFleet() {
                     {r.locked ? (
                       <Popconfirm title={tr("强制释放飞机？会取消相关班表", "Force release? Related rosters are cancelled")}
                         onConfirm={() => void release(r)}>
-                        <Button size="small" danger icon={<UnlockOutlined />}>{tr("释放", "Release")}</Button>
+                        <Button size="small" danger icon={<UnlockOutlined />} disabled={readOnly}>{tr("释放", "Release")}</Button>
                       </Popconfirm>
                     ) : null}
                     {r.status === "ACTIVE" && !r.locked ? (
-                      <Button size="small" onClick={() => void previewFerry(r)}>
+                      <Button size="small" disabled={readOnly} onClick={() => void previewFerry(r)}>
                         {tr("快速调机", "Ferry")}
                       </Button>
                     ) : null}
                     {r.status === "ACTIVE" || r.status === "MAINTENANCE" ? (
-                      <Button size="small" onClick={() => void patch(r, {
+                      <Button size="small" disabled={readOnly} onClick={() => void patch(r, {
                         status: r.status === "ACTIVE" ? "MAINTENANCE" : "ACTIVE", version: r.version,
                       })}>
                         {r.status === "ACTIVE" ? tr("送修", "Maintenance") : tr("恢复", "Restore")}
@@ -405,7 +426,7 @@ export function OpsFleet() {
                     {r.status !== "RETIRED" && !r.locked ? (
                       <Popconfirm title={tr("退役后不能再执行航班", "Retire this aircraft?")}
                         onConfirm={() => void patch(r, { status: "RETIRED", version: r.version })}>
-                        <Button size="small" danger type="text">{tr("退役", "Retire")}</Button>
+                        <Button size="small" danger type="text" disabled={readOnly}>{tr("退役", "Retire")}</Button>
                       </Popconfirm>
                     ) : null}
                   </Space>
@@ -424,7 +445,7 @@ export function OpsFleet() {
         extra={(
           <Space>
             <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreateType}>
+            <Button type="primary" icon={<PlusOutlined />} disabled={readOnly} onClick={openCreateType}>
               {tr("新增机型", "New type")}
             </Button>
           </Space>
@@ -489,9 +510,9 @@ export function OpsFleet() {
               render: (_: unknown, r: OpsAircraftType) => (
                 <Space size={4} wrap>
                   {r.source === "CUSTOM" ? (
-                    <Button size="small" onClick={() => openEditType(r)}>{tr("编辑", "Edit")}</Button>
+                    <Button size="small" disabled={readOnly} onClick={() => openEditType(r)}>{tr("编辑", "Edit")}</Button>
                   ) : null}
-                  <Button size="small" onClick={() => openCopyType(r)}>{tr("复制", "Copy")}</Button>
+                  <Button size="small" disabled={readOnly} onClick={() => openCopyType(r)}>{tr("复制", "Copy")}</Button>
                   {r.source !== "CUSTOM" ? (
                     <Popconfirm
                       title={tr("按内置真值重置翼展？", "Reset wingspan to the built-in value?")}
@@ -499,20 +520,30 @@ export function OpsFleet() {
                         "Only this row; for wingspans left wrong by older fallback values.")}
                       onConfirm={() => void resetTypeWingspan(r)}
                     >
-                      <Button size="small" type="text">{tr("重置翼展", "Reset span")}</Button>
+                      <Button size="small" type="text" disabled={readOnly}>{tr("重置翼展", "Reset span")}</Button>
                     </Popconfirm>
                   ) : null}
                   {r.source === "CUSTOM" ? (
                     <>
-                      <Tooltip title={tr("停用后不再参与抽班/包机", "Disabled types are excluded from draws")}>
-                        <Button size="small" onClick={() => void disableType(r)}>{tr("停用", "Disable")}</Button>
-                      </Tooltip>
+                      {/* UI-11：停用会让抽班/包机都选不到这个机型，先确认（原来点了就生效） */}
+                      <Popconfirm
+                        title={tr("停用这个机型？", "Disable this type?")}
+                        description={tr("停用后不再参与抽班/包机；可再点「编辑」把开关打开恢复。",
+                          "Disabled types are excluded from draws and charters; re-enable it in Edit.")}
+                        okText={tr("停用", "Disable")}
+                        cancelText={tr("返回", "Back")}
+                        onConfirm={() => void disableType(r)}
+                      >
+                        <Tooltip title={tr("停用后不再参与抽班/包机", "Disabled types are excluded from draws")}>
+                          <Button size="small" disabled={readOnly}>{tr("停用", "Disable")}</Button>
+                        </Tooltip>
+                      </Popconfirm>
                       <Popconfirm
                         title={tr("删除这个自定义机型？", "Delete this custom type?")}
                         description={tr("机队里还有飞机在用时会拒绝删除。", "Deletion is rejected while aircraft still use it.")}
                         onConfirm={() => void deleteType(r)}
                       >
-                        <Button size="small" danger type="text">{tr("删除", "Delete")}</Button>
+                        <Button size="small" danger type="text" disabled={readOnly}>{tr("删除", "Delete")}</Button>
                       </Popconfirm>
                     </>
                   ) : null}
@@ -738,7 +769,7 @@ export function OpsFleet() {
         confirmLoading={busy}
         okText={tr("加入机队", "Add")}
       >
-        <Form form={form} layout="vertical" initialValues={{ acquisition_type: "LEASE", base_airport_icao: "ZBAA" }}>
+        <Form form={form} layout="vertical" initialValues={{ acquisition_type: "LEASE" }}>
           <Form.Item name="type_id" label={tr("机型模板", "Type template")}
             extra={recording.aircraft_title
               ? tr(`当前模拟器机模：${recording.aircraft_title}（留空则按关键字自动匹配）`,
@@ -749,8 +780,9 @@ export function OpsFleet() {
           <Form.Item name="registration" label={tr("注册号", "Registration")} rules={[{ required: true }]}>
             <Input maxLength={12} placeholder="B-1671" />
           </Form.Item>
+          {/* UI-12：机场走 navdata 搜索，默认填本机档案的基地 */}
           <Form.Item name="base_airport_icao" label={tr("基地机场", "Base airport")} rules={[{ required: true }]}>
-            <Input maxLength={4} />
+            <AirportSelect placeholder={baseAirport || "ZBAA"} />
           </Form.Item>
           <Form.Item name="acquisition_type" label={tr("引进方式", "Acquisition")}>
             <Select options={[

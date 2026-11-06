@@ -1,7 +1,9 @@
 import { Card, Col, Empty, Progress, Row, Space, Table, Tag, Typography } from "antd";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { LoadError } from "../components/LoadError";
 import { MetricCard } from "../components/MetricCard";
+import { useApp } from "../context";
 import { useI18n } from "../i18n";
 import type { Stats as StatsData } from "../types";
 import { fmtMinutes, pct, ratingLabels } from "../utils";
@@ -10,11 +12,21 @@ const { Text } = Typography;
 
 export function Stats() {
   const { tr } = useI18n();
+  const { refreshKey } = useApp();
   const [stats, setStats] = useState<StatsData | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    api<StatsData>("/local/stats").then(setStats).catch(() => undefined);
+  const load = useCallback(async () => {
+    try {
+      setStats(await api<StatsData>("/local/stats"));
+      setError(null);
+    } catch (e) {
+      // UI-09：以前 catch 掉之后页面静默显示 0，看不出是接口挂了
+      setError((e as Error).message);
+    }
   }, []);
+
+  useEffect(() => { void load(); }, [load, refreshKey]);
 
   const maxMonthly = useMemo(
     () => Math.max(1, ...(stats?.monthly.map((m) => m.flights) ?? [1])),
@@ -33,6 +45,14 @@ export function Stats() {
           <p>{tr("只统计 AOC 本地完成的飞行；Volanta 历史仅参与机场去重", "Only completed AOC flights count here; Volanta history only feeds airport dedupe")}</p>
         </div>
       </div>
+
+      {error ? (
+        <LoadError
+          message={error}
+          onRetry={() => void load()}
+          title={tr("统计数据加载失败", "Failed to load statistics")}
+        />
+      ) : null}
 
       <div className="metric-grid">
         <MetricCard title={tr("总飞行", "Flights")} value={stats?.flights ?? 0} />

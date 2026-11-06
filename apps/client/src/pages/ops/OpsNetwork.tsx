@@ -1,18 +1,21 @@
 import { DeleteOutlined, PlusOutlined, ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import {
-  Button, Card, Checkbox, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, message,
+  Alert, Button, Card, Checkbox, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, message,
 } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api";
 import { AirportSelect } from "../../components/AirportSelect";
+import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { fmtBlock, fmtUtc, hoursFromMinutes } from "../../ops";
 import type { OpsAircraftType, OpsInstance, OpsRoute, OpsSchedule } from "../../types";
 
+// UI-13：星期标签要走 i18n（英文模式下以前仍是「一二三四五六日」）
 const WEEKDAYS = [
-  { label: "一", value: 1 }, { label: "二", value: 2 }, { label: "三", value: 4 },
-  { label: "四", value: 8 }, { label: "五", value: 16 }, { label: "六", value: 32 },
-  { label: "日", value: 64 },
+  { zh: "一", en: "Mon", value: 1 }, { zh: "二", en: "Tue", value: 2 },
+  { zh: "三", en: "Wed", value: 4 }, { zh: "四", en: "Thu", value: 8 },
+  { zh: "五", en: "Fri", value: 16 }, { zh: "六", en: "Sat", value: 32 },
+  { zh: "日", en: "Sun", value: 64 },
 ];
 
 const instanceColor: Record<string, string> = {
@@ -20,8 +23,21 @@ const instanceColor: Record<string, string> = {
   SETTLED: "default", CANCELLED: "red", ABORTED: "orange",
 };
 
+const instanceLabel: Record<string, { zh: string; en: string }> = {
+  SCHEDULED: { zh: "已排班", en: "Scheduled" },
+  ASSIGNED: { zh: "已分配", en: "Assigned" },
+  STARTED: { zh: "已开始", en: "Started" },
+  LANDED: { zh: "已落地", en: "Landed" },
+  SETTLED: { zh: "已结算", en: "Settled" },
+  CANCELLED: { zh: "已取消", en: "Cancelled" },
+  ABORTED: { zh: "已中止", en: "Aborted" },
+};
+
 export function OpsNetwork() {
   const { tr } = useI18n();
+  // IA-07：联机模式下航线/班期由服务端维护，本页只读
+  const { onlineMode, refreshKey } = useApp();
+  const readOnly = onlineMode;
   const [routes, setRoutes] = useState<OpsRoute[]>([]);
   const [schedules, setSchedules] = useState<OpsSchedule[]>([]);
   const [instances, setInstances] = useState<OpsInstance[]>([]);
@@ -45,7 +61,7 @@ export function OpsNetwork() {
     setTypes(t.items);
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load, refreshKey]);
 
   const addRoute = async () => {
     const values = await routeForm.validateFields();
@@ -65,12 +81,18 @@ export function OpsNetwork() {
 
   const addSchedule = async () => {
     const values = await scheduleForm.validateFields();
+    // UI-12：全部取消勾选以前会被静默改成「每天」，用户会以为不排班 —— 直接拦住
+    const days = (values.days as number[] | undefined) || [];
+    if (!days.length) {
+      message.warning(tr("请至少选一个运行日（留空不等于不排班，以前会被当成每天）",
+        "Pick at least one operating day (an empty set used to mean every day)"));
+      return;
+    }
     setBusy(true);
     try {
-      const days = (values.days as number[] | undefined) || [];
       await api("/local/ops/schedules", {
         method: "POST",
-        body: JSON.stringify({ ...values, days_of_week: days.reduce((acc, v) => acc + v, 0) || 127 }),
+        body: JSON.stringify({ ...values, days_of_week: days.reduce((acc, v) => acc + v, 0) }),
       });
       setScheduleOpen(false);
       scheduleForm.resetFields();
@@ -140,9 +162,18 @@ export function OpsNetwork() {
         </div>
         <Space>
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
-          <Button icon={<SyncOutlined />} onClick={() => void generate()}>{tr("生成未来 7 天", "Generate 7 days")}</Button>
+          <Button icon={<SyncOutlined />} disabled={readOnly} onClick={() => void generate()}>
+            {tr("生成未来 7 天", "Generate 7 days")}
+          </Button>
         </Space>
       </div>
+
+      {readOnly ? (
+        <Alert type="info" showIcon
+          message={tr("联机模式：该数据由公司服务端维护", "Online mode: maintained by the company server")}
+          description={tr("客户端的航线/班期编辑已隐藏或置灰；未开启联机时仍可自由编辑。",
+            "Route/schedule editing is disabled in online mode; turn online mode off to edit locally.")} />
+      ) : null}
 
       <Tabs
         items={[
@@ -152,7 +183,8 @@ export function OpsNetwork() {
             children: (
               <Card className="panel" variant="borderless" styles={{ body: { padding: 0 } }}
                 title={<span>{tr("航线网络", "Network")}</span>}
-                extra={<Button size="small" type="primary" icon={<PlusOutlined />} onClick={() => setRouteOpen(true)}>{tr("新增航线", "Add route")}</Button>}>
+                extra={<Button size="small" type="primary" icon={<PlusOutlined />} disabled={readOnly}
+                  onClick={() => setRouteOpen(true)}>{tr("新增航线", "Add route")}</Button>}>
                 <Table
                   rowKey="id"
                   size="small"
@@ -168,7 +200,7 @@ export function OpsNetwork() {
                       title: "", key: "del", width: 60,
                       render: (_: unknown, r: OpsRoute) => (
                         <Popconfirm title={tr("删除航线？", "Delete route?")} onConfirm={() => void removeRoute(r)}>
-                          <Button size="small" type="text" danger icon={<DeleteOutlined />} />
+                          <Button size="small" type="text" danger icon={<DeleteOutlined />} disabled={readOnly} />
                         </Popconfirm>
                       ),
                     },
@@ -182,7 +214,8 @@ export function OpsNetwork() {
             label: `${tr("班期", "Schedules")} (${schedules.length})`,
             children: (
               <Card className="panel" variant="borderless" styles={{ body: { padding: 0 } }}
-                extra={<Button size="small" type="primary" icon={<PlusOutlined />} onClick={() => setScheduleOpen(true)}>{tr("新增班期", "Add schedule")}</Button>}>
+                extra={<Button size="small" type="primary" icon={<PlusOutlined />} disabled={readOnly}
+                  onClick={() => setScheduleOpen(true)}>{tr("新增班期", "Add schedule")}</Button>}>
                 <Table
                   rowKey="id"
                   size="small"
@@ -196,18 +229,21 @@ export function OpsNetwork() {
                     { title: tr("机型", "Type"), key: "type", render: (_: unknown, r: OpsSchedule) => r.type_icao ? `${r.type_icao}${r.type_variant && r.type_variant !== "STANDARD" ? ` ${r.type_variant}` : ""}` : tr("任意", "Any") },
                     { title: tr("过站", "Turn"), dataIndex: "turnaround_min", width: 70, render: (v: number) => `${v}min` },
                     {
-                      title: tr("启用", "Enabled"), dataIndex: "enabled", width: 80,
+                      // UI-11：以前是个「看起来像标签」的控件，点一下就切换 —— 改成明确的开关
+                      title: tr("启用", "Enabled"), dataIndex: "enabled", width: 90,
                       render: (v: boolean, r: OpsSchedule) => (
-                        <Tag color={v ? "green" : "default"} style={{ cursor: "pointer" }} onClick={() => void toggleSchedule(r, !v)}>
-                          {v ? tr("启用", "on") : tr("停用", "off")}
-                        </Tag>
+                        <Space size={6}>
+                          <Switch size="small" checked={v} disabled={readOnly}
+                            onChange={(next) => void toggleSchedule(r, next)} />
+                          <span className="muted" style={{ fontSize: 12 }}>{v ? tr("启用", "on") : tr("停用", "off")}</span>
+                        </Space>
                       ),
                     },
                     {
                       title: "", key: "del", width: 60,
                       render: (_: unknown, r: OpsSchedule) => (
                         <Popconfirm title={tr("删除班期？", "Delete schedule?")} onConfirm={() => void removeSchedule(r)}>
-                          <Button size="small" type="text" danger icon={<DeleteOutlined />} />
+                          <Button size="small" type="text" danger icon={<DeleteOutlined />} disabled={readOnly} />
                         </Popconfirm>
                       ),
                     },
@@ -233,14 +269,18 @@ export function OpsNetwork() {
                     { title: tr("计划到达", "ETA"), dataIndex: "scheduled_arr_utc", render: (v: string) => <span className="mono">{fmtUtc(v)}</span> },
                     { title: tr("任务", "Mission"), dataIndex: "mission_type", width: 100 },
                     {
-                      title: tr("状态", "Status"), dataIndex: "status", width: 100,
-                      render: (v: string) => <Tag color={instanceColor[v] || "default"}>{v}</Tag>,
+                      title: tr("状态", "Status"), dataIndex: "status", width: 110,
+                      render: (v: string) => (
+                        <Tag color={instanceColor[v] || "default"}>
+                          {instanceLabel[v] ? tr(instanceLabel[v].zh, instanceLabel[v].en) : v}
+                        </Tag>
+                      ),
                     },
                     {
                       title: "", key: "act", width: 80,
                       render: (_: unknown, r: OpsInstance) => (r.status === "SCHEDULED" ? (
                         <Popconfirm title={tr("取消该航班实例？", "Cancel this instance?")} onConfirm={() => void cancelInstance(r)}>
-                          <Button size="small" type="text" danger>{tr("取消", "Cancel")}</Button>
+                          <Button size="small" type="text" danger disabled={readOnly}>{tr("取消", "Cancel")}</Button>
                         </Popconfirm>
                       ) : null),
                     },
@@ -287,12 +327,37 @@ export function OpsNetwork() {
             <Form.Item name="flight_number" label={tr("航班号", "Flight number")} rules={[{ required: true }]} style={{ flex: 1 }}>
               <Input maxLength={8} placeholder="AOC101" />
             </Form.Item>
-            <Form.Item name="dep_local_time" label={tr("本地起飞 HH:MM", "Local dep HH:MM")} rules={[{ required: true }]} style={{ width: 160 }}>
-              <Input placeholder="08:00" />
+            {/* UI-12：时刻不再随便填 —— 统一成 HH:MM，非法值就地报错 */}
+            <Form.Item
+              name="dep_local_time"
+              label={tr("本地起飞 HH:MM", "Local dep HH:MM")}
+              style={{ width: 160 }}
+              normalize={(value: string) => {
+                const raw = String(value ?? "").trim();
+                const match = /^(\d{1,2}):(\d{2})$/.exec(raw);
+                return match ? `${match[1].padStart(2, "0")}:${match[2]}` : raw;
+              }}
+              rules={[
+                { required: true },
+                {
+                  pattern: /^([01]\d|2[0-3]):[0-5]\d$/,
+                  message: tr("格式为 HH:MM（00:00–23:59）", "Use HH:MM (00:00–23:59)"),
+                },
+              ]}
+            >
+              <Input placeholder="08:00" maxLength={5} />
             </Form.Item>
           </Space>
-          <Form.Item name="days" label={tr("运行日（本地）", "Days (local)")}>
-            <Checkbox.Group options={WEEKDAYS} />
+          <Form.Item
+            name="days"
+            label={tr("运行日（本地）", "Days (local)")}
+            rules={[{
+              validator: (_rule, value: number[] | undefined) => (value && value.length
+                ? Promise.resolve()
+                : Promise.reject(new Error(tr("至少选一天", "Pick at least one day")))),
+            }]}
+          >
+            <Checkbox.Group options={WEEKDAYS.map((d) => ({ value: d.value, label: tr(d.zh, d.en) }))} />
           </Form.Item>
           <Space size={12} style={{ display: "flex" }}>
             <Form.Item name="aircraft_type_id" label={tr("机型要求", "Aircraft type")} style={{ flex: 1 }}>

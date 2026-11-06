@@ -12,6 +12,8 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../api";
+import { AirportSelect } from "../../components/AirportSelect";
+import { LoadError } from "../../components/LoadError";
 import { MetricCard } from "../../components/MetricCard";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
@@ -32,9 +34,10 @@ function prefixPair(value: unknown, digits: string, fallback: string): { prefix:
 export function OpsHome() {
   const { tr } = useI18n();
   const navigate = useNavigate();
-  const { opsStatus } = useApp();
+  const { opsStatus, refreshKey } = useApp();
   const statusMeta = opsStateMeta(opsStatus);
   const [data, setData] = useState<OpsDashboard | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [settlements, setSettlements] = useState<OpsSettlement[]>([]);
   const [profileOpen, setProfileOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -52,9 +55,15 @@ export function OpsHome() {
     ]);
     setData(dash);
     setSettlements(st.items);
+    setError(null);
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  const reload = useCallback(() => {
+    setError(null);
+    void load().catch((e: Error) => setError(e.message));
+  }, [load]);
+
+  useEffect(() => { reload(); }, [reload, refreshKey]);
 
   const seed = async () => {
     setBusy(true);
@@ -86,7 +95,16 @@ export function OpsHome() {
     }
   };
 
-  if (!data) return <div className="page"><Card loading /></div>;
+  // UI-09：接口失败时给持久错误 + 重试，而不是永远停在骨架屏
+  if (!data) {
+    return (
+      <div className="page">
+        {error
+          ? <LoadError title={tr("运营数据加载失败", "Failed to load operations data")} message={error} onRetry={reload} />
+          : <Card loading />}
+      </div>
+    );
+  }
   const profile = data.profile;
   const roster = data.active_roster;
   const callsignSample = prefixPair(profile.callsign_prefix, "123", "AUV");
@@ -99,7 +117,7 @@ export function OpsHome() {
           <h2>{tr("运营中心", "Operations")}</h2>
           <p>{tr("单机运营模式：机队、班表、配载、结算与账本都在本机完成，无需联网。", "Single-player operations: fleet, rosters, load sheets, settlement and ledger stay local — no server, no login.")}</p>
         </div>
-        <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
+        <Button icon={<ReloadOutlined />} onClick={reload}>{tr("刷新", "Refresh")}</Button>
       </div>
 
       <Card
@@ -321,7 +339,10 @@ export function OpsHome() {
           >
             <Input maxLength={4} placeholder="AOC" />
           </Form.Item>
-          <Form.Item name="base_airport_icao" label={tr("基地机场", "Base airport")}><Input maxLength={4} placeholder="ZBAA" /></Form.Item>
+          {/* UI-12：机场不再是自由文本（错了只能等后端报错），走 navdata 搜索 */}
+          <Form.Item name="base_airport_icao" label={tr("基地机场", "Base airport")}>
+            <AirportSelect allowClear placeholder="ZBAA" />
+          </Form.Item>
           <Form.Item name="currency" label={tr("货币", "Currency")}><Input disabled /></Form.Item>
         </Form>
       </Modal>

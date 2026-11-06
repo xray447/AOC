@@ -149,6 +149,18 @@ class PersonalService:
     def _wire_ops_hooks(self) -> None:
         self.flights.ops_context = self.ops.context_for_recording
         self.flights.on_finalized = self.ops.on_flight_finalized
+        # 1.6：改绑「无主自动开录」时回填推出定稿值（推出可能发生在任务开始之前）
+        self.ops.pushback_provider = self._pushback_snapshot
+        # §36 兜底 C：navdata 可能在 ops 建好之前就被读过，这里补一次覆盖
+        self._apply_runway_overrides(self._nav)
+
+    def _pushback_snapshot(self) -> dict:
+        """当前这条录制的推出定稿快照（未推出时为空值）。"""
+        return {
+            "zfw_kg": self.flights.zfw_at_pushback,
+            "fuel_kg": self.flights.fuel_at_pushback,
+            "source": self.flights.pushback_source,
+        }
 
     def _match_aircraft_type(self, title: str | None) -> str | None:
         """按 SimLink 的 aircraft_title 匹配机型（机队/机型模板的 title_keyword）。"""
@@ -232,10 +244,31 @@ class PersonalService:
         self._nav_path = key
         try:
             self._nav = NavData(path, scenery_path=scenery, runway_source=source)
+            # §36 兜底 C（1.4）：手工跑道覆盖优先于场景库/navdata
+            self._apply_runway_overrides(self._nav)
         except (NavDataError, Exception) as exc:  # noqa: BLE001
             self._nav_error = f"{type(exc).__name__}: {exc}"
             self._nav = None
         return self._nav
+
+    def _apply_runway_overrides(self, nav: NavData | None) -> None:
+        ops = getattr(self, "ops", None)
+        if nav is None or ops is None:
+            return
+        try:
+            nav.set_runway_overrides(ops.runway_overrides())
+        except Exception:  # noqa: BLE001
+            return
+
+    def set_runway_override(self, icao: str, ident: str, data: dict) -> dict:
+        result = self.ops.set_runway_override(icao, ident, data)
+        self._apply_runway_overrides(self._nav)
+        return result
+
+    def delete_runway_override(self, icao: str, ident: str) -> dict:
+        result = self.ops.delete_runway_override(icao, ident)
+        self._apply_runway_overrides(self._nav)
+        return result
 
     def _scenery_candidate(self) -> str | None:
         """游戏场景库（§36 / D-7）：Little Navmap 从 MSFS 扫出的 navdata。
@@ -690,6 +723,24 @@ class PersonalService:
             if not self.ops.active_task():
                 return {"ok": True, "aborted": True, "task": task}
         return self.ops.abort_task(reason, task=task)
+
+    async def recover_stuck(self, reason: str | None = None) -> dict:
+        """卡死恢复（1.6）：先停掉「没绑到任务上」的录制，再解开任务，机队位置保持现状。
+
+        典型现场（§41）：SimLink 自动开录建了一条 PERSONAL 记录，任务却指向另一个
+        （甚至不存在的）记录 id，执行页一直显示「开始记录」，`void` 又会把飞机位置
+        写回出发机场 —— 与真实位置不符。这里只做解除，不搬飞机、不冲销账本。
+        """
+        task = self.ops.active_task()
+        current = self.flights.status()
+        stopped = False
+        if current.active and (not task or current.flight_id != task.get("flight_record_id")):
+            await self.stop_recording(abort=True)
+            stopped = True
+        result = self.ops.recover_task(reason)
+        result["stopped_recording"] = stopped
+        result["recording_id"] = current.flight_id if stopped else None
+        return result
 
     async def start_recording(self, partial: bool = False) -> dict:
         """开始录制。ZFW/油量不再在开录时取样（§32 方案 B）：由推出事件回传定稿值。"""

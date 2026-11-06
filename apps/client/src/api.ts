@@ -45,6 +45,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       } else if (data?.message) {
         message = data.message;
       }
+      // aoc-core 的 OpsError 处理器返回的是平铺结构 `{code, message, details}`（没有 `detail` 包裹），
+      // 以前只读 `detail.*` 导致 `err.code` 永远是 undefined（ROSTER_EXISTS / RECORDING_IN_PROGRESS
+      // / AIRCRAFT_NOT_AT_DEPARTURE 这些分支其实一直没生效）。
+      if (!code && typeof data?.code === "string") code = data.code;
+      if (!details && data?.details && typeof data.details === "object") details = data.details;
     } catch {
       /* keep status text */
     }

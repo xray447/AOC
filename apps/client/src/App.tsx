@@ -26,8 +26,10 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { api, initApi } from "./api";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import type { AppContextValue } from "./context";
 import { I18nProvider, useI18n } from "./i18n";
+import { confirmLeave } from "./leaveGuard";
 import { Onboarding } from "./pages/Onboarding";
 import { Dashboard } from "./pages/Dashboard";
 import { OpsFinance } from "./pages/ops/OpsFinance";
@@ -35,16 +37,14 @@ import { OpsFleet } from "./pages/ops/OpsFleet";
 import { OpsFly } from "./pages/ops/OpsFly";
 import { OpsHome } from "./pages/ops/OpsHome";
 import { OpsNetwork } from "./pages/ops/OpsNetwork";
-import { OpsReview } from "./pages/ops/OpsReview";
 import { OpsRules } from "./pages/ops/OpsRules";
 import { Online } from "./pages/Online";
-import { Recommend } from "./pages/Recommend";
-import { RoutePlanner } from "./pages/RoutePlanner";
+import { RoutePlan } from "./pages/RoutePlan";
 import { Logs } from "./pages/Logs";
 import { LogDetail } from "./pages/LogDetail";
-import { MapPage } from "./pages/MapPage";
 import { Stats } from "./pages/Stats";
 import { SettingsPage } from "./pages/Settings";
+import { loadOnline } from "./online";
 import { opsStateMeta } from "./ops";
 import { simlinkState } from "./simlink";
 import type { Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings } from "./types";
@@ -66,18 +66,28 @@ function useDarkMode(settings: Settings | null): boolean {
   return systemDark;
 }
 
-function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, saveSettings, dark }: AppContextValue) {
+function Shell({
+  bootstrap, settings, navdata, recording, opsStatus, refresh, saveSettings, dark, onlineMode,
+  refreshKey, openWizard,
+}: AppContextValue) {
   const { tr } = useI18n();
   const location = useLocation();
   const navigate = useNavigate();
   const [collapsed, setCollapsed] = useState(false);
+  /** UI-10：有未保存改动时先确认（设置页注册的拦截器）。 */
+  const go = useCallback(async (path: string) => {
+    if (path === location.pathname) return;
+    if (!(await confirmLeave())) return;
+    navigate(path);
+  }, [location.pathname, navigate]);
   const selected = useMemo(() => {
-    if (location.pathname.startsWith("/logs")) return "/logs";
+    // IA-02 / IA-01 / IA-09：合并页的子路由仍高亮同一个菜单项
+    if (location.pathname.startsWith("/logs") || location.pathname.startsWith("/map")) return "/logs";
+    if (location.pathname.startsWith("/recommend")) return "/route";
     if (location.pathname.startsWith("/ops")) {
       const path = "/" + location.pathname.split("/").slice(1, 3).join("/");
-      // 合并页：子页签路由仍高亮同一个菜单项
       if (["/ops/roster", "/ops/free", "/ops/execute"].includes(path)) return "/ops/fly";
-      if (["/ops/settlements", "/ops/ledger"].includes(path)) return "/ops/finance";
+      if (["/ops/settlements", "/ops/ledger", "/ops/review"].includes(path)) return "/ops/finance";
       return path;
     }
     return location.pathname;
@@ -85,10 +95,10 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
 
   const personalItems = [
     { key: "/", icon: <DashboardOutlined />, label: tr("首页", "Home") },
-    { key: "/recommend", icon: <CompassOutlined />, label: tr("推荐", "Discover") },
-    { key: "/route", icon: <RocketOutlined />, label: tr("航路", "Routes") },
+    // IA-09：推荐与航路合成一页（先推荐、后规划），两个深链都保留
+    { key: "/route", icon: <CompassOutlined />, label: tr("航路规划", "Route planning") },
+    // IA-02：地图并进日志页签
     { key: "/logs", icon: <AppstoreOutlined />, label: tr("日志", "Logbook") },
-    { key: "/map", icon: <GlobalOutlined />, label: tr("地图", "Map") },
     { key: "/stats", icon: <LineChartOutlined />, label: tr("统计", "Stats") },
     { key: "/settings", icon: <SettingOutlined />, label: tr("设置", "Settings") },
   ];
@@ -97,9 +107,9 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
     { key: "/ops/fleet", icon: <CarOutlined />, label: tr("机队", "Fleet") },
     { key: "/ops/network", icon: <ThunderboltOutlined />, label: tr("航线与班期", "Network") },
     { key: "/ops/fly", icon: <RocketOutlined />, label: tr("飞行执行", "Fly") },
+    // IA-01：复核队列并进财务的第三个页签
     { key: "/ops/finance", icon: <BankOutlined />, label: tr("财务", "Finance") },
     { key: "/ops/rules", icon: <AuditOutlined />, label: tr("运营规则", "Rules") },
-    { key: "/ops/review", icon: <CheckSquareOutlined />, label: tr("复核队列", "Review") },
     { key: "/ops/online", icon: <CloudServerOutlined />, label: tr("联机模式", "Online") },
   ];
   const items: MenuProps["items"] = [
@@ -117,7 +127,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
   return (
     <Layout className="app-shell">
       <Sider className="app-sider" collapsible collapsed={collapsed} trigger={null} width={216}>
-        <div className="brand" onClick={() => navigate("/")}>
+        <div className="brand" onClick={() => void go("/")}>
           <div className="brand-mark">AOC</div>
           {!collapsed ? (
             <div className="brand-text">
@@ -131,7 +141,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
           theme="dark"
           selectedKeys={[selected]}
           items={items}
-          onClick={({ key }) => navigate(key)}
+          onClick={({ key }) => void go(key)}
         />
         <div className="sider-footer">
           {!collapsed ? (
@@ -167,7 +177,7 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
                 type={statusMeta.state === "FLIGHT" ? "primary" : "default"}
                 icon={statusMeta.state === "FLIGHT" ? <RocketOutlined />
                   : statusMeta.state === "GROUND" ? <CarOutlined /> : <ClockCircleOutlined />}
-                onClick={() => navigate(statusMeta.path)}
+                onClick={() => void go(statusMeta.path)}
               >
                 {tr(statusMeta.zh, statusMeta.en)}
                 {statusDetail ? ` · ${statusDetail}` : ""}
@@ -184,7 +194,13 @@ function Shell({ bootstrap, settings, navdata, recording, opsStatus, refresh, sa
           </Space>
         </Header>
         <Content className="app-content">
-          <Outlet context={{ bootstrap, settings, navdata, recording, opsStatus, dark, refresh, saveSettings } satisfies AppContextValue} />
+          {/* UI-15：任一页面渲染抛错时拦截，避免整窗白屏（换页后自动复位） */}
+          <ErrorBoundary resetKey={location.pathname + String(refreshKey)}>
+            <Outlet context={{
+              bootstrap, settings, navdata, recording, opsStatus, dark,
+              refreshKey, refresh, saveSettings, onlineMode, openWizard,
+            } satisfies AppContextValue} />
+          </ErrorBoundary>
         </Content>
       </Layout>
     </Layout>
@@ -199,6 +215,8 @@ export default function App() {
   const [opsStatus, setOpsStatus] = useState<OpsStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showWizard, setShowWizard] = useState(false);
+  /** UI-08：顶栏「刷新」自增，页面据此重取自己的数据（不再是「只在当前页有效」的两种行为）。 */
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const load = useCallback(async () => {
     const boot = await initApi();
@@ -271,6 +289,8 @@ export default function App() {
     setNavdata(navRes);
     setRecording(recRes);
     setOpsStatus(statusRes);
+    // UI-08：顶栏刷新同时通知当前页面重取自己的数据
+    setRefreshKey((v) => v + 1);
   }, []);
 
   const saveSettings = useCallback(async (patch: Partial<Settings>) => {
@@ -293,6 +313,9 @@ export default function App() {
   }, [saveSettings]);
 
   const dark = useDarkMode(settings);
+  // IA-07：联机模式下客户端三页（航线与班期/机队/运营规则）只读；未联机保持现状。
+  // 登录/退出都在 localStorage，App 的轮询会让它在一个周期内同步过来。
+  const onlineMode = Boolean(loadOnline());
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -342,17 +365,22 @@ export default function App() {
                 recording={recording}
                 opsStatus={opsStatus}
                 dark={dark}
+                onlineMode={onlineMode}
+                refreshKey={refreshKey}
                 refresh={refresh}
                 saveSettings={saveSettings}
+                openWizard={() => setShowWizard(true)}
               />
             }
           >
             <Route index element={<Dashboard />} />
-            <Route path="recommend" element={<Recommend />} />
-            <Route path="route" element={<RoutePlanner />} />
+            {/* IA-09：推荐与航路是同一页，两个深链都保留 */}
+            <Route path="recommend" element={<RoutePlan />} />
+            <Route path="route" element={<RoutePlan />} />
             <Route path="logs" element={<Logs />} />
             <Route path="logs/:id" element={<LogDetail />} />
-            <Route path="map" element={<MapPage />} />
+            {/* IA-02：`/map` 落到日志页的地图页签（保留 `?focus=` / `?track=`） */}
+            <Route path="map" element={<Logs />} />
             <Route path="stats" element={<Stats />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="ops" element={<OpsHome />} />
@@ -366,7 +394,8 @@ export default function App() {
             <Route path="ops/settlements" element={<OpsFinance />} />
             <Route path="ops/ledger" element={<OpsFinance />} />
             <Route path="ops/rules" element={<OpsRules />} />
-            <Route path="ops/review" element={<OpsReview />} />
+            {/* IA-01：`/ops/review` 深链落在财务的「待复核」页签 */}
+            <Route path="ops/review" element={<OpsFinance />} />
             <Route path="ops/online" element={<Online />} />
           </Route>
         </Routes>

@@ -5,6 +5,8 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api";
+import { LoadError } from "../../components/LoadError";
+import { useRefreshKey } from "../../context";
 import { useI18n } from "../../i18n";
 import { entryLabel, fmtUtc, money } from "../../ops";
 import type { OpsLedger } from "../../types";
@@ -13,14 +15,31 @@ const { Text } = Typography;
 
 export function OpsLedgerPage({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
+  const refreshKey = useRefreshKey();
   const [data, setData] = useState<OpsLedger | null>(null);
   const [limit, setLimit] = useState(200);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setData(await api<OpsLedger>(`/local/ops/ledger?limit=${limit}`));
+    try {
+      setData(await api<OpsLedger>(`/local/ops/ledger?limit=${limit}`));
+      setError(null);
+    } catch (e) {
+      // UI-09：此前只有一条会消失的 toast，页面永远停在骨架屏
+      setError((e as Error).message);
+    }
   }, [limit]);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
+
+  /** UI-19：合并页里也要能改条数/刷新（以前这两个控件只在非合并页渲染）。 */
+  const toolbar = (
+    <Space>
+      <InputNumber min={50} max={1000} step={50} value={limit}
+        onChange={(v) => setLimit(Number(v || 200))} />
+      <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
+    </Space>
+  );
 
   const totals = Object.entries(data?.totals || {}).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
 
@@ -32,14 +51,15 @@ export function OpsLedgerPage({ embedded = false }: { embedded?: boolean }) {
             <h2>{tr("账本", "Ledger")}</h2>
             <p>{tr("只追加不修改；按类型汇总当期收入与成本。", "Append-only entries, summarised by type.")}</p>
           </div>
-          <Space>
-            <InputNumber min={50} max={1000} step={50} value={limit} onChange={(v) => setLimit(Number(v || 200))} />
-            <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
-          </Space>
+          {toolbar}
         </div>
       )}
 
-      {!data ? <Card loading /> : (
+      {embedded ? <div style={{ display: "flex", justifyContent: "flex-end" }}>{toolbar}</div> : null}
+
+      {error ? <LoadError message={error} onRetry={() => void load()} /> : null}
+
+      {!data ? (error ? null : <Card loading />) : (
         <>
           <Row gutter={16}>
             <Col xs={24} lg={8}>

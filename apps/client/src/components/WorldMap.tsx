@@ -66,11 +66,15 @@ interface Props {
   tilesUrl?: string | null;
   onSelectAirport?: (icao: string) => void;
   onSelectLeg?: (dep: string, arr: string) => void;
+  /** 弹窗里的「规划航路」：Tauri webview 里不能用 <a href>（会整页跳出 SPA）。 */
+  onPlanRoute?: (dep: string, arr?: string) => void;
   /** 选中的导入航班轨迹（[[lon, lat], ...]） */
   track?: LonLat[] | null;
 }
 
-export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelectAirport, onSelectLeg, track }: Props) {
+export function WorldMap({
+  data, dark = true, focus, basemap, tilesUrl, onSelectAirport, onSelectLeg, onPlanRoute, track,
+}: Props) {
   const { tr } = useI18n();
   // 弹窗文案用的是 ref，避免 tr 变化导致整张地图重建
   const trRef = useRef(tr);
@@ -79,8 +83,12 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
   selectAirportRef.current = onSelectAirport;
   const selectLegRef = useRef(onSelectLeg);
   selectLegRef.current = onSelectLeg;
+  const planRouteRef = useRef(onPlanRoute);
+  planRouteRef.current = onPlanRoute;
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  // UI-06：地图上只保留一个弹窗（旧实现每次点击都 new 一个，连点会叠一屏）
+  const popupRef = useRef<maplibregl.Popup | null>(null);
 
   const points = useMemo(() => {
     // 机场弹窗需要的出发/到达次数与连接机场数：按航段聚合到机场
@@ -388,17 +396,37 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
         return best;
       };
 
+      // UI-06：单弹窗 + 用按钮回调（不再每次 new Popup、不再用 <a href> 整页跳转）
+      const showPopup = (lngLat: maplibregl.LngLatLike, html: string, action?: () => void) => {
+        popupRef.current?.remove();
+        const el = document.createElement("div");
+        el.innerHTML = html;
+        if (action) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = `${trRef.current("规划航路", "Plan route")} →`;
+          btn.style.cssText = "margin-top:6px;padding:0;border:none;background:none;"
+            + "color:#38bdf8;cursor:pointer;font:inherit;text-align:left";
+          btn.addEventListener("click", () => {
+            action();
+            popupRef.current?.remove();
+          });
+          el.appendChild(btn);
+        }
+        popupRef.current = new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+          .setLngLat(lngLat)
+          .setDOMContent(el)
+          .addTo(map);
+      };
       const showLeg = (f: maplibregl.MapGeoJSONFeature, lngLat: maplibregl.LngLat) => {
         const props = f.properties as { dep: string; arr: string; count: number };
         const source = f.layer.id.includes("imported") ? "Volanta / imported" : "AOC";
         const tr = trRef.current;
-        new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
-          .setLngLat(lngLat)
-          .setHTML(`<div style="font-weight:600">${escapeHtml(props.dep)} → ${escapeHtml(props.arr)}</div>`
-            + `<div style="color:#94a3b8">${props.count} ${tr("班", "legs")} · ${escapeHtml(source)}</div>`
-            + `<div style="color:#475569;margin-top:2px">${tr("已按此航段筛选", "Filtered by this leg")}</div>`
-            + `<a href="/route?dep=${encodeURIComponent(props.dep)}&arr=${encodeURIComponent(props.arr)}" style="display:inline-block;margin-top:4px;color:#38bdf8">${tr("查看航路", "Plan route")} →</a>`)
-          .addTo(map);
+        showPopup(lngLat,
+          `<div style="font-weight:600">${escapeHtml(props.dep)} → ${escapeHtml(props.arr)}</div>`
+          + `<div style="color:#94a3b8">${props.count} ${tr("班", "legs")} · ${escapeHtml(source)}</div>`
+          + `<div style="color:#475569;margin-top:2px">${tr("已按此航段筛选", "Filtered by this leg")}</div>`,
+          () => planRouteRef.current?.(props.dep, props.arr));
         selectLegRef.current?.(props.dep, props.arr);
       };
       map.on("click", "airports", (e) => {
@@ -418,12 +446,11 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
           `<div style="color:#475569;margin-top:2px">${tr("出发", "Dep")} ${p.departures} · ${tr("到达", "Arr")} ${p.arrivals}</div>`,
           `<div style="color:#94a3b8">${tr("地点", "Places")} ${p.connections} · ${tr("班次", "Flights")} ${p.departures + p.arrivals}</div>`,
           `<div style="color:#475569;margin-top:2px">${tr("已按此机场筛选，点击地图空白处取消", "Filtered by this airport; click empty map to clear")}</div>`,
-          `<a href="/route?dep=${encodeURIComponent(p.icao)}" style="display:inline-block;margin-top:4px;color:#38bdf8">${tr("生成航路", "Plan route")} →</a>`,
         ];
-        new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
-          .setLngLat((f.geometry as unknown as { coordinates: [number, number] }).coordinates)
-          .setHTML(html.filter(Boolean).join(""))
-          .addTo(map);
+        showPopup(
+          (f.geometry as unknown as { coordinates: [number, number] }).coordinates,
+          html.filter(Boolean).join(""),
+          () => planRouteRef.current?.(p.icao));
         selectAirportRef.current?.(p.icao);
       });
       map.on("click", (e) => {
@@ -434,6 +461,7 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
           showLeg(f, e.lngLat);
           return;
         }
+        popupRef.current?.remove();
         selectAirportRef.current?.("");
       });
       map.on("mousemove", (e) => {
@@ -444,6 +472,8 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
     });
     return () => {
       cancelArrowRefresh?.();
+      popupRef.current?.remove();
+      popupRef.current = null;
       map.remove();
       mapRef.current = null;
       if (container.current) {
@@ -465,6 +495,8 @@ export function WorldMap({ data, dark = true, focus, basemap, tilesUrl, onSelect
     };
     if (map.getSource("airports")) apply();
     else map.once("style.load", apply);
+    // 筛选/数据变化后旧弹窗内容就过期了（UI-06）
+    popupRef.current?.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, lines, importedLines, trackLine, arrowSpecs]);
 

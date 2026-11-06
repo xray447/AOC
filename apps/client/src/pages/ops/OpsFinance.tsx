@@ -7,15 +7,18 @@ import { useI18n } from "../../i18n";
 import { money } from "../../ops";
 import type { OpsFinanceSummary } from "../../types";
 import { OpsLedgerPage } from "./OpsLedger";
+import { OpsReview } from "./OpsReview";
 import { OpsSettlements } from "./OpsSettlements";
 
 const { Text } = Typography;
 
-type FinanceTab = "settlements" | "ledger";
+type FinanceTab = "settlements" | "ledger" | "review";
 
 const TAB_PATH: Record<FinanceTab, string> = {
   settlements: "/ops/settlements",
   ledger: "/ops/ledger",
+  // IA-01 / D-11：复核队列并进财务的第三个页签，`/ops/review` 保留深链
+  review: "/ops/review",
 };
 
 const PERIOD_LABEL: Record<string, { zh: string; en: string }> = {
@@ -139,6 +142,11 @@ export function OpsFinance() {
             key: "ledger",
             label: tr("账本", "Ledger"),
             children: <div key={`ledger-${refreshKey}`}><OpsLedgerPage embedded /></div>,
+          },
+          {
+            key: "review",
+            label: tr("待复核", "To review"),
+            children: <div key={`review-${refreshKey}`}><OpsReview embedded /></div>,
           },
         ]}
       />

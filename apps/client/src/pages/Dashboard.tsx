@@ -7,11 +7,10 @@ import {
   RocketOutlined,
   SyncOutlined,
 } from "@ant-design/icons";
-import { Alert, Button, Card, Empty, Space, Table, Tag, Tooltip, Typography, message } from "antd";
+import { Alert, Button, Card, Empty, Modal, Space, Table, Tag, Tooltip, Typography, message } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api";
-import { MetricCard } from "../components/MetricCard";
 import { SimlinkNotice } from "../components/SimlinkNotice";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
@@ -23,7 +22,7 @@ const { Text } = Typography;
 
 export function Dashboard() {
   const { tr } = useI18n();
-  const { settings, navdata, recording, bootstrap, refresh } = useApp();
+  const { settings, navdata, recording, bootstrap, refresh, refreshKey } = useApp();
   const navigate = useNavigate();
   const [stats, setStats] = useState<Stats | null>(null);
   const [recent, setRecent] = useState<FlightRecord[]>([]);
@@ -43,8 +42,8 @@ export function Dashboard() {
     setVolanta(v);
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
-  useEffect(() => { if (!recording.active) void load(); }, [recording.active, load]);
+  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load, refreshKey]);
+  useEffect(() => { if (!recording.active) void load().catch(() => undefined); }, [recording.active, load]);
 
   useEffect(() => {
     if (!recording.active || !recording.started_at) { setElapsed(0); return; }
@@ -55,9 +54,28 @@ export function Dashboard() {
   }, [recording.active, recording.started_at]);
 
   const start = async () => {
+    // UI-16：与执行页同一口径 —— 没连上模拟器先确认，并把后端 warnings 逐条展示
+    if (sim.level === "no-sim") {
+      const proceed = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: tr("没连上模拟器", "Simulator not connected"),
+          content: tr(
+            "SimLink 在运行，但没连上 MSFS：这次记录不会有采样点，落地后也无法结算。仍要开始吗？",
+            "SimLink is running but not connected to MSFS: this recording will have no samples and cannot be settled. Start anyway?",
+          ),
+          okText: tr("仍然开始", "Start anyway"),
+          okButtonProps: { danger: true },
+          cancelText: tr("返回", "Back"),
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!proceed) return;
+    }
     setBusy(true);
     try {
-      await api("/local/recording/start", { method: "POST" });
+      const res = await api<{ warnings?: string[] }>("/local/recording/start", { method: "POST" });
+      (res.warnings || []).forEach((w) => message.warning(w));
       message.success(tr("已开始记录", "Recording started"));
       await refresh();
     } catch (e) {
@@ -219,13 +237,15 @@ export function Dashboard() {
         </div>
       </div>
 
-      <div className="metric-grid">
-        <MetricCard title={tr("总飞行", "Flights")} value={stats?.flights ?? 0} suffix={tr("班", "flights")} />
-        <MetricCard title={tr("总时间", "Total time")} value={fmtMinutes(stats?.total_minutes)} />
-        <MetricCard title={tr("总距离", "Distance")} value={Math.round(stats?.total_distance_nm ?? 0)} suffix="NM" />
-        <MetricCard title={tr("机场", "Airports")} value={stats?.airports ?? 0} extra={`${stats?.countries ?? 0} ${tr("个国家/地区", "countries")}`} />
-        <MetricCard title={tr("平均接地 VS", "Avg touchdown")} value={stats?.avg_landing_vs_fpm != null ? Math.round(stats.avg_landing_vs_fpm) : "—"} suffix="fpm" />
-        <MetricCard title={tr("最大过载", "Max G")} value={stats?.max_g_flight != null ? stats.max_g_flight.toFixed(2) : "—"} suffix="G" />
+      {/* IA-04 / D-11：累计指标统一归「统计」，首页只留一行摘要 */}
+      <div className="panel panel-pad" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <Space wrap size={18}>
+          <span><strong className="mono">{(stats?.flights ?? 0).toLocaleString()}</strong> {tr("班", "flights")}</span>
+          <span><strong className="mono">{fmtMinutes(stats?.total_minutes)}</strong> {tr("总时间", "total time")}</span>
+          <span><strong className="mono">{(stats?.airports ?? 0).toLocaleString()}</strong> {tr("机场", "airports")}</span>
+          <span className="muted">{stats?.countries ?? 0} {tr("个国家/地区", "countries")}</span>
+        </Space>
+        <Link to="/stats">{tr("查看统计", "Open stats")} <ArrowRightOutlined /></Link>
       </div>
 
       <Card

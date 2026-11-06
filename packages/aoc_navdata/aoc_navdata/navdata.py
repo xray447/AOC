@@ -170,6 +170,10 @@ class NavData:
         self._runway_sql: str | None = None
         self._runway_sql_checked = False
         self._runway_count_cache: int | None = None
+        # §36 兜底 C（1.4）：手工覆盖的跑道几何，由 aoc-core 从本地库注入
+        self._runway_overrides: dict[str, dict[str, dict]] = {}
+        # 覆盖生效前机场表里的原值（删除覆盖时还原）
+        self._override_backup: dict[str, dict] = {}
         self._prime_runway_units()
         self._prime_runway_widths()
         self.airac, self.navdata_version = self._load_meta()
@@ -532,7 +536,10 @@ class NavData:
         return self.airports.get((ident or "").upper())
 
     def runways(self, ident: str | None) -> list[dict]:
-        """跑道端几何：`auto`/`scenery` 时先查游戏场景库，缺失回落现实 navdata。"""
+        """跑道端几何：`auto`/`scenery` 时先查游戏场景库，缺失回落现实 navdata。
+
+        §36 兜底 C（1.4）：手工覆盖表优先于这两个数据源（`source=override`）。
+        """
         key = (ident or "").strip().upper()
         if self._scenery is not None and self.runway_source != "navdata":
             rows = self._scenery.runways(key)
@@ -544,8 +551,101 @@ class NavData:
                     info["longest_runway_m"] = round(float(derived), 1)
                     info["longest_runway_ft"] = round(float(derived) * FT_PER_M, 1)
                     info["runway_source"] = "scenery"
-                return [{**r, "source": "scenery"} for r in rows]
-        return [{**r, "source": "navdata"} for r in self._load_runways_for(key)]
+                return self._with_overrides(key, [{**r, "source": "scenery"} for r in rows])
+        return self._with_overrides(
+            key, [{**r, "source": "navdata"} for r in self._load_runways_for(key)])
+
+    def set_runway_overrides(self, overrides: dict | None) -> None:
+        """手工跑道覆盖（§36 兜底 C）：`{ICAO: {IDENT: {length_m,width_m,threshold_lat,threshold_lon,hdg}}}`。
+
+        只对「场景库扫不到 / 玩家装了 add-on 机场」有用；命中后 `find_runway()` 优先读它。
+        """
+        cleaned: dict[str, dict[str, dict]] = {}
+        for icao, items in (overrides or {}).items():
+            key = str(icao or "").strip().upper()
+            if len(key) != 4 or not isinstance(items, dict):
+                continue
+            for ident, data in items.items():
+                name = str(ident or "").strip().upper()
+                if not name or not isinstance(data, dict):
+                    continue
+                cleaned.setdefault(key, {})[name] = dict(data)
+        # 先把上一轮覆盖改过的机场字段还原（删除覆盖/切换 navdata 时不留脏值）
+        for icao, backup in self._override_backup.items():
+            info = self.airports.get(icao)
+            if info is None:
+                continue
+            for field, value in backup.items():
+                if value is None:
+                    info.pop(field, None)
+                else:
+                    info[field] = value
+        self._override_backup = {}
+        self._runway_overrides = cleaned
+        # 覆盖会改长度/宽度：把受影响机场的最长跑道与翼展上限同步回机场表
+        for icao in cleaned:
+            info = self.airports.get(icao)
+            if info is not None:
+                self._override_backup[icao] = {
+                    field: info.get(field) for field in (
+                        "longest_runway_m", "longest_runway_ft", "runway_width_m",
+                        "max_wingspan_m", "runway_source")}
+            self.runways(icao)
+
+    def runway_overrides(self) -> dict[str, dict[str, dict]]:
+        return {icao: {ident: dict(data) for ident, data in items.items()}
+                for icao, items in self._runway_overrides.items()}
+
+    def _with_overrides(self, key: str, rows: list[dict]) -> list[dict]:
+        overrides = self._runway_overrides.get(key)
+        if not overrides:
+            return rows
+        out: list[dict] = []
+        matched: set[str] = set()
+        for row in rows:
+            name = str(row.get("name") or "").strip().upper()
+            data = overrides.get(name)
+            if data is None:
+                out.append(row)
+                continue
+            matched.add(name)
+            out.append(self._merge_override(row, data))
+        for name, data in overrides.items():
+            if name not in matched:
+                out.append(self._merge_override({"name": name, "ils": None}, data))
+        self._refresh_airport_geometry(key, out)
+        return out
+
+    @staticmethod
+    def _merge_override(row: dict, data: dict) -> dict:
+        merged = {**row, "source": "override"}
+        try:
+            if data.get("length_m"):
+                merged["length_m"] = round(float(data["length_m"]), 1)
+            if data.get("width_m"):
+                merged["width_m"] = round(float(data["width_m"]), 1)
+            if data.get("threshold_lat") is not None and data.get("threshold_lon") is not None:
+                merged["lat"] = float(data["threshold_lat"])
+                merged["lon"] = float(data["threshold_lon"])
+            if data.get("hdg") is not None:
+                merged["hdg"] = float(data["hdg"]) % 360.0
+        except (TypeError, ValueError):
+            return {**row}
+        return merged
+
+    def _refresh_airport_geometry(self, key: str, rows: list[dict]) -> None:
+        info = self.airports.get(key)
+        if info is None:
+            return
+        lengths = [float(r["length_m"]) for r in rows if r.get("length_m")]
+        if lengths:
+            info["longest_runway_m"] = round(max(lengths), 1)
+            info["longest_runway_ft"] = round(max(lengths) * FT_PER_M, 1)
+        widths = [float(r["width_m"]) for r in rows if r.get("width_m")]
+        if widths:
+            info["runway_width_m"] = round(max(widths), 1)
+            info["max_wingspan_m"] = max_wingspan_for_width(max(widths))
+        info["runway_source"] = "override"
 
     def scenery_available(self) -> bool:
         return self._scenery is not None

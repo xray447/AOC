@@ -319,6 +319,19 @@ CREATE TABLE IF NOT EXISTS ops_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- §36 兜底 C（1.4）：手工跑道覆盖。场景库扫不到 / 玩家装了 add-on 机场时用，
+-- find_runway() 优先读它（source=override），不影响 navdata 原库。
+CREATE TABLE IF NOT EXISTS airport_runway_override (
+    icao TEXT NOT NULL,
+    ident TEXT NOT NULL,
+    length_m REAL,
+    width_m REAL,
+    threshold_lat REAL,
+    threshold_lon REAL,
+    hdg REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (icao, ident)
+);
 """
 
 

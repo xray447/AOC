@@ -7,11 +7,12 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api";
+import { SettlementSummary } from "../../components/SettlementSummary";
 import { SimBriefButton } from "../../components/SimBriefButton";
 import { SimlinkNotice } from "../../components/SimlinkNotice";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
-import { fmtBlock, fmtUtc, money, policyAction, settlementStatus } from "../../ops";
+import { fmtBlock, fmtUtc, legStatus, money } from "../../ops";
 import { simlinkState } from "../../simlink";
 import type {
   FlightStatus, OpsFreeFlight, OpsLoadSheet, OpsRoster, OpsSettlement, OpsTask,
@@ -44,7 +45,7 @@ interface ActiveResponse {
 export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
   const navigate = useNavigate();
-  const { refresh, recording } = useApp();
+  const { refresh, recording, refreshKey } = useApp();
   const sim = simlinkState(recording);
   const [active, setActive] = useState<ActiveResponse | null>(null);
   const [load, setLoad] = useState<OpsLoadSheet | null>(null);
@@ -74,7 +75,7 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     }
   }, []);
 
-  useEffect(() => { void loadAll().catch((e: Error) => message.error(e.message)); }, [loadAll]);
+  useEffect(() => { void loadAll().catch((e: Error) => message.error(e.message)); }, [loadAll, refreshKey]);
   useEffect(() => {
     if (recording.active) void loadAll();
   }, [recording.active, loadAll]);
@@ -195,6 +196,26 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
     }
   };
 
+  /** 1.6 卡死恢复：停掉没绑到任务上的录制、把航段退回未开始，机队位置保持现状。 */
+  const recoverStuck = async () => {
+    setBusy(true);
+    try {
+      const res = await api<{ recovered?: boolean; stopped_recording?: boolean }>(
+        "/local/ops/tasks/recover",
+        { method: "POST", body: JSON.stringify({ reason: "记录未绑定，解除卡死" }) });
+      await refresh();
+      await loadAll();
+      message.info(res.recovered
+        ? tr("已解除卡死：航段回到未开始，机队位置保持不变（可回班表重新开始本段）",
+          "Recovered: the leg is back to planned and the aircraft keeps its position")
+        : tr("没有需要解除的状态", "Nothing to recover"));
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const task = active?.task || null;
   const rosterLeg = active?.roster?.legs.find((l) => l.id === task?.roster_leg_id);
   const flightId = task?.flight_record_id;
@@ -273,7 +294,10 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
             <Descriptions size="small" column={3}>
 
               <Descriptions.Item label={tr("任务", "Task")}>
-                <Tag color={task.kind === "ROSTER" ? "blue" : "cyan"}>{task.kind}</Tag>
+                {/* UI-13：任务类型不再直接显示 ROSTER/FREE 原始枚举 */}
+                <Tag color={task.kind === "ROSTER" ? "blue" : "cyan"}>
+                  {task.kind === "ROSTER" ? tr("班表", "Roster") : tr("自由飞", "Free flight")}
+                </Tag>
                 {task.callsign}
               </Descriptions.Item>
               <Descriptions.Item label={tr("航段", "Leg")}>{task.dep_icao} → {task.arr_icao}</Descriptions.Item>
@@ -335,6 +359,18 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                 description={tr(
                   "这段飞行不会计入本航段。请先结束那条记录，再回到班表重新「开始本段」。",
                   "This flight will not count for this leg. Stop that recording first, then start the leg again.")}
+                action={(
+                  <Popconfirm
+                    title={tr("解除卡死？", "Recover the stuck task?")}
+                    description={tr("会停止那条未绑定的录制、把本航段退回未开始；机队位置保持现状，不冲销账本。",
+                      "Stops the unbound recording and returns this leg to planned; the aircraft keeps its position and nothing is reversed.")}
+                    okText={tr("解除", "Recover")}
+                    cancelText={tr("返回", "Back")}
+                    onConfirm={() => void recoverStuck()}
+                  >
+                    <Button size="small" loading={busy}>{tr("一键解除", "Recover")}</Button>
+                  </Popconfirm>
+                )}
               />
             ) : null}
             {!recording.active && flightStatus && flightStatus.position_ok === false ? (
@@ -463,7 +499,11 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                   {rosterLeg ? (
                     <Descriptions size="small" column={1}>
                       <Descriptions.Item label={tr("航段", "Leg")}>{rosterLeg.sequence} / {active?.roster?.legs.length}</Descriptions.Item>
-                      <Descriptions.Item label={tr("状态", "Status")}>{rosterLeg.status}</Descriptions.Item>
+                      <Descriptions.Item label={tr("状态", "Status")}>
+                        {legStatus[rosterLeg.status]
+                          ? tr(legStatus[rosterLeg.status].zh, legStatus[rosterLeg.status].en)
+                          : rosterLeg.status}
+                      </Descriptions.Item>
                       <Descriptions.Item label={tr("实际起飞", "Actual off")}>{fmtUtc(rosterLeg.actual_dep_utc)}</Descriptions.Item>
                       <Descriptions.Item label={tr("实际到达", "Actual on")}>{fmtUtc(rosterLeg.actual_arr_utc)}</Descriptions.Item>
                     </Descriptions>
@@ -476,30 +516,20 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
           ) : null}
 
           {settlement ? (
-            <Card className="panel" variant="borderless" style={{ marginTop: 16 }}
-              title={tr("结算结果", "Settlement")}
-              extra={(
-                <Space>
-                  <Tag color={policyAction[settlement.policy_action]?.color}>
-                    {policyAction[settlement.policy_action] ? tr(policyAction[settlement.policy_action].zh, policyAction[settlement.policy_action].en) : settlement.policy_action}
-                  </Tag>
-                  <Tag color={settlementStatus[settlement.status]?.color}>
-                    {settlementStatus[settlement.status] ? tr(settlementStatus[settlement.status].zh, settlementStatus[settlement.status].en) : settlement.status}
-                  </Tag>
-                </Space>
-              )}>
-              <Row gutter={16}>
-                <Col span={6}><Statistic title={tr("毛收入", "Gross revenue")} value={money(settlement.revenue_gross)} /></Col>
-                <Col span={6}><Statistic title={tr("结算收入", "Settled revenue")} value={money(settlement.revenue_total)} /></Col>
-                <Col span={6}><Statistic title={tr("总成本", "Costs")} value={money(settlement.cost_total)} /></Col>
-                <Col span={6}><Statistic title={tr("利润", "Profit")} value={money(settlement.profit)}
-                  valueStyle={{ color: settlement.profit >= 0 ? "#22c55e" : "#ef4444" }} /></Col>
-              </Row>
-              <Space style={{ marginTop: 12 }}>
-                <Button onClick={() => navigate(`/ops/settlements?focus=${settlement.id}`)}>{tr("查看明细", "Details")}</Button>
-                <Button onClick={() => navigate(`/logs/${settlement.flight_record_id}`)}>{tr("回放轨迹", "Replay")}</Button>
-              </Space>
-            </Card>
+            <div style={{ marginTop: 16 }}>
+              {/* IA-05：数字卡复用 SettlementSummary（与财务抽屉、日志详情同一套口径） */}
+              <SettlementSummary settlement={settlement} compact
+                extra={(
+                  <Space>
+                    <Button size="small" onClick={() => navigate(`/ops/settlements?focus=${settlement.id}`)}>
+                      {tr("查看明细", "Details")}
+                    </Button>
+                    <Button size="small" onClick={() => navigate(`/logs/${settlement.flight_record_id}`)}>
+                      {tr("回放轨迹", "Replay")}
+                    </Button>
+                  </Space>
+                )} />
+            </div>
           ) : null}
         </>
       )}

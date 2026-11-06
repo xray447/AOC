@@ -40,6 +40,8 @@ FLIGHT_COLUMNS = [
     "partial", "late_join", "block_off_source",
     # §36 跑道几何来源（场景库优先，回落 navdata）
     "runway_length_m", "runway_source",
+    # UI-02：这条记录来自哪个采样源（simconnect / demo / replay），开录时落库
+    "data_source",
     "track_profile_json", "track_points", "track_bytes", "track_fidelity_m",
     "track_sha256", "data_gap_seconds", "validation_status",
     "validation_notes_json", "anomaly_flags_json", "notes", "created_at", "updated_at",
@@ -274,7 +276,8 @@ class Database:
                               ("engine_seconds", "INTEGER"), ("engine_estimated", "INTEGER"),
                               ("partial", "INTEGER"), ("late_join", "INTEGER"),
                               ("block_off_source", "TEXT"),
-                              ("runway_length_m", "REAL"), ("runway_source", "TEXT")):
+                              ("runway_length_m", "REAL"), ("runway_source", "TEXT"),
+                              ("data_source", "TEXT")):
                 if name not in flight_cols:
                     con.execute(f"alter table flight_record add column {name} {ddl}")
 

@@ -101,9 +101,14 @@ def test_a05_draw_respects_constraints_and_locks_aircraft(ops: PersonalService):
     assert aircraft["status"] == "HELD"
     assert aircraft["locked"] is True
 
-    # 同一架飞机不会再被抽到
-    again = _draw(ops, registration=aircraft["registration"])
-    assert all(c["aircraft"]["id"] != aircraft["id"] for c in again["candidates"])
+    # UI-01 / D-10：抽班只生成候选（不落库、不锁机），确认时才拦
+    redraw = _draw(ops)
+    assert redraw["candidates"], "已有班表时仍应能出候选"
+    with pytest.raises(OpsError) as exc:
+        ops.ops.confirm_roster(redraw["candidates"][0]["candidate_token"], 0)
+    assert exc.value.code == "ROSTER_EXISTS"
+    # 被锁的飞机不进可用池（抽班与自由飞共用同一判据）
+    assert all(a["id"] != aircraft["id"] for a in ops.ops.free_aircraft())
 
 
 def test_a06_redraw_is_free_and_releases_aircraft(ops: PersonalService):
@@ -220,6 +225,8 @@ def test_a17_policy_change_applies_to_next_flight_only(ops: PersonalService):
     assert first["payout_factor"] == pytest.approx(0.94)
 
     _set_policy(ops, "数据缺口改为拒绝", rules={"DATA_GAP": {"action": "REJECT"}})
+    # UI-01：还有 IN_PROGRESS 班表时不能抽新班，先取消
+    ops.ops.cancel_roster(roster1["id"], "测试")
     roster2, _ = _confirm(ops)
     _, second, _ = _fly(ops, roster2["id"], data_gap_seconds=720, anomaly_flags=["DATA_GAP"])
     assert second["policy_action"] == "REJECT"
@@ -1515,3 +1522,171 @@ def test_start_leg_rejects_expired_roster(ops: PersonalService):
     with pytest.raises(OpsError) as exc:
         ops.ops.start_leg(roster["id"], 1)
     assert exc.value.code == "ROSTER_EXPIRED"
+
+
+# ------------------------------------------- 1.6 / 1.4 遗留（2026-11-06）
+def test_confirm_rejects_when_roster_exists(ops: PersonalService):
+    """UI-01 / D-10：抽班可以反复出候选，确认时才拒绝；`replace=true` 替换未开始的班表。"""
+    roster, _ = _confirm(ops)
+    result = _draw(ops)
+    assert result["candidates"], "已有班表时仍可重抽候选"
+    token = result["candidates"][0]["candidate_token"]
+    with pytest.raises(OpsError) as exc:
+        ops.ops.confirm_roster(token, 0)
+    assert exc.value.code == "ROSTER_EXISTS"
+    assert exc.value.details["roster_id"] == roster["id"]
+
+    # 首段未开始 → 允许替换（旧班表按重抽口径取消，不记失约、不收费）
+    replaced = ops.ops.confirm_roster(token, 0, replace=True)
+    assert replaced["status"] == "LOCKED"
+    assert ops.ops.roster(roster["id"])["status"] == "CANCELLED"
+    assert (ops.ops.profile() or {}).get("no_show_count", 0) == 0
+
+    # 首段已开始 → 一律拒绝（不能把正在飞的班表换掉）
+    ops.ops.start_leg(replaced["id"], 1)
+    again = _draw(ops)
+    with pytest.raises(OpsError) as exc:
+        ops.ops.confirm_roster(again["candidates"][0]["candidate_token"], 0, replace=True)
+    assert exc.value.code == "ROSTER_EXISTS"
+    assert exc.value.details["status"] == "IN_PROGRESS"
+
+
+def test_stale_in_progress_roster_is_closed_without_penalty(ops: PersonalService):
+    """1.6：窗口已过、一段未完成、无录制/任务的 IN_PROGRESS 班表自动收尾（不收费）。"""
+    roster, _ = _confirm(ops)
+    ops.ops.start_leg(roster["id"], 1)
+    # 模拟崩溃后残留：任务与活跃录制都没了，只剩卡死的 IN_PROGRESS
+    ops.ops._meta_set(ops_service.ACTIVE_TASK_KEY, None)
+    ops.db.setting_set("active_recording", None)
+    with ops.ops._tx() as con:
+        con.execute("update roster set expires_at='2020-01-01T00:00:00Z' where id=?",
+                    (roster["id"],))
+    no_show_before = ops.ops.profile()["no_show_count"]
+    ops.ops._expire_locks()
+    closed = ops.ops.roster(roster["id"])
+    assert closed["status"] == "EXPIRED"
+    assert all(leg["status"] == "CANCELLED" for leg in closed["legs"])
+    aircraft = ops.ops.get_aircraft(roster["aircraft_id"])
+    assert aircraft["status"] == "ACTIVE" and aircraft["locked"] is False
+    assert ops.ops.profile()["no_show_count"] == no_show_before, "自动收尾不记失约"
+
+
+def test_partial_roster_with_completed_leg_is_not_auto_closed(ops: PersonalService):
+    """test_a27 的语义保留：有已完成航段的中途班表不自动收尾。"""
+    roster, _ = _confirm(ops)
+    _fly(ops, roster["id"], 1)
+    ops.db.setting_set("active_recording", None)
+    with ops.ops._tx() as con:
+        con.execute("update roster set expires_at='2020-01-01T00:00:00Z' where id=?",
+                    (roster["id"],))
+    ops.ops._expire_locks()
+    assert ops.ops.roster(roster["id"])["status"] == "IN_PROGRESS"
+
+
+def test_start_leg_adopt_backfills_pushback_zfw_and_fuel(ops: PersonalService):
+    """1.6：改绑时把「无任务阶段」已定稿的推出 ZFW/油量带进记录，不退回配载单。"""
+    roster, _ = _confirm(ops)
+    record = _auto_recording(ops)
+    ops.flights.zfw_at_pushback = 166714.0
+    ops.flights.fuel_at_pushback = 42000.0
+    ops.flights.pushback_source = "engine"
+    started = ops.ops.start_leg(roster["id"], 1)
+    adopted = ops.db.get_flight(record["id"])
+    assert adopted["actual_zfw_kg"] == pytest.approx(166714.0)
+    assert adopted["fuel_start_kg"] == pytest.approx(42000.0)
+    assert started["task"]["zfw_source"] == "engine"
+    assert any("推出定稿" in w for w in started["warnings"])
+    events = [e for e in ops.db.list_events(record["id"]) if e["type"] == "zfw_check"]
+    assert events and events[-1]["payload"]["adopted_from_pushback"] is True
+
+
+def test_zfw_change_after_pushback_is_logged_not_overwritten(ops: PersonalService):
+    """1.6 / §32 边界：推出定稿后再大改配载不覆盖记录值，只补一条事件。"""
+    roster, _ = _confirm(ops)
+    started = ops.ops.start_leg(roster["id"], 1)
+    flight_id = started["task"]["flight_record_id"]
+    ops.db.insert_flight({"id": flight_id, "mode": "ROSTER", "status": "RECORDING",
+                          "callsign": "AOC900", "aircraft_type": "A320",
+                          "created_at": "2026-11-05T00:00:00Z"})
+    ops.ops.set_actual_zfw(160000, source="engine", final=True)
+    ops.ops.set_actual_zfw(150000, source="gs", final=True)
+    flight = ops.db.get_flight(flight_id)
+    assert flight["actual_zfw_kg"] == pytest.approx(160000)
+    events = [e for e in ops.db.list_events(flight_id)
+              if e["type"] == "zfw_changed_after_pushback"]
+    assert events and events[0]["payload"]["delta_kg"] == pytest.approx(-10000)
+
+
+def test_recover_task_keeps_aircraft_position(ops: PersonalService):
+    """1.6：卡死恢复不动位置（不像 void 那样写回出发机场），航段可重新开始。"""
+    roster, _ = _confirm(ops)
+    started = ops.ops.start_leg(roster["id"], 1)
+    with ops.ops._tx() as con:
+        con.execute("update aircraft set current_airport_icao='ZPPP' where id=?",
+                    (roster["aircraft_id"],))
+    result = ops.ops.recover_task("测试恢复")
+    assert result["recovered"] is True and result["keep_position"] is True
+    aircraft = ops.ops.get_aircraft(roster["aircraft_id"])
+    assert aircraft["current_airport_icao"] == "ZPPP", "位置保持现状"
+    assert aircraft["status"] == "ACTIVE" and aircraft["locked"] is False
+    leg = next(l for l in ops.ops.roster(roster["id"])["legs"]
+               if l["id"] == started["task"]["roster_leg_id"])
+    assert leg["status"] == "PLANNED" and leg["flight_record_id"] is None
+    assert ops.ops.active_task() is None
+    # 位置保留后不能凭空起飞：仍由「飞机是否在出发机场」把关
+    with pytest.raises(OpsError) as blocked:
+        ops.ops.start_leg(roster["id"], 1)
+    assert blocked.value.code == "AIRCRAFT_NOT_AT_DEPARTURE"
+    # 修正位置（force + 审计）后可以重新开始本段
+    ops.ops.update_aircraft(roster["aircraft_id"],
+                            {"current_airport_icao": leg["dep_icao"], "force": True})
+    again = ops.ops.start_leg(roster["id"], 1)
+    assert again["task"]["roster_leg_id"] == leg["id"]
+
+
+def test_update_aircraft_position_requires_force_and_audits(ops: PersonalService):
+    """§35 收口：位置不能直接改；force=true 才放行并写 AIRCRAFT_FIX_POSITION。"""
+    aircraft = ops.ops.list_fleet()[0]
+    with pytest.raises(OpsError) as exc:
+        ops.ops.update_aircraft(aircraft["id"], {"current_airport_icao": "ZPPP"})
+    assert exc.value.code == "VALIDATION"
+    updated = ops.ops.update_aircraft(aircraft["id"],
+                                      {"current_airport_icao": "zppp", "force": True})
+    assert updated["current_airport_icao"] == "ZPPP"
+    audit = [row for row in ops.ops.audit_log(50) if row["action"] == "AIRCRAFT_FIX_POSITION"]
+    assert audit and audit[0]["after"]["current_airport_icao"] == "ZPPP"
+
+
+def test_runway_override_takes_priority_and_can_be_removed(ops: PersonalService):
+    """§36 兜底 C：手工覆盖优先于场景库/navdata，删除后还原。"""
+    nav = ops.nav
+    assert nav is not None
+    rows = nav.runways("ZBAA")
+    assert rows
+    ident = rows[0]["name"]
+    original_length = rows[0]["length_m"]
+    original_wingspan = nav.max_wingspan_m("ZBAA")
+    ops.set_runway_override("ZBAA", ident, {
+        "length_m": 1234, "width_m": 60, "hdg": 90,
+        "threshold_lat": 40.1, "threshold_lon": 116.6})
+    overridden = next(r for r in ops.nav.runways("ZBAA") if r["name"] == ident)
+    assert overridden["length_m"] == pytest.approx(1234)
+    assert overridden["source"] == "override"
+    assert overridden["hdg"] == pytest.approx(90)
+    assert overridden["lat"] == pytest.approx(40.1)
+    assert ops.nav.max_wingspan_m("ZBAA") == 80   # 60 m 宽 → 80 m 翼展上限
+
+    ops.delete_runway_override("ZBAA", ident)
+    restored = next(r for r in ops.nav.runways("ZBAA") if r["name"] == ident)
+    assert restored["length_m"] == pytest.approx(original_length)
+    assert ops.nav.max_wingspan_m("ZBAA") == original_wingspan
+    assert ops.ops.runway_overrides() == {}
+
+
+def test_flight_record_keeps_own_data_source(ops: PersonalService):
+    """UI-02：记录落库时带自己的采样源，历史日志不再显示当前会话的来源。"""
+    ops.flights.simlink_source = "simconnect"
+    ops.flights.start(manual=False)
+    record = ops.db.get_flight(ops.flights.status().flight_id or "")
+    assert record and record["data_source"] == "simconnect"
+    ops.flights.stop(abort=True)

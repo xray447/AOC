@@ -499,6 +499,8 @@ class FlightService:
                 "partial": 1 if rec.partial else 0,
                 "late_join": 1 if rec.late_join else 0,
                 "block_off_source": rec.block_off_source,
+                # UI-02：这条记录自己的采样源（历史日志不再显示当前会话的来源）
+                "data_source": self.simlink_source,
             })
             self.db.insert_flight(record)
         self._save_persisted()
@@ -593,8 +595,10 @@ class FlightService:
         aircraft_type = stored.get("aircraft_type") or self._aircraft_type()
         result = evaluate(points, nav, rating_thresholds(settings), aircraft_type,
                           partial=bool(rec.partial),
-                          # §32：滑出油量取推出定稿值，缺失回落首帧（demo/replay 源）
-                          fuel_start_kg=self.fuel_at_pushback)
+                          # §32：滑出油量取推出定稿值，缺失回落首帧（demo/replay 源）。
+                          # 1.6：改绑时已把推出油量写进记录，进程重启后也能取回来。
+                          fuel_start_kg=self.fuel_at_pushback
+                          if self.fuel_at_pushback is not None else stored.get("fuel_start_kg"))
         takeoff_idx = result.get("takeoff_index")
         landing_idx = result.get("landing_index")
         if takeoff_idx is None:

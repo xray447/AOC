@@ -4,16 +4,25 @@ import {
 } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../api";
 import { AirportSelect } from "../../components/AirportSelect";
 import { SimBriefButton } from "../../components/SimBriefButton";
+import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { aircraftStatus, fmtUtc } from "../../ops";
 import type { OpsAircraft, OpsFreeAirport, OpsFreeFlight, OpsProfile } from "../../types";
 
 /** 计划起飞时间默认 now + 50min（界面本地时区，提交转 UTC）。 */
 const DEFAULT_DEP_OFFSET_MIN = 50;
+
+/** UI-13：自由飞任务状态不再直接显示原始枚举。 */
+const FREE_STATUS: Record<string, { zh: string; en: string; color: string }> = {
+  LOCKED: { zh: "已锁定", en: "Locked", color: "gold" },
+  IN_FLIGHT: { zh: "飞行中", en: "In flight", color: "blue" },
+  COMPLETED: { zh: "已完成", en: "Completed", color: "green" },
+  CANCELLED: { zh: "已取消", en: "Cancelled", color: "default" },
+};
 
 interface FreeForm {
   dep_icao: string;
@@ -25,6 +34,7 @@ interface FreeForm {
 export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
   const navigate = useNavigate();
+  const { refreshKey } = useApp();
   const [aircraft, setAircraft] = useState<OpsAircraft[]>([]);
   const [current, setCurrent] = useState<OpsFreeFlight | null>(null);
   const [profile, setProfile] = useState<OpsProfile | null>(null);
@@ -33,6 +43,9 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
   const [dep, setDep] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm<FreeForm>();
+  // IA-03：右侧「可用飞机」不再只是罗列，点击行即选中（下方摘要卡显示机型/航程/座位/占用）
+  const selectedAircraftId = Form.useWatch("aircraft_id", form) as string | undefined;
+  const selectedAircraft = aircraft.find((a) => a.id === selectedAircraftId) || null;
 
   const loadAircraft = useCallback(async (airport: string) => {
     const res = await api<{ items: OpsAircraft[] }>(
@@ -69,7 +82,7 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
     await loadAircraft(start);
   }, [dep, form, loadAircraft, loadAirports]);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load, refreshKey]);
 
   const changeDep = async (value: string) => {
     setDep(value);
@@ -158,7 +171,13 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
 
       {current ? (
         <Card className="panel" variant="borderless" title={tr("当前自由飞任务", "Active free flight")}
-          extra={<Tag color="cyan">{current.status}</Tag>}>
+          extra={(
+            <Tag color={FREE_STATUS[current.status]?.color || "cyan"}>
+              {FREE_STATUS[current.status]
+                ? tr(FREE_STATUS[current.status].zh, FREE_STATUS[current.status].en)
+                : current.status}
+            </Tag>
+          )}>
           <Descriptions size="small" column={3}>
             <Descriptions.Item label={tr("呼号", "Callsign")}>
               <span className="mono">{current.callsign || "—"}</span>
@@ -176,9 +195,17 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
               callsign={current.callsign}
               opsLeg={{ freeId: current.id }}
             />
-            <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={() => void start()}>
-              {tr("开始飞行", "Start")}
-            </Button>
+            {/* UI-16：已经开始的任务不再显示「开始飞行」（点了才 409） */}
+            {current.status === "IN_FLIGHT" ? (
+              <Button type="primary" onClick={() => navigate("/ops/execute")}>
+                {tr("去执行页（任务进行中）", "Open execute page (in progress)")}
+              </Button>
+            ) : (
+              <Button type="primary" icon={<PlayCircleOutlined />} loading={busy}
+                disabled={current.status !== "LOCKED"} onClick={() => void start()}>
+                {tr("开始飞行", "Start")}
+              </Button>
+            )}
             {current.status === "LOCKED" ? (
               <>
                 <Button onClick={() => void heartbeat()}>{tr("续期锁", "Renew lock")}</Button>
@@ -258,22 +285,57 @@ export function OpsFreeFlightPage({ embedded = false }: { embedded?: boolean }) 
             </Card>
           </Col>
           <Col xs={24} lg={14}>
-            <Card className="panel" variant="borderless" title={`${tr("可用飞机", "Available aircraft")} · ${dep || "—"}`}
-              styles={{ body: { padding: 0 } }}>
+            <Card
+              className="panel"
+              variant="borderless"
+              title={`${tr("可用飞机", "Available aircraft")} · ${dep || "—"}`}
+              extra={<Link to="/ops/fleet">{tr("去机队", "Open fleet")}</Link>}
+              styles={{ body: { padding: 0 } }}
+            >
+              {/* IA-03：点击行即选中左下拉；摘要卡补上航程/座位/占用，避免「能看不能选」 */}
+              {selectedAircraft ? (
+                <div style={{ padding: "10px 12px" }}>
+                  <Descriptions size="small" column={4}>
+                    <Descriptions.Item label={tr("机型", "Type")}>
+                      {selectedAircraft.type_icao || "—"}
+                      {selectedAircraft.type_variant && selectedAircraft.type_variant !== "STANDARD"
+                        ? ` ${selectedAircraft.type_variant}` : ""}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={tr("座位", "Seats")}>{selectedAircraft.pax_capacity ?? "—"}</Descriptions.Item>
+                    <Descriptions.Item label={tr("航程", "Range")}>
+                      {selectedAircraft.range_nm ? `${selectedAircraft.range_nm} NM` : "—"}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={tr("占用", "Held")}>
+                      {selectedAircraft.locked
+                        ? <Tag color="gold">{tr("已锁定", "Locked")}</Tag>
+                        : <Tag color="green">{tr("可用", "Free")}</Tag>}
+                    </Descriptions.Item>
+                  </Descriptions>
+                </div>
+              ) : null}
               {aircraft.length ? (
                 <Table
                   rowKey="id"
                   size="small"
                   pagination={false}
                   dataSource={aircraft}
+                  onRow={(row) => ({
+                    onClick: () => form.setFieldValue("aircraft_id", row.id),
+                    style: { cursor: "pointer" },
+                  })}
+                  rowClassName={(row) => (row.id === selectedAircraftId ? "row-selected" : "")}
                   columns={[
                     { title: tr("注册号", "Registration"), dataIndex: "registration", width: 110, render: (v: string) => <strong>{v}</strong> },
                     { title: tr("机型", "Type"), key: "type", render: (_: unknown, r: OpsAircraft) => `${r.type_icao || ""}${r.type_variant && r.type_variant !== "STANDARD" ? ` ${r.type_variant}` : ""}` },
                     { title: tr("角色", "Role"), dataIndex: "type_role", width: 90 },
                     { title: tr("座位", "Seats"), dataIndex: "pax_capacity", width: 70 },
                     {
-                      title: tr("状态", "Status"), dataIndex: "status", width: 90,
-                      render: (v: string) => <Tag color={aircraftStatus[v]?.color}>{v}</Tag>,
+                      title: tr("状态", "Status"), dataIndex: "status", width: 110,
+                      render: (v: string) => (
+                        <Tag color={aircraftStatus[v]?.color}>
+                          {aircraftStatus[v] ? tr(aircraftStatus[v].zh, aircraftStatus[v].en) : v}
+                        </Tag>
+                      ),
                     },
                   ]}
                 />

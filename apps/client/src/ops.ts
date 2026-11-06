@@ -154,6 +154,31 @@ export const anomalyLabel: Record<string, { zh: string; en: string }> = {
   REVIEW: { zh: "复核", en: "Review" },
 };
 
+/** UI-13：轨迹事件的类型标签（日志详情「事件」表不再直接打印英文枚举）。 */
+export const eventLabel: Record<string, { zh: string; en: string }> = {
+  recording_started: { zh: "开始记录", en: "Recording started" },
+  recording_stopped: { zh: "结束记录", en: "Recording stopped" },
+  sim_connected: { zh: "模拟器已连接", en: "Simulator connected" },
+  sim_disconnected: { zh: "模拟器断开", en: "Simulator disconnected" },
+  teleport: { zh: "位置跳变", en: "Teleport" },
+  pushback: { zh: "推出", en: "Pushback" },
+  takeoff: { zh: "起飞", en: "Takeoff" },
+  landing: { zh: "落地", en: "Landing" },
+  touchdown: { zh: "接地", en: "Touchdown" },
+  pause: { zh: "暂停", en: "Pause" },
+  sim_rate: { zh: "时间倍率", en: "Sim rate" },
+  data_gap: { zh: "数据缺口", en: "Data gap" },
+  zfw_check: { zh: "ZFW 校验", en: "ZFW check" },
+  zfw_changed_after_pushback: { zh: "推出后改配载", en: "ZFW changed after pushback" },
+  fuel: { zh: "油量", en: "Fuel" },
+  refuel: { zh: "加油", en: "Refuel" },
+  flaps: { zh: "襟翼", en: "Flaps" },
+  gear: { zh: "起落架", en: "Gear" },
+  engine: { zh: "发动机", en: "Engine" },
+  stop: { zh: "停止", en: "Stop" },
+  phase: { zh: "阶段变化", en: "Phase" },
+};
+
 export function typeLabel(type: OpsAircraftType): string {
   const variant = type.variant && type.variant !== "STANDARD" ? ` ${type.variant}` : "";
   const role = type.role === "BIZJET" ? "公务机" : type.role === "VIP" ? "VIP" : "";

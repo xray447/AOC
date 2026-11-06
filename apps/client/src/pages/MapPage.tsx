@@ -3,6 +3,7 @@ import { Alert, Button, Card, Select, Space, Table, Tag, Typography, message } f
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { LoadError } from "../components/LoadError";
 import { WorldMap } from "../components/WorldMap";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
@@ -15,9 +16,16 @@ type Filter =
   | { kind: "airport"; value: string }
   | { kind: "leg"; dep: string; arr: string };
 
-export function MapPage() {
+interface MapPageProps {
+  /** IA-02：作为「日志」页的地图页签内嵌时，不渲染自己的标题区。 */
+  embedded?: boolean;
+  /** 从导入航班列表点进来时要显示的轨迹 id（`/map?track=`）。 */
+  focusTrackId?: string | null;
+}
+
+export function MapPage({ embedded = false, focusTrackId = null }: MapPageProps = {}) {
   const { tr } = useI18n();
-  const { dark, navdata, settings } = useApp();
+  const { dark, navdata, settings, refreshKey } = useApp();
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [data, setData] = useState<MapData | null>(null);
@@ -26,17 +34,40 @@ export function MapPage() {
   const [filter, setFilter] = useState<Filter | null>(null);
   const [track, setTrack] = useState<{ id: string; points: LonLat[] } | null>(null);
   const [trackBusy, setTrackBusy] = useState(false);
+  // UI-09：接口失败时以前会永远停在「加载中…」，看不出是接口挂了
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (y?: number) => {
     setLoading(true);
     try {
       setData(await api<MapData>(`/local/map${y ? `?year=${y}` : ""}`));
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { void load(year); }, [year, load]);
+  useEffect(() => { void load(year); }, [year, load, refreshKey]);
+
+  // IA-02：从「日志 → 来源：导入」点某条航班，直接在地图上显示这条轨迹
+  useEffect(() => {
+    if (!focusTrackId) return undefined;
+    let alive = true;
+    void (async () => {
+      try {
+        const detail = await api<{ id: string; track: LonLat[] | null }>(
+          `/local/volanta/flights/${encodeURIComponent(focusTrackId)}`);
+        if (alive && detail.track && detail.track.length >= 2) {
+          setTrack({ id: detail.id, points: detail.track });
+        }
+      } catch (e) {
+        if (alive) message.error((e as Error).message);
+      }
+    })();
+    return () => { alive = false; };
+  }, [focusTrackId]);
 
   const selectAirport = useCallback((icao: string) => {
     setFilter(icao ? { kind: "airport", value: icao } : null);
@@ -111,10 +142,10 @@ export function MapPage() {
   const filteredEmpty = Boolean(filter && view && view.legs.length === 0);
 
   return (
-    <div className="page">
-      <div className="page-head">
+    <div className={embedded ? "ops-embedded" : "page"}>
+      <div className="page-head" style={embedded ? { alignItems: "center" } : undefined}>
         <div>
-          <h2>{tr("飞行地图", "Flight map")}</h2>
+          <h2 style={embedded ? { fontSize: 16 } : undefined}>{tr("飞行地图", "Flight map")}</h2>
           <p>{tr(
             "青色为 AOC 记录，橙色为 Volanta / 手动导入，箭头表示飞行方向，班次越多线越粗（有线宽上限）；点击机场或航段即可筛选，点击空白处取消",
             "Cyan lines are AOC records; amber lines are Volanta / manual imports; arrows show direction and more flights means a thicker line (capped). Click an airport or leg to filter; click empty map to clear.",
@@ -136,6 +167,8 @@ export function MapPage() {
       {!navdata.available ? (
         <Alert type="info" showIcon message={tr("未导入 navdata：只能显示ICAO列表，地图上无坐标点", "navdata missing: only ICAO codes can be shown, not coordinates")} />
       ) : null}
+
+      {error ? <LoadError message={error} onRetry={() => void load(year)} /> : null}
 
       <Card
         className="panel"
@@ -168,6 +201,9 @@ export function MapPage() {
               tilesUrl={settings.tiles_url}
               onSelectAirport={selectAirport}
               onSelectLeg={selectLeg}
+              onPlanRoute={(dep, arr) => navigate(arr
+                ? `/route?dep=${encodeURIComponent(dep)}&arr=${encodeURIComponent(arr)}`
+                : `/route?dep=${encodeURIComponent(dep)}`)}
               track={track?.points ?? null}
             />
           ) : (
@@ -185,6 +221,9 @@ export function MapPage() {
         />
       ) : null}
 
+      {/* IA-02：历史表已并入「日志 → 列表」的来源筛选，地图页签内不再重复两张表 */}
+      {embedded ? null : (
+      <>
       <Card
         className="panel"
         variant="borderless"
@@ -218,9 +257,9 @@ export function MapPage() {
               title: tr("航段", "Leg"),
               render: (_: unknown, row) => (
                 <Space size={4}>
-                  <Tag>{row.dep_icao || "????"}</Tag>
+                  <Tag>{row.dep_icao || "—"}</Tag>
                   <span className="muted">→</span>
-                  <Tag>{row.arr_icao || "????"}</Tag>
+                  <Tag>{row.arr_icao || "—"}</Tag>
                 </Space>
               ),
             },
@@ -285,9 +324,9 @@ export function MapPage() {
               title: tr("航段", "Leg"),
               render: (_: unknown, row) => (
                 <Space size={4}>
-                  <Tag>{row.dep_icao || "????"}</Tag>
+                  <Tag>{row.dep_icao || "—"}</Tag>
                   <span className="muted">→</span>
-                  <Tag>{row.arr_icao || "????"}</Tag>
+                  <Tag>{row.arr_icao || "—"}</Tag>
                 </Space>
               ),
             },
@@ -316,6 +355,8 @@ export function MapPage() {
           ]}
         />
       </Card>
+      </>
+      )}
 
       {data && data.airports.length === 0 ? (
         <Card className="panel" variant="borderless">

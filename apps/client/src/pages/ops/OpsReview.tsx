@@ -5,25 +5,35 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api";
+import { LoadError } from "../../components/LoadError";
+import { useRefreshKey } from "../../context";
 import { useI18n } from "../../i18n";
 import { anomalyLabel, fmtUtc, money, settlementTitle } from "../../ops";
 import type { OpsSettlement } from "../../types";
 
 const { Text } = Typography;
 
-export function OpsReview() {
+/** IA-01 / D-11：复核队列并进「财务」的第三个页签；`/ops/review` 仍可深链。 */
+export function OpsReview({ embedded = false }: { embedded?: boolean }) {
   const { tr } = useI18n();
+  const refreshKey = useRefreshKey();
   const [rows, setRows] = useState<OpsSettlement[]>([]);
   const [target, setTarget] = useState<{ row: OpsSettlement; action: string } | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const res = await api<{ items: OpsSettlement[] }>("/local/ops/review");
-    setRows(res.items);
+    try {
+      const res = await api<{ items: OpsSettlement[] }>("/local/ops/review");
+      setRows(res.items);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
   }, []);
 
-  useEffect(() => { void load().catch((e: Error) => message.error(e.message)); }, [load]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
 
   const resolve = async () => {
     if (!target) return;
@@ -45,7 +55,7 @@ export function OpsReview() {
   };
 
   return (
-    <div className="page">
+    <div className={embedded ? "ops-embedded" : "page"}>
       <div className="page-head">
         <div>
           <h2>{tr("复核队列", "Review queue")}</h2>
@@ -54,6 +64,8 @@ export function OpsReview() {
         </div>
         <Button icon={<ReloadOutlined />} onClick={() => void load()}>{tr("刷新", "Refresh")}</Button>
       </div>
+
+      {error ? <LoadError message={error} onRetry={() => void load()} /> : null}
 
       {!rows.length ? (
         <Card className="panel" variant="borderless">
@@ -65,7 +77,8 @@ export function OpsReview() {
             rowKey="id"
             size="small"
             dataSource={rows}
-            pagination={false}
+            // UI-19：合并页里以前没有分页，行多了只能整页滚
+            pagination={{ pageSize: 12, showSizeChanger: false }}
             columns={[
               {
                 title: tr("航班", "Flight"), key: "t",

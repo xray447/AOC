@@ -361,3 +361,54 @@ def test_settlement_detail_flattens_flight_fields(app_client, navdata_path):
     assert "????" not in f"{detail['callsign']} {detail['dep_icao']} {detail['arr_icao']}"
     # 详情页仍在用的嵌套对象保留
     assert detail["flight"]["id"] == listing["flight_record_id"]
+
+def test_roster_exists_and_task_recover_endpoints(app_client, navdata_path):
+    """UI-01 / 1.6：已有班表时「确认」返回 409 ROSTER_EXISTS（抽班本身仍可出候选）。"""
+    app_client.put("/local/settings", json={"navdata_path": str(navdata_path)})
+    service = app_client.app.state.service
+    service.ops.seed_demo()
+    drawn = service.ops.draw({"max_legs": 1, "max_block_minutes": 480, "window_hours": 168,
+                              "min_turnaround_min": 45})
+    service.ops.confirm_roster(drawn["candidates"][0]["candidate_token"], 0)
+
+    again = app_client.post("/local/ops/rosters/draw", json={
+        "max_legs": 1, "max_block_minutes": 480, "window_hours": 168, "min_turnaround_min": 45})
+    assert again.status_code == 200
+    assert again.json()["candidates"]
+
+    res = app_client.post("/local/ops/rosters/confirm", json={
+        "candidate_token": again.json()["candidates"][0]["candidate_token"], "candidate_index": 0})
+    assert res.status_code == 409
+    assert res.json()["code"] == "ROSTER_EXISTS"
+    assert res.json()["details"]["roster_id"]
+
+    idle = app_client.post("/local/ops/tasks/recover", json={"reason": "test"})
+    assert idle.status_code == 200
+    assert idle.json()["recovered"] is False
+
+
+def test_runway_override_endpoints(app_client, navdata_path):
+    """§36 兜底 C：手工覆盖优先于 navdata，删除后还原，越界 422。"""
+    app_client.put("/local/settings", json={"navdata_path": str(navdata_path)})
+    saved = app_client.put("/local/navdata/runway-overrides/ZBAA/18",
+                          json={"length_m": 1234, "width_m": 60, "hdg": 90})
+    assert saved.status_code == 200
+
+    items = app_client.get("/local/navdata/runway-overrides").json()["items"]
+    assert items["ZBAA"]["18"]["length_m"] == 1234
+
+    detail = app_client.get("/local/airports/ZBAA").json()
+    row = next(r for r in detail["runways"] if r["ident"] == "18")
+    assert row["source"] == "override"
+    assert row["length_m"] == 1234
+    # 60 m 宽 → 翼展上限 80 m（§26 档位）
+    assert detail["max_wingspan_m"] == 80
+
+    removed = app_client.delete("/local/navdata/runway-overrides/ZBAA/18")
+    assert removed.status_code == 200 and removed.json()["deleted"] is True
+    restored = app_client.get("/local/airports/ZBAA").json()
+    row = next(r for r in restored["runways"] if r["ident"] == "18")
+    assert row["source"] == "navdata"
+
+    bad = app_client.put("/local/navdata/runway-overrides/ZBAA/18", json={"length_m": 1})
+    assert bad.status_code == 422

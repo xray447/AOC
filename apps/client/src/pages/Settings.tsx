@@ -1,23 +1,27 @@
 import {
-  ApiOutlined,
   CloudDownloadOutlined,
-  DatabaseOutlined,
+  ExclamationCircleOutlined,
   ExportOutlined,
   FolderOpenOutlined,
   ImportOutlined,
-  ReloadOutlined,
   SaveOutlined,
 } from "@ant-design/icons";
-import { Button, Card, Col, Divider, Input, InputNumber, Row, Select, Space, Switch, Tag, Typography, message } from "antd";
+import {
+  Button, Card, Col, Divider, Input, InputNumber, Modal, Popconfirm, Row, Select, Space, Switch, Tag,
+  Typography, message,
+} from "antd";
 import { useEffect, useMemo, useState } from "react";
 import { aircraftGroups } from "../aircraft";
 import { api, download } from "../api";
 import { BASEMAPS } from "../basemap";
 import { AirportSelect } from "../components/AirportSelect";
+import { NavdataPanel } from "../components/NavdataPanel";
+import { RunwayOverrideCard } from "../components/RunwayOverrideCard";
+import { SimlinkPanel } from "../components/SimlinkPanel";
 import { VolantaImport } from "../components/VolantaImport";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
-import { openLogFolder, simlinkState } from "../simlink";
+import { setLeaveGuard } from "../leaveGuard";
 import type { AircraftType, Settings } from "../types";
 import { deepEqual } from "../utils";
 
@@ -25,38 +29,13 @@ const { Text, Paragraph } = Typography;
 
 export function SettingsPage() {
   const { tr } = useI18n();
-  const { settings, navdata, recording, bootstrap, saveSettings, refresh } = useApp();
+  const { settings, navdata, bootstrap, saveSettings, refresh, openWizard } = useApp();
   const [draft, setDraft] = useState<Settings>(settings);
   const [types, setTypes] = useState<AircraftType[]>([]);
   const [saving, setSaving] = useState(false);
-  const [navPath, setNavPath] = useState(settings.navdata_path || "");
-  const [navBusy, setNavBusy] = useState(false);
   const [archivePath, setArchivePath] = useState("");
   const [importPath, setImportPath] = useState("");
   const [archiveBusy, setArchiveBusy] = useState(false);
-  const [reconnectBusy, setReconnectBusy] = useState(false);
-  const sim = simlinkState(recording);
-
-  /** 让 SimLink 立刻重建 SimConnect（否则后台每 5s 自动重试一次）。 */
-  const reconnect = async () => {
-    setReconnectBusy(true);
-    try {
-      await api("/local/simlink/reconnect", { method: "POST" });
-      await refresh();
-      message.success(tr("已请求重新连接，几秒后看状态", "Reconnect requested — check the status in a few seconds"));
-    } catch (e) {
-      message.error((e as Error).message);
-    } finally {
-      setReconnectBusy(false);
-    }
-  };
-
-  const openLogs = async () => {
-    const ok = await openLogFolder();
-    if (!ok) {
-      message.info(`${tr("日志目录", "Log folder")}: ${bootstrap.logs || `${bootstrap.home}/logs`}`);
-    }
-  };
 
   useEffect(() => { setDraft(settings); }, [settings]);
   useEffect(() => {
@@ -66,9 +45,38 @@ export function SettingsPage() {
   const patch = (p: Partial<Settings>) => setDraft((d) => ({ ...d, ...p }));
   const dirty = useMemo(() => !deepEqual(draft, settings), [draft, settings]);
 
+  /** UI-10：有未保存改动时，切页/关窗口先确认（不再是「只有右下角一条浮条」）。 */
+  useEffect(() => {
+    if (!dirty) {
+      setLeaveGuard(null);
+      return undefined;
+    }
+    setLeaveGuard(() => new Promise<boolean>((resolve) => {
+      Modal.confirm({
+        title: tr("设置有未保存的更改", "Unsaved settings"),
+        content: tr("离开这一页会丢掉刚才的修改（主题/语言等保存后才生效）。确认离开？",
+          "Leaving this page discards your edits (theme/language apply after saving). Leave anyway?"),
+        okText: tr("放弃并离开", "Discard & leave"),
+        okButtonProps: { danger: true },
+        cancelText: tr("留下继续编辑", "Stay"),
+        onOk: () => resolve(true),
+        onCancel: () => resolve(false),
+      });
+    }));
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      // 老式浏览器/WebView 需要设置 returnValue 才会弹确认
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      setLeaveGuard(null);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+    };
+  }, [dirty, tr]);
+
   const discard = () => {
     setDraft(settings);
-    setNavPath(settings.navdata_path || "");
     message.info(tr("已放弃未保存的更改", "Unsaved changes discarded"));
   };
 
@@ -82,27 +90,6 @@ export function SettingsPage() {
       message.error((e as Error).message);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const selectNavdata = async () => {
-    setNavBusy(true);
-    try {
-      const status = await api<{ available: boolean; airac?: string; airports?: number; error?: string }>("/local/navdata/select", {
-        method: "POST",
-        body: JSON.stringify({ path: navPath.trim() || null }),
-      });
-      await refresh();
-      if (status.available) {
-        patch({ navdata_path: navPath.trim() });
-        message.success(tr("navdata 已加载", "navdata loaded"));
-      } else {
-        message.warning(status.error || tr("未加载", "not loaded"));
-      }
-    } catch (e) {
-      message.error((e as Error).message);
-    } finally {
-      setNavBusy(false);
     }
   };
 
@@ -145,25 +132,17 @@ export function SettingsPage() {
 
       <Row gutter={[12, 12]}>
         <Col xs={24} lg={12}>
-          <Card className="panel" variant="borderless" title={<Space><DatabaseOutlined />{tr("数据源", "Data sources")}</Space>}>
+          <Card
+            className="panel"
+            variant="borderless"
+            title={<Space><FolderOpenOutlined />{tr("数据源", "Data sources")}</Space>}
+            extra={<Button size="small" onClick={openWizard}>{tr("重新运行向导", "Re-run wizard")}</Button>}
+          >
             <Space direction="vertical" style={{ width: "100%" }} size={10}>
-              <div className="setting-row">
-                <div>
-                  <div className="label">{tr("navdata（Little Navmap / Navigraph SQLite）", "navdata (Little Navmap / Navigraph SQLite)")}</div>
-                  <div className="hint">{navdata.available ? `AIRAC ${navdata.airac} · ${navdata.airports} ${tr("机场", "airports")}` : navdata.error}</div>
-                </div>
-                <Tag color={navdata.available ? "blue" : "default"}>{navdata.available ? tr("已加载", "loaded") : tr("未加载", "missing")}</Tag>
-              </div>
-              <Input
-                value={navPath}
-                onChange={(e) => setNavPath(e.target.value)}
-                placeholder="%APPDATA%\\ABarthel\\little_navmap_db\\little_navmap_navigraph.sqlite"
-                prefix={<FolderOpenOutlined />}
+              {/* IA-10：navdata 选择块与首次向导共用（同一份状态/错误处理） */}
+              <NavdataPanel
+                onLoaded={(status) => patch({ navdata_path: status.available ? status.path : null })}
               />
-              <Space>
-                <Button icon={<DatabaseOutlined />} loading={navBusy} onClick={() => void selectNavdata()}>{tr("检测并保存", "Check & save")}</Button>
-                <Button onClick={() => { setNavPath(""); patch({ navdata_path: null }); }}>{tr("清除", "Clear")}</Button>
-              </Space>
               <Divider style={{ margin: "8px 0" }} />
               <div className="setting-row">
                 <div>
@@ -198,37 +177,8 @@ export function SettingsPage() {
                 ]}
               />
               <Divider style={{ margin: "8px 0" }} />
-              <div className="setting-row">
-                <div>
-                  <div className="label">SimLink</div>
-                  <div className="hint">
-                    {tr(sim.zh, sim.en)}
-                    {sim.level === "online" ? ` · ${recording.simlink_version || ""}` : ""}
-                    {sim.source ? ` · source=${sim.source}` : ""}
-                  </div>
-                  {sim.level === "no-sim" && sim.error ? (
-                    <div className="hint" style={{ opacity: 0.75 }}>{sim.error}</div>
-                  ) : null}
-                  {sim.level === "offline" ? (
-                    <div className="hint">
-                      {tr("启动 aoc-simlink.exe（或 Tauri 客户端）后会自动发现。",
-                        "Start aoc-simlink.exe (or the Tauri client) and it is picked up automatically.")}
-                    </div>
-                  ) : null}
-                </div>
-                <Space size={6} wrap>
-                  <Button size="small" icon={<ReloadOutlined />} onClick={() => void refresh()}>
-                    {tr("刷新", "Refresh")}
-                  </Button>
-                  <Button size="small" icon={<ApiOutlined />} loading={reconnectBusy}
-                    disabled={!recording.simlink_connected} onClick={() => void reconnect()}>
-                    {tr("重新连接", "Reconnect")}
-                  </Button>
-                  <Button size="small" icon={<FolderOpenOutlined />} onClick={() => void openLogs()}>
-                    {tr("日志目录", "Logs")}
-                  </Button>
-                </Space>
-              </div>
+              {/* IA-10：SimLink 状态块与首次向导共用 */}
+              <SimlinkPanel />
               <div className="setting-row">
                 <div>
                   <div className="label">{tr("Volanta 同步", "Volanta sync")}</div>
@@ -244,6 +194,11 @@ export function SettingsPage() {
               <VolantaImport csvRows={4} onImported={() => refresh()} />
             </Space>
           </Card>
+        </Col>
+
+        {/* §36 兜底 C（1.4）：场景库扫不到 / add-on 机场的手工跑道覆盖 */}
+        <Col xs={24} lg={12}>
+          <RunwayOverrideCard />
         </Col>
 
         <Col xs={24} lg={12}>
@@ -324,8 +279,12 @@ export function SettingsPage() {
         <Col xs={24} lg={12}>
           <Card className="panel" variant="borderless" title={tr("单位与外观", "Units & appearance")}>
             <Space direction="vertical" style={{ width: "100%" }} size={4}>
+              {/* UI-10 / D-10：主题与语言保持「保存后生效」，但在控件旁写清楚，避免被当成切换失效 */}
               <div className="setting-row">
-                <div className="label">{tr("主题", "Theme")}</div>
+                <div>
+                  <div className="label">{tr("主题", "Theme")}</div>
+                  <div className="hint">{tr("保存后生效", "Applies after saving")}</div>
+                </div>
                 <Select
                   value={draft.theme}
                   onChange={(v) => patch({ theme: v })}
@@ -338,7 +297,10 @@ export function SettingsPage() {
                 />
               </div>
               <div className="setting-row">
-                <div className="label">{tr("语言", "Language")}</div>
+                <div>
+                  <div className="label">{tr("语言", "Language")}</div>
+                  <div className="hint">{tr("保存后生效", "Applies after saving")}</div>
+                </div>
                 <Select
                   value={draft.language}
                   onChange={(v) => patch({ language: v })}
@@ -427,7 +389,21 @@ export function SettingsPage() {
               </Space>
               {archivePath ? <Text className="muted" style={{ fontSize: 12 }}>{archivePath}</Text> : null}
               <Input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder={tr("档案 zip 的绝对路径", "Absolute path to archive zip")} prefix={<ImportOutlined />} />
-              <Button loading={archiveBusy} onClick={() => void importArchive()}>{tr("导入档案（覆盖本地库）", "Import archive (replaces local DB)")}</Button>
+              {/* UI-10：覆盖本地库是不可逆操作（旧库会被自动备份），先确认再提交 */}
+              <Popconfirm
+                title={tr("导入档案会覆盖本地数据库", "Importing replaces the local database")}
+                description={tr("当前的 aoc.db、轨迹与设置会被替换（旧库会自动备份）。确认导入？",
+                  "The current aoc.db, tracks and settings are replaced (the old DB is backed up first). Continue?")}
+                okText={tr("导入并覆盖", "Import & overwrite")}
+                okButtonProps={{ danger: true }}
+                cancelText={tr("返回", "Back")}
+                disabled={!importPath.trim()}
+                onConfirm={() => void importArchive()}
+              >
+                <Button loading={archiveBusy} disabled={!importPath.trim()} danger>
+                  {tr("导入档案（覆盖本地库）", "Import archive (replaces local DB)")}
+                </Button>
+              </Popconfirm>
               <Divider style={{ margin: "6px 0" }} />
               <div className="setting-row">
                 <div><div className="label">{tr("公司模式", "Company mode")}</div><div className="hint">{tr("M2 功能，入口在发布后开放", "M2 feature, enabled after release")}</div></div>
@@ -439,10 +415,13 @@ export function SettingsPage() {
       </Row>
 
       {dirty ? (
-        <div className="save-float" role="status" aria-live="polite">
+        <div className="save-float save-float-dirty" role="status" aria-live="polite">
           <div>
-            <div className="label">{tr("设置有未保存的更改", "Unsaved changes")}</div>
-            <div className="hint">{tr("点击保存后才会生效", "Changes take effect after saving")}</div>
+            <div className="label">
+              <ExclamationCircleOutlined style={{ color: "#f59e0b", marginRight: 6 }} />
+              {tr("有未保存的更改（离开将丢失）", "Unsaved changes (lost if you leave)")}
+            </div>
+            <div className="hint">{tr("主题/语言/单位等保存后才生效", "Theme, language and units apply after saving")}</div>
           </div>
           <Space size={8}>
             <Button size="small" onClick={discard}>{tr("放弃", "Discard")}</Button>

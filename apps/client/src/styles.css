@@ -83,6 +83,8 @@ body {
 .page-head p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
 .muted { color: var(--muted); }
 .mono { font-variant-numeric: tabular-nums; }
+/* UI-05：执行页的「ZFW 偏低」提示（此前类名缺失，阈值判断等于没有视觉反馈） */
+.text-danger { color: #ef4444; font-weight: 600; }
 
 .panel {
   background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
@@ -188,6 +190,11 @@ body {
 }
 .save-float .label { font-size: 13px; font-weight: 600; }
 .save-float .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+/* UI-10：未保存提示要更显眼（以前和普通浮条没差别，容易被忽略） */
+.save-float-dirty { border-color: rgba(245, 158, 11, .55) !important; box-shadow: 0 0 0 1px rgba(245, 158, 11, .25), var(--shadow); }
+
+/* IA-03：自由飞「可用飞机」表点击选中的行 */
+.ant-table-row.row-selected > td { background: var(--accent-soft) !important; }
 @keyframes save-float-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: none; }

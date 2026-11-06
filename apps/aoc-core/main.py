@@ -195,6 +195,8 @@ def create_app(config: CoreConfig) -> FastAPI:
                     "DUPLICATE_TYPE", "AIRCRAFT_TYPE_IN_USE",
                     # §41：录制与任务错序 / 班表过期
                     "RECORDING_IN_PROGRESS", "ROSTER_EXPIRED",
+                    # UI-01：已有未完成班表时禁止再抽（不能同时锁两架飞机）
+                    "ROSTER_EXISTS",
                     "CONFIG_VERSION_CONFLICT", "VERSION_CONFLICT", "INVALID_TOKEN"}
 
     @app.exception_handler(OpsError)
@@ -526,6 +528,19 @@ def create_app(config: CoreConfig) -> FastAPI:
             raise HTTPException(status_code=422, detail={"code": "IMPORT_FAILED", "message": str(exc)}) from exc
 
     # ---------------- 单机运营模式（M2） ----------------
+    @app.get("/local/navdata/runway-overrides")
+    def navdata_runway_overrides():
+        """§36 兜底 C（1.4）：手工跑道覆盖表（场景库扫不到 / add-on 机场）。"""
+        return {"items": service.ops.runway_overrides()}
+
+    @app.put("/local/navdata/runway-overrides/{icao}/{ident}")
+    def navdata_runway_override_set(icao: str, ident: str, body: dict[str, Any]):
+        return service.set_runway_override(icao, ident, body or {})
+
+    @app.delete("/local/navdata/runway-overrides/{icao}/{ident}")
+    def navdata_runway_override_delete(icao: str, ident: str):
+        return service.delete_runway_override(icao, ident)
+
     @app.get("/local/ops/dashboard")
     def ops_dashboard():
         return service.ops.dashboard()
@@ -653,8 +668,10 @@ def create_app(config: CoreConfig) -> FastAPI:
 
     @app.post("/local/ops/rosters/confirm")
     def ops_roster_confirm(body: dict[str, Any]):
+        # UI-01 / D-10：replace=true 时允许用新候选替换一张尚未开始首段的 LOCKED 班表
         return service.ops.confirm_roster(body.get("candidate_token", ""),
-                                          int(body.get("candidate_index") or 0))
+                                          int(body.get("candidate_index") or 0),
+                                          bool(body.get("replace") or False))
 
     @app.get("/local/ops/rosters")
     def ops_rosters():
@@ -757,6 +774,11 @@ def create_app(config: CoreConfig) -> FastAPI:
         """放弃当前航班：停止录制、取消航段与剩余班表、释放飞机（不结算）。"""
         reason = (body or {}).get("reason")
         return await service.abort_task(reason)
+
+    @app.post("/local/ops/tasks/recover")
+    async def ops_task_recover(body: dict[str, Any] | None = None):
+        """卡死恢复（1.6）：停掉没绑到任务上的录制、解除航段/任务，**机队位置保持现状**。"""
+        return await service.recover_stuck((body or {}).get("reason"))
 
     @app.get("/local/ops/finance/summary")
     def ops_finance_summary():

@@ -250,6 +250,8 @@ export interface FlightRecord {
   /** §33：中途接入（block_off 只能取接入后首帧）。 */
   late_join?: number | boolean | null;
   block_off_source?: "preroll" | "connect" | null;
+  /** UI-02：这条记录自己的采样源（simconnect / demo / replay），开录时落库。 */
+  data_source?: string | null;
   threshold_distance_m?: number | null;
   /** 着陆入口内移量（米），距入口距离已扣掉这段。 */
   displaced_threshold_m?: number | null;

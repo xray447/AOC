@@ -24,6 +24,39 @@ interface SyncEvent {
   created_at: string;
 }
 
+/** UI-13：联机页的状态/角色/事件枚举本地化（以前英文模式也是原文枚举）。 */
+const ROLE_LABEL: Record<string, { zh: string; en: string }> = {
+  ADMIN: { zh: "管理员", en: "Admin" },
+  DISPATCHER: { zh: "签派", en: "Dispatcher" },
+  PILOT: { zh: "飞行员", en: "Pilot" },
+};
+
+const ROSTER_LABEL: Record<string, { zh: string; en: string }> = {
+  LOCKED: { zh: "待开始", en: "Locked" },
+  IN_PROGRESS: { zh: "执行中", en: "In progress" },
+  COMPLETED: { zh: "已完成", en: "Completed" },
+  CANCELLED: { zh: "已取消", en: "Cancelled" },
+  EXPIRED: { zh: "已过期", en: "Expired" },
+};
+
+const LEG_LABEL: Record<string, { zh: string; en: string }> = {
+  PLANNED: { zh: "计划", en: "Planned" },
+  HELD: { zh: "待开始", en: "Held" },
+  IN_PROGRESS: { zh: "执行中", en: "In progress" },
+  COMPLETED: { zh: "已完成", en: "Completed" },
+  CANCELLED: { zh: "已取消", en: "Cancelled" },
+};
+
+const EVENT_LABEL: Record<string, { zh: string; en: string }> = {
+  CREATE: { zh: "创建", en: "Create" },
+  UPDATE: { zh: "更新", en: "Update" },
+  DELETE: { zh: "删除", en: "Delete" },
+  ASSIGN: { zh: "分配", en: "Assign" },
+  SETTLE: { zh: "结算", en: "Settle" },
+  LOCK: { zh: "锁定", en: "Lock" },
+  RELEASE: { zh: "释放", en: "Release" },
+};
+
 export function Online() {
   const { tr } = useI18n();
   const [state, setState] = useState<OnlineState | null>(() => loadOnline());
@@ -184,7 +217,9 @@ export function Online() {
         </Space>}>
         <Descriptions size="small" column={4}>
           <Descriptions.Item label={tr("账号", "User")}>{state.user.display_name}</Descriptions.Item>
-          <Descriptions.Item label={tr("角色", "Role")}><Tag>{state.user.role}</Tag></Descriptions.Item>
+          <Descriptions.Item label={tr("角色", "Role")}>
+            <Tag>{ROLE_LABEL[state.user.role] ? tr(ROLE_LABEL[state.user.role].zh, ROLE_LABEL[state.user.role].en) : state.user.role}</Tag>
+          </Descriptions.Item>
           <Descriptions.Item label={tr("公司余额", "Balance")}>
             {state.company.currency} {state.company.balance.toFixed(2)}
           </Descriptions.Item>
@@ -200,7 +235,11 @@ export function Online() {
               <Descriptions.Item label={tr("飞机", "Aircraft")}>
                 {roster.aircraft ? `${roster.aircraft.registration} (${roster.aircraft.type?.icao || "—"})` : "—"}
               </Descriptions.Item>
-              <Descriptions.Item label={tr("状态", "Status")}><Tag color="blue">{roster.status}</Tag></Descriptions.Item>
+              <Descriptions.Item label={tr("状态", "Status")}>
+                <Tag color="blue">
+                  {ROSTER_LABEL[roster.status] ? tr(ROSTER_LABEL[roster.status].zh, ROSTER_LABEL[roster.status].en) : roster.status}
+                </Tag>
+              </Descriptions.Item>
               <Descriptions.Item label={tr("锁到期", "Lock expires")}>{roster.expires_at}</Descriptions.Item>
             </Descriptions>
             <Table size="small" rowKey="id" pagination={false} dataSource={roster.legs}
@@ -209,7 +248,13 @@ export function Online() {
                 { title: tr("航班", "Flight"), dataIndex: "flight_number" },
                 { title: tr("航段", "Route"), render: (_: unknown, row: OnlineFlight) => `${row.dep_icao} → ${row.arr_icao}` },
                 { title: tr("计划起飞", "ETD"), dataIndex: "scheduled_dep_utc" },
-                { title: tr("状态", "Status"), render: (_: unknown, row: OnlineFlight & { leg_status?: string }) => <Tag>{row.leg_status || "HELD"}</Tag> },
+                {
+                  title: tr("状态", "Status"),
+                  render: (_: unknown, row: OnlineFlight & { leg_status?: string }) => {
+                    const status = row.leg_status || "HELD";
+                    return <Tag>{LEG_LABEL[status] ? tr(LEG_LABEL[status].zh, LEG_LABEL[status].en) : status}</Tag>;
+                  },
+                },
               ]} />
           </>
         )}
@@ -238,7 +283,10 @@ export function Online() {
           <Table size="small" rowKey="id" pagination={false} dataSource={events}
             columns={[
               { title: "#", dataIndex: "id", width: 70 },
-              { title: tr("类型", "Kind"), dataIndex: "kind", render: (v: string) => <Tag>{v}</Tag> },
+              {
+                title: tr("类型", "Kind"), dataIndex: "kind",
+                render: (v: string) => <Tag>{EVENT_LABEL[v] ? tr(EVENT_LABEL[v].zh, EVENT_LABEL[v].en) : v}</Tag>,
+              },
               { title: tr("对象", "Entity"), render: (_: unknown, row: SyncEvent) => `${row.entity || ""} ${row.entity_id || ""}` },
               { title: tr("时间", "Time"), dataIndex: "created_at" },
             ]} />

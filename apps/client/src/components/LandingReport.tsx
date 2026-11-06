@@ -110,7 +110,7 @@ export function LandingReport({
           {duration != null ? `${tr("时长", "duration")} ${Math.round(duration)}s · ` : ""}
           {tr("样本", "samples")} {points.length}
           <br />
-          {dataSource || "AOC"} · {flight.dep_icao || "????"} → {flight.arr_icao || "????"}
+          {dataSource || "AOC"} · {flight.dep_icao || "—"} → {flight.arr_icao || "—"}
         </div>
       </div>
 
@@ -128,7 +128,7 @@ export function LandingReport({
               width: 7, height: 7, borderRadius: "50%", background: C_ALT,
               boxShadow: `0 0 8px ${C_ALT}`, display: "inline-block",
             }} />
-            {tr("落地", "Landing")} {flight.arr_icao || "????"}/{flight.runway_ident || "—"} @ t={Math.round(landingT)}s
+            {tr("落地", "Landing")} {flight.arr_icao || "—"}/{flight.runway_ident || "—"} @ t={Math.round(landingT)}s
             <span style={{ color: "#6b7c93" }}>
               {flight.threshold_distance_m != null
                 ? ` · ${tr("距着陆入口", "from threshold")} ${round(flight.threshold_distance_m)} m`

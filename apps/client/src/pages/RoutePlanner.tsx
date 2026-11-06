@@ -34,12 +34,28 @@ const coverageMeta: Record<string, { zh: string; en: string; color: string }> = 
   NO_DATA: { zh: "未检查", en: "Not checked", color: "default" },
 };
 
-export function RoutePlanner() {
+interface RoutePlannerProps {
+  /** IA-09：作为「航路规划」下半部分内嵌时，不再渲染自己的标题区。 */
+  embedded?: boolean;
+  /** 受控的起降机场（上方推荐卡片会填入）。 */
+  depValue?: string;
+  arrValue?: string;
+  onDepChange?: (value: string) => void;
+  onArrChange?: (value: string) => void;
+}
+
+export function RoutePlanner({
+  embedded = false, depValue, arrValue, onDepChange, onArrChange,
+}: RoutePlannerProps = {}) {
   const { tr } = useI18n();
   const { settings, navdata } = useApp();
   const [params] = useSearchParams();
-  const [dep, setDep] = useState(params.get("dep") || "");
-  const [arr, setArr] = useState(params.get("arr") || "");
+  const [depState, setDepState] = useState(params.get("dep") || "");
+  const [arrState, setArrState] = useState(params.get("arr") || "");
+  const dep = depValue ?? depState;
+  const arr = arrValue ?? arrState;
+  const setDep = onDepChange ?? setDepState;
+  const setArr = onArrChange ?? setArrState;
   const [cruiseFl, setCruiseFl] = useState(settings.aircraft_type ? 350 : 350);
   const [aircraft, setAircraft] = useState(settings.aircraft_type);
   const [types, setTypes] = useState<AircraftType[]>([]);
@@ -65,6 +81,11 @@ export function RoutePlanner() {
     }, 250);
     return () => window.clearTimeout(timer);
   }, [dep, arr, aircraft, cruiseFl]);
+
+  // 起降/机型变了，旧航路就不再对应这对机场：清掉结果，避免照着上一条航路飞
+  useEffect(() => {
+    setResult(null);
+  }, [dep, arr, aircraft]);
 
   const generate = async () => {
     if (dep.length !== 4 || arr.length !== 4) {
@@ -117,10 +138,12 @@ export function RoutePlanner() {
       : tr("高度未校验", "Altitude unverified");
 
   return (
-    <div className="page">
+    <div className={embedded ? "ops-embedded" : "page"}>
       <div className="page-head">
         <div>
-          <h2>{tr("航路规划", "Route planning")}</h2>
+          <h2 style={embedded ? { fontSize: 16 } : undefined}>
+            {embedded ? tr("② 规划航路", "2. Plan the route") : tr("航路规划", "Route planning")}
+          </h2>
           <p>{tr("AIP 官方航路 → 覆盖检查 → Pre-train 图；任一环节失败都会给出 SimBrief 链接", "AIP → coverage → graph; any failure falls back to SimBrief")}</p>
         </div>
       </div>

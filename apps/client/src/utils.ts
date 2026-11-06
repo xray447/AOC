@@ -131,7 +131,7 @@ export const statusLabels: Record<string, { zh: string; en: string; color: strin
 };
 
 export function flightTitle(f: FlightRecord): string {
-  return `${f.dep_icao || "????"} → ${f.arr_icao || "????"}`;
+  return `${f.dep_icao || "—"} → ${f.arr_icao || "—"}`;
 }
 
 export function pct(value: number, total: number): number {

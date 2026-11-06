@@ -1,22 +1,36 @@
 import { CompassOutlined, RocketOutlined, ThunderboltOutlined } from "@ant-design/icons";
 import { Alert, Button, Card, Col, Empty, Form, InputNumber, Row, Select, Slider, Space, Switch, Tag, Typography, message } from "antd";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { aircraftGroups, categoryLabel } from "../aircraft";
 import { api } from "../api";
 import { AirportSelect } from "../components/AirportSelect";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
-import type { AircraftType, Candidate, RecommendResult } from "../types";
+import type { AircraftType, Candidate, RecommendResult, Settings } from "../types";
 
 const { Text, Paragraph } = Typography;
 
-export function Recommend() {
+interface RecommendProps {
+  /** IA-09：作为「航路规划」上半部分内嵌时，不再渲染自己的标题区。 */
+  embedded?: boolean;
+  /** 受控的出发机场（与下方航路表单共用）。 */
+  base?: string;
+  onBaseChange?: (value: string) => void;
+  /** 点候选卡片时把机场填进下方的航路表单（不传则跳到 `/route`）。 */
+  onPick?: (dep: string, arr: string) => void;
+}
+
+export function Recommend({
+  embedded = false, base: baseProp, onBaseChange, onPick,
+}: RecommendProps = {}) {
   const { tr } = useI18n();
-  const { settings, navdata } = useApp();
+  const { settings, navdata, saveSettings } = useApp();
   const navigate = useNavigate();
   const [minutes, setMinutes] = useState(90);
-  const [base, setBase] = useState<string>(settings.home_airport || "");
+  const [baseState, setBaseState] = useState<string>(settings.home_airport || "");
+  const base = baseProp ?? baseState;
+  const setBase = onBaseChange ?? setBaseState;
   const [aircraft, setAircraft] = useState(settings.aircraft_type);
   const [never, setNever] = useState(settings.recommend.only_never_visited);
   const [newCountry, setNewCountry] = useState(settings.recommend.prefer_new_country);
@@ -31,6 +45,16 @@ export function Recommend() {
   useEffect(() => {
     if (!base && settings.home_airport) setBase(settings.home_airport);
   }, [settings.home_airport, base]);
+
+  // UI-17：换了机场/机型/可用时间后，旧候选就不再对应这组输入 —— 直接清掉
+  useEffect(() => {
+    setResult(null);
+  }, [base, aircraft, minutes, never, newCountry]);
+
+  /** 两个开关改了就写回设置（以前只改本次请求，刷新页面又变回去）。 */
+  const persistRecommend = useCallback((patch: Partial<Settings["recommend"]>) => {
+    void saveSettings({ recommend: { ...settings.recommend, ...patch } }).catch(() => undefined);
+  }, [saveSettings, settings.recommend]);
 
   const submit = async () => {
     if (!base) {
@@ -58,15 +82,24 @@ export function Recommend() {
     }
   };
 
-  const goRoute = (c: Candidate) => navigate(`/route?dep=${encodeURIComponent(base)}&arr=${encodeURIComponent(c.icao)}`);
+  const goRoute = (c: Candidate) => {
+    if (onPick) {
+      onPick(base, c.icao);
+      return;
+    }
+    navigate(`/route?dep=${encodeURIComponent(base)}&arr=${encodeURIComponent(c.icao)}`);
+  };
   const selectedType = types.find((t) => t.icao === aircraft);
 
   return (
-    <div className="page">
+    <div className={embedded ? "ops-embedded" : "page"}>
       <div className="page-head">
         <div>
-          <h2>{tr("去一个没去过的地方", "Fly somewhere new")}</h2>
-          <p>{tr("按可用时间筛选机场，优先从未到达、且是新的国家/地区", "Filter by available time, preferring never-visited airports and new countries")}</p>
+          <h2 style={embedded ? { fontSize: 16 } : undefined}>
+            {embedded ? tr("① 推荐目的地", "1. Pick a destination") : tr("去一个没去过的地方", "Fly somewhere new")}
+          </h2>
+          <p>{tr("按可用时间筛选机场，优先从未到达、且是新的国家/地区",
+            "Filter by available time, preferring never-visited airports and new countries")}</p>
         </div>
       </div>
 
@@ -103,7 +136,8 @@ export function Recommend() {
                       style={{ width: 130 }}
                     />
                   </Space>
-                  <Slider min={30} max={360} step={15} value={minutes} onChange={setMinutes} tooltip={{ formatter: (v) => `${v} min` }} />
+                  {/* UI-17：滑块与输入框同为 20–720（以前滑块 30–360、输入框 20–720，口径不一致） */}
+                  <Slider min={20} max={720} step={15} value={minutes} onChange={setMinutes} tooltip={{ formatter: (v) => `${v} min` }} />
                 </Space>
               </Form.Item>
             </Col>
@@ -135,10 +169,16 @@ export function Recommend() {
             <Col xs={24} md={9}>
               <Space size={20}>
                 <span>
-                  <Switch checked={never} onChange={setNever} /> <Text>{tr("只去没到达过的", "Never arrived")}</Text>
+                  <Switch checked={never} onChange={(v) => {
+                    setNever(v);
+                    persistRecommend({ only_never_visited: v });
+                  }} /> <Text>{tr("只去没到达过的", "Never arrived")}</Text>
                 </span>
                 <span>
-                  <Switch checked={newCountry} onChange={setNewCountry} /> <Text>{tr("优先新国家", "Prefer new country")}</Text>
+                  <Switch checked={newCountry} onChange={(v) => {
+                    setNewCountry(v);
+                    persistRecommend({ prefer_new_country: v });
+                  }} /> <Text>{tr("优先新国家", "Prefer new country")}</Text>
                 </span>
               </Space>
             </Col>

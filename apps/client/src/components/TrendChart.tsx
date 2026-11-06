@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 
 export interface TrendPoint {
   t: number;
@@ -18,7 +18,8 @@ interface Props {
   emptyText?: string;
 }
 
-const W = 1040;
+/** viewBox 的兜底宽度（容器还没测量出来时）。 */
+const W_FALLBACK = 1040;
 const PAD_L = 52;
 const PAD_R = 14;
 const PAD_T = 14;
@@ -43,6 +44,22 @@ function percentile(values: number[], ratio: number): number {
 export function TrendChart({
   title, unit, color, series, markerT, height = 200, note, emptyText,
 }: Props) {
+  // UI-07：viewBox 宽度跟着容器走。以前固定 1040 + preserveAspectRatio="none"，
+  // 容器一变窄左侧数值和底部时间刻度就被横向拉伸（1440 以下和嵌在卡片里都很难看）。
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(W_FALLBACK);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver((entries) => {
+      const next = entries[0]?.contentRect.width;
+      if (next && next > 120) setWidth(Math.round(next));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  const W = width;
+
   const points = series
     .filter((p) => Number.isFinite(p.t) && typeof p.v === "number" && Number.isFinite(p.v))
     .map((p) => ({ t: p.t, v: p.v as number }))
@@ -56,7 +73,7 @@ export function TrendChart({
 
   if (points.length < 2) {
     return (
-      <div style={wrap} data-testid={`chart-${title}`}>
+      <div ref={wrapRef} style={wrap} data-testid={`chart-${title}`}>
         <div style={{ fontSize: 10, letterSpacing: 1.4, color: "#8fa3ba", marginBottom: 4 }}>
           {title}{unit ? <span style={{ color: "#6b7c93" }}> · {unit}</span> : null}
         </div>
@@ -87,12 +104,13 @@ export function TrendChart({
   const marker = typeof markerT === "number" && markerT >= t0 && markerT <= t1 ? markerT : null;
 
   return (
-    <div style={wrap} data-testid={`chart-${title}`}>
+    <div ref={wrapRef} style={wrap} data-testid={`chart-${title}`}>
       <div style={{ fontSize: 10, letterSpacing: 1.4, color: "#8fa3ba", marginBottom: 4 }}>
         {title}{unit ? <span style={{ color: "#6b7c93" }}> · {unit}</span> : null}
       </div>
+      {/* viewBox 宽 = 实测容器宽：文字不再被横向拉伸 */}
       <svg viewBox={`0 0 ${W} ${height}`} width="100%" height={height}
-        preserveAspectRatio="none" role="img" aria-label={title}>
+        role="img" aria-label={title}>
         {[0, 1, 2, 3, 4].map((i) => {
           const value = yMin + ((yMax - yMin) * i) / 4;
           const y = sy(value);
