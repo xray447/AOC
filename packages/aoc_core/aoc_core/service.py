@@ -11,13 +11,14 @@ import json
 import logging
 import os
 import shutil
+import socket
 import threading
 import time as _time
 import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from aoc_integrations.volanta import VolantaClient, extract_track, parse_csv, parse_stored_flight
 from aoc_navdata import NavData, NavDataError, haversine_nm
@@ -41,6 +42,7 @@ from .aircraft import AircraftCatalog
 from .db import Database, utcnow
 from .flights import FlightService
 from .ops import OpsError, OpsService
+from .ops import stands as stand_rules
 from .ops.service import zfw_check
 from .paths import AppPaths
 from .recommend import recommend as build_recommend
@@ -124,6 +126,10 @@ class PersonalService:
         self._auto_start_mode_sent: str | None = None
         self._auto_stop_hold_sent: float | None = None
         self._last_persist = 0.0
+        # docs/12：到达提醒节流 + BeyondATC 在线探测缓存（Q-7 让位）
+        self._stand_tick_at = 0.0
+        self._batc_checked_at = 0.0
+        self._batc_online_cache: bool | None = None
         self._poller_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_status: dict[str, Any] = {}
@@ -153,6 +159,7 @@ class PersonalService:
         self.ops.pushback_provider = self._pushback_snapshot
         # §36 兜底 C：navdata 可能在 ops 建好之前就被读过，这里补一次覆盖
         self._apply_runway_overrides(self._nav)
+        self._apply_stand_overrides(self._nav)
 
     def _pushback_snapshot(self) -> dict:
         """当前这条录制的推出定稿快照（未推出时为空值）。"""
@@ -246,6 +253,7 @@ class PersonalService:
             self._nav = NavData(path, scenery_path=scenery, runway_source=source)
             # §36 兜底 C（1.4）：手工跑道覆盖优先于场景库/navdata
             self._apply_runway_overrides(self._nav)
+            self._apply_stand_overrides(self._nav)
         except (NavDataError, Exception) as exc:  # noqa: BLE001
             self._nav_error = f"{type(exc).__name__}: {exc}"
             self._nav = None
@@ -268,6 +276,25 @@ class PersonalService:
     def delete_runway_override(self, icao: str, ident: str) -> dict:
         result = self.ops.delete_runway_override(icao, ident)
         self._apply_runway_overrides(self._nav)
+        return result
+
+    def _apply_stand_overrides(self, nav: NavData | None) -> None:
+        ops = getattr(self, "ops", None)
+        if nav is None or ops is None:
+            return
+        try:
+            nav.set_stand_overrides(ops.stand_overrides())
+        except Exception:  # noqa: BLE001
+            return
+
+    def set_stand_override(self, icao: str, ident: str, data: dict) -> dict:
+        result = self.ops.set_stand_override(icao, ident, data)
+        self._apply_stand_overrides(self._nav)
+        return result
+
+    def delete_stand_override(self, icao: str, ident: str) -> dict:
+        result = self.ops.delete_stand_override(icao, ident)
+        self._apply_stand_overrides(self._nav)
         return result
 
     def _scenery_candidate(self) -> str | None:
@@ -515,10 +542,22 @@ class PersonalService:
         reference = {str(r.get("name") or "").upper(): r.get("length_m")
                      for r in nav.navdata_runways(icao)}
         visited = self.db.visited_airports()
+        # docs/12 §7.2：机位与「航站楼是哪片机位」一起返回（机场详情/维护卡片共用）
+        stands = nav.stands(icao)
+        terminals = self.ops.terminals(icao) if hasattr(self, "ops") else []
         return {
             **info, "icao": info["ident"],
             "visited": info["ident"] in visited,
             "runway_source": (runways[0].get("source") if runways else "navdata"),
+            "stand_source": (stands[0].get("source") if stands else "none"),
+            "stand_count": len(stands),
+            "stands": [{
+                "ident": s.get("ident"), "type": s.get("type"),
+                "lat": s.get("lat"), "lon": s.get("lon"), "heading": s.get("heading"),
+                "radius_m": s.get("radius_m"), "has_jetway": s.get("has_jetway"),
+                "source": s.get("source"),
+            } for s in stands[:400]],
+            "terminals": terminals,
             "runways": [{
                 "ident": r.get("name"), "heading": r.get("hdg"),
                 "length_m": r.get("length_m"), "ils": r.get("ils"),
@@ -867,6 +906,10 @@ class PersonalService:
             "gs_kt": None, "ias_kt": None, "alt_ft": None, "agl_ft": None,
             "lat": None, "lon": None, "vs_fpm": None, "phase": None,
             "remaining_nm": None, "ete_min": None, "eta_utc": None,
+            # docs/12 §5.2：修正后的 ETA 与置信度（老字段 eta_utc 不动）
+            "eta_refined_min": None, "eta_refined_utc": None, "eta_confidence": None,
+            # docs/12 §7.2：机位卡 / 通道原因码 / 最近一条通知
+            "stand": None, "stand_channel": None, "notice": None,
             "total_weight_kg": None, "fuel_weight_kg": None, "actual_zfw_kg": None,
             # 位置闸（§33）：前端据此禁用「开始记录」或改走部分记录
             "dep_icao": None, "dep_distance_nm": None, "position_ok": True,
@@ -921,6 +964,14 @@ class PersonalService:
                     out["ete_min"] = round(ete, 1)
                     out["eta_utc"] = (datetime.now(timezone.utc) + timedelta(minutes=ete)) \
                         .isoformat(timespec="seconds").replace("+00:00", "Z")
+                    # §5.2：下降段地速会掉到 140 kt，裸算 ETA 越接近越低估，这里按三档修正
+                    refined, confidence = stand_rules.eta_refined(
+                        remaining, gs, phase=out.get("phase"))
+                    out["eta_refined_min"] = refined
+                    out["eta_confidence"] = confidence
+                    out["eta_refined_utc"] = (datetime.now(timezone.utc)
+                                              + timedelta(minutes=refined)) \
+                        .isoformat(timespec="seconds").replace("+00:00", "Z")
         # §32：推出后以 SimLink 回传的定稿值为准（展示与结算同一来源）
         pushback_zfw = self.flights.zfw_at_pushback
         if pushback_zfw is not None:
@@ -947,7 +998,165 @@ class PersonalService:
                                 else "short" if delta < -1 else ("over" if delta > 1 else "ok"))
         out["zfw_warnings"] = list(self._zfw_warnings)
         out["zfw_warning_seq"] = self._zfw_warning_seq
+        # docs/12：机位卡（定稿值只读，重算/手工指定走 POST /local/flights/{id}/stand）
+        flight_id = (task or {}).get("flight_record_id")
+        out["stand"] = self.ops.flight_stand(flight_id)
+        need_stand = out["stand"] is None
+        if not need_stand and out["stand"].get("source") in (None, "none"):
+            # 之前「没有机位数据」：只有现在数据真的到了才重算，否则每 2 s 白写一次库
+            arr = out["stand"].get("airport_icao")
+            need_stand = bool(self.nav is not None and arr and self.nav.stands(arr))
+        if flight_id and need_stand:
+            # P0 判据：打开执行页就能看到预计机位 —— 先算好（PROPOSED），T-30 只负责通知
+            try:
+                self.ops.ensure_flight_stand(
+                    flight_id, size_filter=bool(self._settings.get("stand_size_filter", True)))
+                out["stand"] = self.ops.flight_stand(flight_id)
+            except Exception as exc:  # noqa: BLE001 - 选位失败不影响实时状态
+                log.warning("预计机位计算失败：%s: %s", type(exc).__name__, exc)
+        out["stand_channel"] = self.stand_channel(arr)
+        out["notice"] = (self.ops.notice_for(flight_id, "STAND_CHANGED")
+                         or self.ops.notice_for(flight_id, "STAND_ETA")
+                         or self.ops.notice_for(flight_id, "ETA_ONLY"))
         return out
+
+    # -- docs/12 到达提醒：通道判定 / 触发 / 投递 --------------------------
+    BATC_PROBE = ("127.0.0.1", 41716)
+    STAND_TICK_S = 5.0
+    STAND_REASON_TEXT: ClassVar[dict[str, str]] = {
+        "TYPE_UNSUPPORTED": "本机型未提供 AOC 机内消息通道，已在 AOC 浮窗显示",
+        "HOPPIE_NOT_CONFIGURED": "未配置 Hoppie logon code（设置 → 到达提醒），已改用浮窗",
+        "HOPPIE_OFFLINE": "Hoppie 不可达（或呼号与机上不一致），已改用浮窗",
+        "BATC_AUTHORITATIVE": "BeyondATC 正在运行，机位以它的地面许可为准",
+        "NO_STAND_DATA": "该机场没有停机位数据，只提供预计到达时刻",
+    }
+
+    def _batc_online(self) -> bool:
+        """BeyondATC 在线探测（§6.2）：只看本机 41716 是否有进程在听，30 s 缓存。
+
+        连不上就当它没跑；任何异常都返回 False（不让探测影响主流程）。
+        """
+        now = _time.monotonic()
+        if self._batc_online_cache is not None and now - self._batc_checked_at < 30.0:
+            return self._batc_online_cache
+        online = False
+        try:
+            with socket.create_connection(self.BATC_PROBE, timeout=0.15):
+                online = True
+        except OSError:
+            online = False
+        self._batc_online_cache, self._batc_checked_at = online, now
+        return online
+
+    def stand_channel(self, arr_icao: str | None) -> dict:
+        """当前生效通道 + 原因码（§6.4）：能进机舱就进机舱，进不去写明为什么。"""
+        settings = self._settings
+        has_stand_data = False
+        if self.nav is not None and arr_icao:
+            has_stand_data = bool(self.nav.stands(arr_icao))
+        result: dict[str, Any] = {
+            "arr_icao": arr_icao, "overlay": bool(settings.get("stand_show_overlay", True)),
+            "system": True, "acars": False, "logon_configured": bool(self.ops.hoppie_logon()),
+            "callsign": settings.get("hoppie_callsign") or None,
+            "reason": None, "reason_text": None, "channel": "overlay",
+        }
+        if self._batc_online():
+            result.update(channel="batc", reason="BATC_AUTHORITATIVE")
+        elif result["logon_configured"] and settings.get("hoppie_enabled"):
+            result.update(channel="acars", acars=True)
+        elif not has_stand_data and arr_icao:
+            result.update(reason="NO_STAND_DATA")
+        elif not result["logon_configured"]:
+            result.update(reason="HOPPIE_NOT_CONFIGURED")
+        else:
+            result.update(reason="HOPPIE_NOT_CONFIGURED")
+        result["reason_text"] = self.STAND_REASON_TEXT.get(result["reason"] or "")
+        return result
+
+    def _stand_callsign(self) -> str | None:
+        task = self.ops.active_task() or {}
+        settings_callsign = str(self._settings.get("hoppie_callsign") or "").strip().upper()
+        if settings_callsign:
+            return settings_callsign
+        return str(task.get("callsign") or "").strip().upper() or None
+
+    def _stand_tick(self, status: dict[str, Any]) -> None:
+        """到达前提醒的触发点（§5.4）：T2 距离 或 T1 ETA 先到，T4 进近兜底。"""
+        settings = self._settings
+        if not settings.get("stand_notice", True):
+            return
+        now = _time.monotonic()
+        if now - self._stand_tick_at < self.STAND_TICK_S:
+            return
+        self._stand_tick_at = now
+        task = self.ops.active_task()
+        if not task or not task.get("flight_record_id"):
+            return
+        lat, lon = status.get("lat"), status.get("lon")
+        gs = status.get("gs_kt")
+        if lat is None or lon is None or status.get("on_ground") is not False or not gs or gs < 50:
+            return
+        arr = str(task.get("arr_icao") or "").upper()
+        info = self.nav.airport(arr) if (self.nav is not None and arr) else None
+        if not info:
+            return
+        remaining = haversine_nm(float(lat), float(lon), info["lat"], info["lon"])
+        phase = str(status.get("phase") or "").upper()
+        eta_min, _confidence = stand_rules.eta_refined(remaining, float(gs), phase=phase)
+        lead_min = float(settings.get("stand_lead_minutes") or 30)
+        lead_nm = float(settings.get("stand_lead_nm") or 150)
+        if remaining <= lead_nm:
+            trigger = "distance"
+        elif eta_min <= lead_min:
+            trigger = "eta"
+        elif phase in ("DESCENT", "APPROACH"):
+            trigger = "phase"
+        else:
+            return
+        eta_utc = (datetime.now(timezone.utc) + timedelta(minutes=eta_min)) \
+            .isoformat(timespec="seconds").replace("+00:00", "Z")
+        notice = self.ops.ensure_stand_notice(
+            task["flight_record_id"], eta_min=eta_min, remaining_nm=round(remaining, 1),
+            eta_utc=eta_utc, trigger=trigger,
+            size_filter=bool(settings.get("stand_size_filter", True)))
+        if notice:
+            self._dispatch_notice(notice, task)
+
+    def _dispatch_notice(self, notice: dict[str, Any], task: dict[str, Any]) -> None:
+        """按 Q-6 双发：ACARS 为主 + 客户端镜像（镜像由队列消费者各弹一次）。"""
+        settings = self._settings
+        payload = dict(notice.get("payload") or {})
+        channel = settings.get("stand_notice_channel") or "both"
+        report = self.stand_channel(payload.get("arr_icao") or task.get("arr_icao"))
+        extra: dict[str, Any] = {"channel": report.get("channel"), "reason": report.get("reason")}
+        want_acars = channel in ("both", "acars") and report.get("acars")
+        packet = payload.get("packet")
+        callsign = self.stand_callsign()
+        if want_acars and packet and callsign:
+            if os.environ.get("AOC_NO_NET"):
+                extra["acars"] = {"ok": False, "verdict": "OFFLINE", "error": "AOC_NO_NET"}
+            else:
+                try:
+                    extra["acars"] = self.ops.hoppie_send(
+                        packet, from_=str(settings.get("hoppie_from") or "AOCDISP"),
+                        to=callsign, flight_record_id=notice.get("flight_record_id"))
+                except Exception as exc:  # noqa: BLE001 - 投递失败绝不阻塞航班
+                    log.warning("Hoppie 投递失败：%s: %s", type(exc).__name__, exc)
+                    extra["acars"] = {"ok": False, "verdict": "FAILED",
+                                      "error": f"{type(exc).__name__}: {exc}"}
+        elif want_acars and not callsign:
+            extra["acars"] = {"ok": False, "verdict": "NO_CALLSIGN"}
+        else:
+            extra["acars"] = {"ok": False, "verdict": "NOT_CONFIGURED",
+                              "error": report.get("reason")}
+        acars = extra.get("acars") or {}
+        if want_acars and not acars.get("ok") and acars.get("verdict") not in ("OFFLINE",):
+            # 投递失败要留原因码（HOPPIE_OFFLINE），别让界面以为「发了但没回执」
+            extra["reason"] = "HOPPIE_OFFLINE"
+            extra["reason_text"] = self.STAND_REASON_TEXT["HOPPIE_OFFLINE"]
+        else:
+            extra["reason_text"] = report.get("reason_text")
+        self.ops.update_notice_payload(notice["id"], extra)
 
     async def stop_recording(self, abort: bool = False) -> dict:
         if self._simlink_client:
@@ -1073,8 +1282,18 @@ class PersonalService:
                 self._last_persist = _time.monotonic()
                 self.flights._save_persisted()
         elif rec is not None:
+            # 收尾前把「到机位」的真实位置留一份样本（docs/12 S4：校验场景库编号）
+            try:
+                self.ops.record_stand_sample(rec.flight_id, status.get("lat"), status.get("lon"))
+            except Exception as exc:  # noqa: BLE001 - 采样失败不影响收尾
+                log.warning("机位样本写入失败：%s: %s", type(exc).__name__, exc)
             # SimLink 已停止（自动或外部），把已有数据收尾
             self.flights.stop(abort=False)
+        # docs/12：到达前提醒的触发（节流在 _stand_tick 内部）
+        try:
+            self._stand_tick(status)
+        except Exception as exc:  # noqa: BLE001 - 提醒失败绝不阻塞遥测
+            log.warning("到达提醒判定失败：%s: %s", type(exc).__name__, exc)
         return True
 
     async def start_polling(self) -> None:

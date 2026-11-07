@@ -51,6 +51,16 @@ export interface Settings {
   home_airport: string | null;
   callsign: string;
   aircraft_type: string;
+  /** docs/12：到达前预计停机位提醒。 */
+  stand_notice: boolean;
+  stand_lead_minutes: number;
+  stand_lead_nm: number;
+  stand_notice_channel: "both" | "inapp" | "system" | "acars";
+  stand_size_filter: boolean;
+  stand_show_overlay: boolean;
+  hoppie_enabled: boolean;
+  hoppie_from: string;
+  hoppie_callsign: string | null;
   [key: string]: unknown;
 }
 
@@ -104,6 +114,121 @@ export interface AirportRunway {
 
 export interface AirportDetail extends Airport {
   runways: AirportRunway[];
+  /** docs/12：停机位与航站楼（Little Navmap parking 表 / 手工覆盖）。 */
+  stand_source?: "scenery" | "navdata" | "override" | "none" | string;
+  stand_count?: number;
+  stands?: AirportStand[];
+  terminals?: AirportTerminal[];
+}
+
+/** 一个停机位（只展示编号：Q-4 不拼航站楼标签）。 */
+export interface AirportStand {
+  ident: string;
+  type?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  heading?: number | null;
+  radius_m?: number | null;
+  has_jetway?: boolean | null;
+  source?: string | null;
+}
+
+export type StandMatcher =
+  | { type: "number_range"; ranges: [number, number][] }
+  | { type: "area_prefix"; prefixes: string[] }
+  | { type: "radius"; lat: number; lon: number; r_m: number }
+  | { type: "explicit"; idents: string[] };
+
+/** 机场事实：航站楼 = 一片命名机位（docs/12 §4.5）。 */
+export interface AirportTerminal {
+  terminal: string;
+  matchers: StandMatcher[];
+  note?: string | null;
+  source?: string;
+  verified_at?: string | null;
+  updated_at?: string | null;
+  matched: number;
+  idents?: string[];
+}
+
+/** 承运人规则：这台航站楼给谁用（空 airlines = 任意承运人）。 */
+export interface TerminalRule {
+  id: string;
+  icao: string;
+  terminal: string;
+  scope: "DOMESTIC" | "INTERNATIONAL" | "BOTH";
+  airlines: string[];
+  priority: number;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** 预计停机位（一段航班一条，定稿后不再因 ETA 抖动重算）。 */
+export interface FlightStand {
+  flight_record_id: string;
+  airport_icao: string;
+  stand_ident: string | null;
+  stand_type?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  radius_m?: number | null;
+  has_jetway?: boolean | null;
+  source: "override" | "scenery" | "navdata" | "learned" | "none" | string;
+  terminal?: string | null;
+  terminal_source?: "rule" | "company_pref" | "none" | string;
+  status: "PROPOSED" | "NOTIFIED" | "CHANGED" | "CONFIRMED" | string;
+  score?: { candidates?: number; warnings?: string[]; scope?: string } & Record<string, unknown>;
+}
+
+/** 到达提醒（多消费者共用一条队列：前端 / Tauri / 便携启动器）。 */
+export interface StandNotice {
+  id: string;
+  seq: number;
+  kind: "STAND_ETA" | "STAND_CHANGED" | "ETA_ONLY" | string;
+  flight_record_id?: string | null;
+  airport_icao?: string | null;
+  title: string;
+  body: string;
+  payload?: {
+    arr_icao?: string;
+    stand?: string | null;
+    source?: string | null;
+    reason?: string | null;
+    reason_text?: string | null;
+    channel?: string;
+    acars?: { ok?: boolean; verdict?: string; error?: string | null };
+    packet?: string;
+    [key: string]: unknown;
+  };
+  created_at: string;
+  ack_by?: string | null;
+  ack_at?: string | null;
+}
+
+/** 收尾时记下的「实际到机位」样本（与场景库最近机位 ≤80 m 时回填编号）。 */
+export interface StandSample {
+  seq?: number;
+  airport_icao: string;
+  lat: number;
+  lon: number;
+  heading?: number | null;
+  stand_ident?: string | null;
+  flight_record_id?: string | null;
+  created_at: string;
+}
+
+/** 当前生效通道 + 原因码（§6.4：降级必须写明为什么）。 */
+export interface StandChannel {
+  arr_icao?: string | null;
+  channel: "acars" | "overlay" | "batc" | string;
+  acars: boolean;
+  overlay: boolean;
+  system: boolean;
+  logon_configured: boolean;
+  callsign?: string | null;
+  reason?: string | null;
+  reason_text?: string | null;
 }
 
 export interface Candidate {
@@ -753,6 +878,14 @@ export interface FlightStatus {
   /** 推出时仍偏低：只推一次（按 zfw_warning_seq 去重）。 */
   zfw_warnings: string[];
   zfw_warning_seq: number;
+  /** docs/12 §5.2：修正后的 ETA（三档分段）与置信度。 */
+  eta_refined_min: number | null;
+  eta_refined_utc: string | null;
+  eta_confidence: "high" | "medium" | "low" | null;
+  /** docs/12：预计停机位（定稿值）、当前生效通道、最近一条到达提醒。 */
+  stand: FlightStand | null;
+  stand_channel: StandChannel | null;
+  notice: StandNotice | null;
 }
 
 export interface OpsFreeFlight {

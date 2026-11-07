@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "AOC 主窗口基础权限",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "AOC 主窗口与到达提醒浮窗的权限",
+  "windows": ["main", "stand-overlay"],
+  "permissions": ["core:default", "notification:default"]
 }

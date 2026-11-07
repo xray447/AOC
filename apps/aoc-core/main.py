@@ -54,6 +54,7 @@ for pkg in (ROOT / "packages" / "aoc_protocol", ROOT / "packages" / "aoc_core",
 from aoc_core import __version__  # noqa: E402
 from aoc_core.lock import InstanceLocked, SingleInstance  # noqa: E402
 from aoc_core.ops import OpsError  # noqa: E402
+from aoc_core.ops import hoppie as hoppie_link  # noqa: E402
 from aoc_core.paths import AppPaths  # noqa: E402
 from aoc_core.service import PersonalService, PositionGateError  # noqa: E402
 from aoc_protocol.schemas import (  # noqa: E402
@@ -541,6 +542,98 @@ def create_app(config: CoreConfig) -> FastAPI:
     def navdata_runway_override_delete(icao: str, ident: str):
         return service.delete_runway_override(icao, ident)
 
+    # ---------------- docs/12：停机位 / 航站楼 / 到达提醒 ----------------
+    @app.get("/local/navdata/stand-overrides")
+    def navdata_stand_overrides():
+        """手工机位覆盖（场景库没扫到 / add-on 机场）。"""
+        return {"items": service.ops.stand_overrides()}
+
+    @app.put("/local/navdata/stand-overrides/{icao}/{ident}")
+    def navdata_stand_override_set(icao: str, ident: str, body: dict[str, Any]):
+        return service.set_stand_override(icao, ident, body or {})
+
+    @app.delete("/local/navdata/stand-overrides/{icao}/{ident}")
+    def navdata_stand_override_delete(icao: str, ident: str):
+        return service.delete_stand_override(icao, ident)
+
+    @app.get("/local/airports/{icao}/terminals")
+    def airport_terminals(icao: str):
+        """某机场的航站楼定义 + 承运人规则（地图框选/预览用）。"""
+        return {"terminals": service.ops.terminals(icao),
+                "rules": service.ops.terminal_rules(icao)}
+
+    @app.put("/local/airports/{icao}/terminals/{terminal}")
+    def airport_terminal_set(icao: str, terminal: str, body: dict[str, Any]):
+        return service.ops.set_terminal(icao, terminal, body or {})
+
+    @app.delete("/local/airports/{icao}/terminals/{terminal}")
+    def airport_terminal_delete(icao: str, terminal: str):
+        return service.ops.delete_terminal(icao, terminal)
+
+    @app.get("/local/terminal-rules")
+    def terminal_rules(icao: str | None = None):
+        return {"items": service.ops.terminal_rules(icao)}
+
+    @app.post("/local/terminal-rules")
+    def terminal_rule_add(body: dict[str, Any]):
+        return service.ops.set_terminal_rule(body or {})
+
+    @app.patch("/local/terminal-rules/{rule_id}")
+    def terminal_rule_update(rule_id: str, body: dict[str, Any]):
+        return service.ops.set_terminal_rule(body or {}, rule_id)
+
+    @app.delete("/local/terminal-rules/{rule_id}")
+    def terminal_rule_delete(rule_id: str):
+        return service.ops.delete_terminal_rule(rule_id)
+
+    @app.get("/local/stand/channel")
+    def stand_channel(arr: str | None = None):
+        """设置页的「当前生效通道 + 原因码」（§6.4）。"""
+        return service.stand_channel((arr or "").upper() or None)
+
+    @app.get("/local/hoppie/status")
+    def hoppie_status():
+        logon = service.ops.hoppie_logon()
+        return {
+            "configured": bool(logon),
+            "masked": hoppie_link.mask(logon),
+            "enabled": bool(service.settings.get("hoppie_enabled")),
+            "from": service.settings.get("hoppie_from") or "AOCDISP",
+            "callsign": service.settings.get("hoppie_callsign")
+            or (service.ops.active_task() or {}).get("callsign"),
+            "channel": service.stand_channel(None),
+        }
+
+    @app.post("/local/hoppie/logon")
+    def hoppie_set_logon(body: dict[str, Any]):
+        """保存 Hoppie logon code（DPAPI 加密后只存本机库，不回显明文）。"""
+        return service.ops.set_hoppie_logon((body or {}).get("logon"))
+
+    @app.post("/local/hoppie/test")
+    def hoppie_test(body: dict[str, Any] | None = None):
+        """发一条测试 telex（`SENT` 只代表已交网络，Hoppie 没有回执）。"""
+        payload = body or {}
+        callsign = str(payload.get("callsign") or service.stand_callsign() or "").strip().upper()
+        if not callsign:
+            raise HTTPException(status_code=422, detail={
+                "code": "VALIDATION", "message": "缺少呼号：请先填写 Hoppie 呼号或开始一个航班"})
+        packet = str(payload.get("packet") or "AOC TEST ACARS LINK").upper()[:200]
+        return service.ops.hoppie_send(
+            packet, from_=str(service.settings.get("hoppie_from") or "AOCDISP"),
+            to=callsign)
+
+    @app.get("/local/notifications")
+    def notifications(since: int | None = None, limit: int = 50,
+                      include_acked: bool = False):
+        """游标拉取（Tauri Rust / 便携启动器 / 前端共用一条队列，§6）。"""
+        items = service.ops.list_notices(since=since, limit=limit, include_acked=include_acked)
+        return {"items": items, "cursor": items[-1]["seq"] if items else (since or 0)}
+
+    @app.post("/local/notifications/{notice_id}/ack")
+    def notification_ack(notice_id: str, body: dict[str, Any] | None = None):
+        return service.ops.ack_notice(notice_id, str((body or {}).get("by") or "ui"))
+
+
     @app.get("/local/ops/dashboard")
     def ops_dashboard():
         return service.ops.dashboard()
@@ -754,6 +847,19 @@ def create_app(config: CoreConfig) -> FastAPI:
     async def ops_flight_status():
         """执行页实时状态：速度/高度/位置/ETE/ETA + 实际 ZFW（取 SimLink 最新采样）。"""
         return await service.ops_flight_status()
+
+    @app.get("/local/flights/{flight_id}/stand")
+    def flight_stand(flight_id: str):
+        """预计机位（定稿值）+ 实际到机位样本（复盘用，§7.2）。"""
+        return {"stand": service.ops.flight_stand(flight_id),
+                "sample": service.ops.stand_sample_for(flight_id)}
+
+    @app.post("/local/flights/{flight_id}/stand")
+    def flight_stand_set(flight_id: str, body: dict[str, Any] | None = None):
+        payload = body or {}
+        return {"stand": service.ops.set_flight_stand(
+            flight_id, str(payload.get("stand_ident") or ""),
+            force=bool(payload.get("force")))}
 
     @app.get("/local/ops/load-sheets/{flight_id}")
     def ops_load_sheet(flight_id: str):

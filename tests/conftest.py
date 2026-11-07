@@ -64,6 +64,11 @@ def build_navdata(path: Path) -> Path:
             minimum_altitude REAL, maximum_altitude REAL,
             from_lonx REAL, from_laty REAL, to_lonx REAL, to_laty REAL);
         CREATE TABLE metadata(airac TEXT, version TEXT, build TEXT, created TEXT, extra TEXT);
+        -- docs/12：停机位（Little Navmap parking 表的最小可用子集）
+        CREATE TABLE parking(
+            parking_id INTEGER PRIMARY KEY, airport_id INTEGER, type TEXT, pushback TEXT,
+            name TEXT, number INTEGER, suffix TEXT, airline_codes TEXT, radius REAL,
+            heading REAL, has_jetway INTEGER, lonx REAL, laty REAL);
         """
     )
     for i, (ident, lat, lon, elev, country, name) in enumerate(AIRPORTS, start=1):
@@ -74,6 +79,19 @@ def build_navdata(path: Path) -> Path:
         con.execute("insert into runway values(?,?,?,?,?,?)", (i, i, end_id, None, 12000, 1))
         con.execute("insert into runway_end values(?,?,?,?,?,?)",
                     (end_id, "18", 180.0, lat, lon, elev))
+        # docs/12 机位：1xx/2xx 中型带廊桥、5xx 重型带廊桥、6xx 中型远机位（无廊桥），
+        # 另外留一个 FUEL（必须被排除）和一个军用货位（RMC）
+        stands = [(n, "GM", 65.0, 1) for n in range(101, 106)]
+        stands += [(n, "GM", 65.0, 1) for n in range(201, 206)]
+        stands += [(n, "GH", 95.0, 1) for n in range(501, 506)]
+        stands += [(n, "GM", 65.0, 0) for n in range(601, 606)]
+        stands += [(1, "FUEL", 40.0, 0), (901, "RMC", 120.0, 0)]
+        for offset, (number, kind, radius, jetway) in enumerate(stands, start=1):
+            con.execute(
+                "insert into parking(parking_id, airport_id, type, name, number, suffix, radius, "
+                "heading, has_jetway, lonx, laty) values(?,?,?,?,?,?,?,?,?,?,?)",
+                (i * 1000 + offset, i, kind, "G", number, None, radius, 0.0, jetway,
+                 lon + offset * 0.0002, lat + offset * 0.0002))
     # ZBAA/ZSSS waypoints + 一条覆盖中国东部的高空航路
     con.execute("insert into waypoint values(1001,'ZBAA',40.0801,116.5846)")
     con.execute("insert into waypoint values(1002,'ZSSS',31.1979,121.3363)")

@@ -1,9 +1,9 @@
 # TODO
 
-> **当前状态（2026-11-06）**：`§1`–`§47` 全部实现，前端走查 `UI-01`–`UI-19` 与信息架构 `IA-01`–`IA-12` 的**客户端侧已全部处置**（§44 / §46 / §47）。
-> **文档分工**：「一、待办」只放未完成项，按 **需要测试 / 客户端 / 服务端** 三类；「二～八」是已完成功能项（§1–§47）；「九」是已收口的走查台账（`UI-xx` / `IA-xx` 逐条明细；其中管理端的 4 条只留指针，正文在 1.3.2）。
-> **剩余量**：测试 4 组（真机 / 干净环境 / 低配机 + 1 组本机冒烟）；客户端 1 条可选（D-10 降级）；服务端 1 条规则 + 管理端 8 条（`M-01`–`M-08`）。
-> 验证：`pytest` 186 项、`tsc --noEmit` + `npm run build` 全绿；`dotnet build` 最近一次通过为 2026-11-05（之后未改 C#）。
+> **当前状态（2026-11-07）**：`§1`–`§48` 全部实现，前端走查 `UI-01`–`UI-19` 与信息架构 `IA-01`–`IA-12` 的**客户端侧已全部处置**（§44 / §46 / §47）。
+> **文档分工**：「一、待办」只放未完成项，按 **需要测试 / 客户端 / 服务端** 三类；「二～八」「十」是已完成功能项（§1–§48）；「九」是已收口的走查台账（`UI-xx` / `IA-xx` 逐条明细；其中管理端的 4 条只留指针，正文在 1.3.2）。
+> **剩余量**：测试 4 组（真机 / 干净环境 / 低配机 + 1 组本机冒烟）+ 到达提醒的 4 条真机项（A-38/A-45/A-46/A-49）；客户端 1 条可选（D-10 降级）；服务端 1 条规则 + 管理端 8 条（`M-01`–`M-08`）。
+> 验证：`pytest` 205 项、`tsc --noEmit` + `npm run build` 全绿；`cargo check` 与 `dotnet build` 于 2026-11-07 通过（新增通知插件与托盘气泡）。
 >
 > 约定：`§编号` 与历史测试编号（`T-xx` / `A-xx`）沿用旧值、**不重排**（文档、提交记录和历史对话都在引用）；
 > 本轮新增的待办用 `C-`（客户端）/ `S-`（服务端规则）/ `M-`（管理端）前缀，测试项直接沿用原条目标题。
@@ -22,6 +22,7 @@
 | 七、已完成 · 2026-11-06（第一批） | §42–§45（§41 三项遗留 / 原 `1.4` 三项遗留 / `UI-01`–`UI-06` / `IA-01·02·04·07·09`） |
 | 八、已完成 · 2026-11-06（第二批） | §46–§47（`UI-01` 口径修订 + 客户端 `UI-07`–`UI-19` 收口 / `IA-03·05·10`；管理端只留文档） |
 | 九、已完成台账 | 走查清单 `UI-01`–`UI-19` / `IA-01`–`IA-12` 逐条明细（全部已处置，原「1.7 / 1.8」） |
+| 十、已完成 · 2026-11-07 | §48（预计停机位与到达提醒：读 `parking`、选位、航站楼规则、ETA 触发、通知队列、Hoppie 直投、浮窗/托盘气泡） |
 | 附录 A | 决策记录 D-1～D-11 |
 | 附录 B | 验证记录 V-1～V-6（含探针工具与最近一次回归） |
 
@@ -49,6 +50,11 @@
 
 #### 1.1.2 实机复测（需 MSFS 2024）
 
+- [ ] **§48 到达提醒（A-38 / A-45 / A-46 / A-49）**：
+  ① 窗口最小化到托盘、MSFS 全屏飞行，距到达 150 NM 时应收到系统通知（A-38）；
+  ② 未装 Hoppie、未开 BATC 时只弹浮窗 + 系统通知，抓包确认无外网请求（A-45）；
+  ③ 模拟器独占全屏时浮窗被盖住不报错、通知中心可回看（A-46）；
+  ④ 装了 Hoppie 的机型（A350 已通）机上 Mailbox 收到且客户端同时弹一次（A-49）。
 - [ ] **§33 幽灵机 / 瞬移**：
   ① 冷启动 MSFS → 连上 SimLink → 进飞行瞬移到基地 → 抽班「开始本段」→「开始记录」：应正常停在「记录中」，不再立刻「已完成」；
   ② 先抽班再进游戏：新记录首帧应落在真实机位（KBFI 幽灵帧被截断），`block_off_source=preroll`；
@@ -792,6 +798,41 @@
 
 > 五条口径（`IA-01/02/04/07/09`）见附录 A `D-11`，均已于 §45 落地。
 > **仍未拍板**：`IA-06` —— 管理端的「经济参数」与「结算策略」是否也合成一页 3 页签？（客户端已经是一页）→ 见 `1.3.2 M-07`。
+
+---
+
+## 十、已完成 · 2026-11-07（§48 预计停机位与到达提醒 P0–P2.5；§49 尺寸口径修正；§50 选位随机化）
+
+> 需求与口径见 [12-预计停机位与到达提醒.md](12-预计停机位与到达提醒.md)（Q-1～Q-11 已拍板）。本轮落地 **P0 / P0.5 / P1 / P2 / P2.5**；**P3（联机分配与冲突避让）按 Q-3 未做**。
+
+### 48. 停机位读取、选位、航站楼规则、到达提醒与投递通道
+
+- **落地（数据）**
+  - `aoc_navdata.NavData.stands(icao)`：读 `parking` 表（`pragma table_info` 探测列名，缺 `has_jetway/suffix/radius/number` 一律降级成 `None`，不报错），按机场懒加载 + 缓存；`auto`/`scenery` 先查场景库、缺失回落现实 navdata（与 `runways()` 同构）。`stand_ident = name+number+suffix`（`G340`）。
+  - 手工覆盖 `airport_stand_override`：`set_stand_overrides()` 注入 `NavData`，`source=override` 优先于两个数据源；`nearest_stand()` 用 80 m 半径匹配「实际到机位」。
+- **落地（选位，`aoc_core/ops/stands.py` 纯计算）**：用途池（客机 GS/GM/GH/GE、货机 RC/RMC、公务 RGA*/DGA）、`radius_m ≥ 翼展`（硬约束，`STAND_RADIUS_FACTOR` / MSFS 场景库乘 `MSFS_STAND_RADIUS_SCALE`，见 §49）、排除 `FUEL/UNKN/VEHICLE`、军用货位与 `is_military` 互斥；通过硬约束的候选**等概率随机**取一个（初版打分表已于 §50 删除）。
+- **落地（航站楼，§4.5）**：`airport_terminal`（机场事实：编号区间 / 区域字母 / 圆形圈选 / 指定机位四种 matcher，OR 叠加）+ `terminal_rule`（承运人规则：DOMESTIC/INTERNATIONAL/BOTH + 承运人集合 + 优先级）。国内/国际按起降机场 `country` 粗判；命中就用该航站楼的机位，**未命中则排除「已被别的承运人声明」的机位**，过滤为空回退全部 + `warnings[]`（不静默）。公司承运人代码在 `ops_profile.airline_codes`（多值），未填时取呼号前缀。
+- **落地（触发与落库，§5 / §7.1）**：`flight_stand`（PROPOSED/NOTIFIED/CHANGED/CONFIRMED，**定稿后不因 ETA 抖动重算**，只有「数据从无到有」或 `force` 才重算）、`stand_sample`（收尾写实际位置，命中则 `CONFIRMED`，不一致写 `STAND_MISMATCH` 审计）、`flight_notice`（`UNIQUE(flight_record_id, kind)` 幂等）。ETA 三档修正（>60 / 20–60 / <20 NM，另乘 1.0–1.3 绕行系数）+ `eta_confidence`；触发在 `poll_simlink_once()` 里（距到达 ≤ `stand_lead_nm` 或 ETA ≤ `stand_lead_minutes`，`DESCENT/APPROACH` 兜底），地面/地速 <50 kt 不触发。
+- **落地（投递，§6）**：一条队列多消费者 —— 前端（可见时 5 s）/ Tauri Rust（10 s + 系统通知 + 置顶浮窗）/ 便携启动器（10 s + 托盘气泡 `NIF_INFO`），`POST /local/notifications/{id}/ack` 记「谁弹过」，`rowid` 作游标。Hoppie telex 直投（`ops/hoppie.py`，仅标准库，≥2 s 限流、无 ACK、`SENT` 只代表已交网络）；`logon` 用 DPAPI 加密存 `ops_meta`，API 只回打码值。BeyondATC 在线（本机 41716 可连）即让位标注；原因码 `TYPE_UNSUPPORTED / HOPPIE_NOT_CONFIGURED / HOPPIE_OFFLINE / BATC_AUTHORITATIVE / NO_STAND_DATA` 进通知 payload 与执行页。
+- **落地（界面）**：执行页「到达信息」卡（只显示编号 + 廊桥/来源 + 修正 ETA + 通道原因 + 最近通知 + 手工指定/重算）；设置页「到达提醒」（阈值/通道/尺寸筛选/浮窗/Hoppie 配置/机型矩阵/当前生效通道）与「航站楼与承运人」（编号区间/区域/圆形/指定机位 + 承运人规则维护）；日志详情「停机位（计划 / 实际）」；`App.tsx` 应用内通知（5 s 游标拉取 + 点击跳执行页）。
+- **测试与工具**：`tests/test_stands.py`（22 项：读表与缺列降级、场景库优先、仅编号数据源、覆盖优先、用途/尺寸过滤、确定性、虹桥 T1 规则与虚构航司排他、规则过严回退、ETA 三档、通知幂等、定稿后不漂移、无机位不编造、样本确认/不一致审计、通道原因码、logon 往返、机位覆盖与通知队列 API）；`tests/conftest.py` 的 fixture 补 `parking` 表。另有 `tools/v7_stand_probe.py`（V-7 探针，结论见 [12](12-预计停机位与到达提醒.md) §14）与 `tools/smoke_stand.py`（用本机真实库跑一遍选位→通知→通道）。`pytest` 205 项、`tsc --noEmit` + `npm run build`、`cargo check`、`dotnet build` 全绿。
+- **背景**：`parking` 表一直没人读（§2 现状盘点），而「到机位」这件事在单机模式没有并发，本质是确定性选位；数据里没有航站楼字段（`airline_codes` 全表 0 填充、`apron` 0 行），只能用规则表重建。
+- **关联**：`docs/12` §3–§7；`docs/README.md` D-27 的「ACARS + 客户端双发」例外；`packages/aoc_navdata`、`packages/aoc_core/aoc_core/ops/{stands,hoppie}.py`、`apps/client/src/components/{StandCard,StandNoticeCard,TerminalRulesCard}.tsx`、`apps/client/src/pages/StandOverlay.tsx`、`apps/client/src-tauri/src/main.rs`、`tools/portable-launcher/Program.cs`。
+
+> **仍未做**：P3 联机分配/冲突避让（Q-3）、MSFS in-game panel（Q-10 明确不做）、Fenix `BEYONDATC` ATIS 端点（Q-11 关闭）。真机验证项见 12 §12 的 V-8 / V-9 / V-11（A-38/A-45/A-46/A-49 需在装有 MSFS 的机器上走查）。
+
+### 49. 机位尺寸口径修正（2026-11-07 同日）
+
+- **修正 MSFS 场景库半径单位**：LNM 扫 MSFS 得到的 `parking.radius` 不是米。实测 RJGG 18 号位真实 93 m 记 152、KSFO GG9 真实 66 m 记 108（比值 1.634 / 1.636 ≈ 1/0.6096），即「模拟器内部半径的英尺数」，而模拟器 radius ≈ 允许翼展的一半 → 新增 `NavData(stand_radius_scale=…)`，场景库按 `MSFS_STAND_RADIUS_SCALE = 0.3048 × 2 ≈ 0.6096` 折算（152→92.7、108→65.8，与实测吻合），现实 navdata 保持 1:1。此前 `STAND_RADIUS_FACTOR=1.0` 直接拿英尺当米比翼展，尺寸硬约束几乎失效（KSFO 上 59 的 `GS` 位对 A320 也被判「停得下」）；折算后 A20N 在 KSFO 只剩 99/101 个候选。
+- **测试**：`tests/test_stands.py` 的 `test_msfs_scenery_radius_is_converted`、`test_scenery_library_preferred`（断言改成按 0.6096 折算）。
+
+### 50. 选位改为「满足规则就随机」，联机占用校验只写文档（2026-11-07 同日）
+
+- **删掉整套打分**：`score_stand()` / `pick_stand()` / `stable_tiebreak()` 及 `JETWAY_PAX|CARGO`、`HISTORY_BONUS`、`SIZE_WEIGHT` 常量全删；`pick_for_flight()` 只剩「硬约束 → 廊桥池 → 航站楼 → 等概率随机」（`random.SystemRandom`）。`service.py` 里随之删掉 `_longest_runway()`、`_stand_history()`，`pick_stand(ctx)` 不再接 `flight_key`。尺寸的两次调整合并成一条：**尺寸只做 §4.1 硬约束**（原式是「半径越大扣得越少」，会把 A20N 推到 RJGG 152 m 的 GE 位）。
+- **落库/接口不变**：`score = null`、`score_json.breakdown = {"random": true, "candidates": N}`，`flight_stand` 表与前端 `FlightStand` 类型不动；定稿语义不变（随机只发生在首次落库与显式重算）。
+- **机位编号去掉 `G`/`P` 前缀**：LNM 的 `parking.name` 里单字母 `G`（廊桥位）/ `P`（停机坪）是全局类别识别符（全库 `P` 26.7 万、`G` 9.1 千行），不是编号本身 → `navdata._stand_row()` 新增 `GLOBAL_STAND_PREFIXES`，`G18`→`18`、`P532`→`532`、`G23V`→`23V`；`GA/GB/NP/…` 子区字母与现实库的完整 name（`P212R`）不动，撞号仍补 `#parking_id`。手工指定兼容旧写法：`set_flight_stand()` 走 `_find_stand()`，输入 `G340` 也能命中 `340`。前端手工输入提示改成 `532 / 212R`。
+- **联机（P3）只写文档**：占用键 `(airport_icao, stand_ident, time_window)`、服务端在未占用候选里随机、冲突重抽 + `ops_audit(STAND_REASSIGN)`、客户端不得自行定稿（对齐 IA-07）。见 [12](12-预计停机位与到达提醒.md) §4.4，本轮不实作。
+- **测试**：`test_pick_is_deterministic` 改成 `test_pick_is_random_within_rules`（40 次都落在候选内且不止一个结果）；新增 `test_size_only_filters_not_prefers`（GM/GH 都会出现）。`pytest` 208 项、`ruff` 全绿。
 
 ---
 

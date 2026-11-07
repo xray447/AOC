@@ -332,6 +332,65 @@ CREATE TABLE IF NOT EXISTS airport_runway_override (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (icao, ident)
 );
+-- docs/12 §7.1：预计/实际停机位（一段航班一条；改派留 before/after 到 ops_audit）
+CREATE TABLE IF NOT EXISTS flight_stand (
+    flight_record_id TEXT PRIMARY KEY,
+    airport_icao     TEXT NOT NULL,
+    stand_ident      TEXT,
+    stand_name TEXT, stand_number INTEGER, stand_suffix TEXT,
+    stand_type       TEXT,
+    lat REAL, lon REAL, heading REAL, radius_m REAL, has_jetway INTEGER,
+    source           TEXT NOT NULL,
+    terminal         TEXT,
+    terminal_source  TEXT,
+    score_json       TEXT,
+    status           TEXT NOT NULL DEFAULT 'PROPOSED',
+    eta_min_at_pick  REAL, remaining_nm_at_pick REAL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flight_stand_airport ON flight_stand(airport_icao);
+-- 到机位的真实样本（落地/收尾时写）：校验场景库编号 + 给无机位机场补候选
+CREATE TABLE IF NOT EXISTS stand_sample (
+    id TEXT PRIMARY KEY,
+    airport_icao TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+    heading REAL, stand_ident TEXT,
+    flight_record_id TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stand_sample_airport ON stand_sample(airport_icao);
+-- 手工机位覆盖（与 airport_runway_override 同模式）
+CREATE TABLE IF NOT EXISTS airport_stand_override (
+    icao TEXT NOT NULL, stand_ident TEXT NOT NULL,
+    lat REAL NOT NULL, lon REAL NOT NULL, heading REAL, radius_m REAL,
+    has_jetway INTEGER, stand_type TEXT, note TEXT, updated_at TEXT NOT NULL,
+    PRIMARY KEY (icao, stand_ident)
+);
+-- 通知收件箱（多消费者共用一条队列：前端 / Tauri Rust / 便携启动器）
+CREATE TABLE IF NOT EXISTS flight_notice (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+    flight_record_id TEXT, airport_icao TEXT,
+    title TEXT NOT NULL, body TEXT NOT NULL, payload_json TEXT,
+    created_at TEXT NOT NULL, ack_by TEXT, ack_at TEXT,
+    UNIQUE (flight_record_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_flight_notice_created ON flight_notice(created_at DESC);
+-- docs/12 §4.5：机场事实（T1 是「哪一片机位」）与承运人规则（T1 给谁用）分两张表
+CREATE TABLE IF NOT EXISTS airport_terminal (
+    icao TEXT NOT NULL, terminal TEXT NOT NULL,
+    matchers_json TEXT NOT NULL,
+    note TEXT, source TEXT NOT NULL DEFAULT 'USER',
+    verified_at TEXT, updated_at TEXT NOT NULL,
+    PRIMARY KEY (icao, terminal)
+);
+CREATE TABLE IF NOT EXISTS terminal_rule (
+    id TEXT PRIMARY KEY,
+    icao TEXT NOT NULL, terminal TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'BOTH',
+    airlines_json TEXT NOT NULL DEFAULT '[]',
+    priority INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_terminal_rule_icao ON terminal_rule(icao);
 """
 
 
@@ -343,6 +402,9 @@ def ensure_schema(db: Database) -> None:
         for name in ("flight_prefix",):
             if name not in existing:
                 con.execute(f"alter table ops_profile add column {name} TEXT")
+        # docs/12 §4.5：公司级承运人代码（多值，逗号分隔：9C,HBH,CXA）
+        if "airline_codes" not in existing:
+            con.execute("alter table ops_profile add column airline_codes TEXT")
         # 机型模板：老库补 source/builtin_key/title_keyword（内置模板统一标 BUILTIN）
         type_cols = {row["name"] for row in con.execute("pragma table_info(aircraft_type)")}
         for name, ddl in (("source", "TEXT NOT NULL DEFAULT 'BUILTIN'"),

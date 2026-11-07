@@ -85,6 +85,21 @@ class Settings(Model):
     home_airport: str | None = None
     callsign: str = "AOC001"
     aircraft_type: str = "A320"
+    # ---- docs/12 到达前预计停机位提醒 -------------------------------------
+    stand_notice: bool = True
+    # 「前 30 分钟」的两个阈值（先到者触发，Q-1）
+    stand_lead_minutes: int = Field(default=30, ge=10, le=60)
+    stand_lead_nm: int = Field(default=150, ge=60, le=300)
+    # 通道：both（ACARS + 客户端双发，Q-6）/ inapp / system / acars
+    stand_notice_channel: Literal["both", "inapp", "system", "acars"] = "both"
+    # 按翼展筛机位（现实 navdata 没有尺寸时自动跳过）
+    stand_size_filter: bool = True
+    # 置顶浮窗镜像（Q-10 ②）；关掉后只剩系统通知/应用内
+    stand_show_overlay: bool = True
+    # Hoppie telex 直投（P2.5）：公司签派站呼号 + 是否启用（logon 单独存 ops_meta）
+    hoppie_enabled: bool = False
+    hoppie_from: str = "AOCDISP"
+    hoppie_callsign: str | None = None
 
 
 # --------------------------------------------------------------------------

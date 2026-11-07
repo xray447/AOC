@@ -20,7 +20,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import {
-  Badge, Button, ConfigProvider, Layout, Menu, Space, Spin, Tag, Tooltip,
+  Badge, Button, ConfigProvider, Layout, Menu, Space, Spin, Tag, Tooltip, notification,
   theme as antdTheme, type MenuProps,
 } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -47,7 +47,9 @@ import { SettingsPage } from "./pages/Settings";
 import { loadOnline } from "./online";
 import { opsStateMeta } from "./ops";
 import { simlinkState } from "./simlink";
-import type { Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings } from "./types";
+import type {
+  Bootstrap, NavdataStatus, OpsStatus, RecordingStatus, Settings, StandNotice,
+} from "./types";
 import { fmtHms } from "./utils";
 
 const { Header, Sider, Content } = Layout;
@@ -217,6 +219,7 @@ export default function App() {
   const [showWizard, setShowWizard] = useState(false);
   /** UI-08：顶栏「刷新」自增，页面据此重取自己的数据（不再是「只在当前页有效」的两种行为）。 */
   const [refreshKey, setRefreshKey] = useState(0);
+  const navigate = useNavigate();
 
   const load = useCallback(async () => {
     const boot = await initApi();
@@ -277,6 +280,55 @@ export default function App() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [bootstrap]);
+
+  // docs/12 §6：到达提醒队列。前端只在页面可见时拉（隐藏时由 Tauri Rust / 便携启动器拉），
+  // 三者共用一条队列，ack 记录「谁弹过」，不会三处各弹一次。
+  useEffect(() => {
+    if (!bootstrap) return;
+    const NOTICE_MS = 5000;
+    let cursor = 0;
+    let stopped = false;
+    let timer = 0;
+    const tick = async () => {
+      if (!document.hidden) {
+        try {
+          const res = await api<{ items: StandNotice[]; cursor: number }>(
+            `/local/notifications?since=${cursor}`);
+          for (const notice of res.items) {
+            cursor = Math.max(cursor, notice.seq || 0);
+            notification.info({
+              key: notice.id,
+              message: notice.title,
+              description: (
+                <div>
+                  <div>{notice.body}</div>
+                  <a onClick={() => {
+                    notification.destroy(notice.id);
+                    navigate("/ops/execute");
+                  }}>
+                    查看执行页 / Open execution page
+                  </a>
+                </div>
+              ),
+              duration: 0,
+              placement: "topRight",
+            });
+            void api(`/local/notifications/${notice.id}/ack`, {
+              method: "POST", body: JSON.stringify({ by: "ui" }),
+            }).catch(() => undefined);
+          }
+        } catch {
+          /* core may be restarting */
+        }
+      }
+      if (!stopped) timer = window.setTimeout(() => void tick(), NOTICE_MS);
+    };
+    timer = window.setTimeout(() => void tick(), NOTICE_MS);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [bootstrap, navigate]);
 
   const refresh = useCallback(async () => {
     const [settingsRes, navRes, recRes, statusRes] = await Promise.all([

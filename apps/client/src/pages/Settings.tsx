@@ -18,6 +18,8 @@ import { AirportSelect } from "../components/AirportSelect";
 import { NavdataPanel } from "../components/NavdataPanel";
 import { RunwayOverrideCard } from "../components/RunwayOverrideCard";
 import { SimlinkPanel } from "../components/SimlinkPanel";
+import { StandNoticeCard } from "../components/StandNoticeCard";
+import { TerminalRulesCard } from "../components/TerminalRulesCard";
 import { VolantaImport } from "../components/VolantaImport";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
@@ -147,14 +149,14 @@ export function SettingsPage() {
               <div className="setting-row">
                 <div>
                   <div className="label">
-                    {tr("场景库跑道数据（游戏内）", "Scenery runway data (in-game)")}
+                    {tr("场景库数据（游戏内跑道 + 停机位）", "Scenery data (runways & stands)")}
                   </div>
                   <div className="hint">
                     {navdata.scenery_available
-                      ? tr(`游戏内跑道几何已启用：${navdata.scenery_path || ""}`,
-                        `In-game runway geometry enabled: ${navdata.scenery_path || ""}`)
-                      : tr("未找到 little_navmap_msfs24.sqlite：跑道几何回落现实 navdata",
-                        "little_navmap_msfs24.sqlite not found — runway geometry falls back to navdata")}
+                      ? tr(`游戏内数据已启用：${navdata.scenery_path || ""}`,
+                        `In-game data enabled: ${navdata.scenery_path || ""}`)
+                      : tr("未找到 little_navmap_msfs24.sqlite：跑道与机位回落现实 navdata（机位只有编号）",
+                        "little_navmap_msfs24.sqlite not found — runways and stands fall back to navdata (ident only)")}
                   </div>
                 </div>
                 <Tag color={navdata.scenery_available ? "green" : "default"}>
@@ -199,6 +201,14 @@ export function SettingsPage() {
         {/* §36 兜底 C（1.4）：场景库扫不到 / add-on 机场的手工跑道覆盖 */}
         <Col xs={24} lg={12}>
           <RunwayOverrideCard />
+        </Col>
+
+        {/* docs/12：到达前预计停机位提醒（阈值 / 通道 / Hoppie）与航站楼规则 */}
+        <Col xs={24} lg={12}>
+          <StandNoticeCard draft={draft} patch={patch} />
+        </Col>
+        <Col xs={24} lg={12}>
+          <TerminalRulesCard />
         </Col>
 
         <Col xs={24} lg={12}>

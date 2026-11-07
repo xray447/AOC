@@ -30,6 +30,24 @@ MILITARY_NAME_PATTERNS = (
 )
 # 跑道宽度 → 可接受的最大翼展（米）。45–60 m 是 4D/4E 冲突区，只能保守按 D（52 m）
 WINGSPAN_BY_WIDTH = ((45.0, 36), (60.0, 52), (float("inf"), 80))
+# 机位（docs/12 §4.1）：`radius_m` 的口径统一成「这个位能停多宽的翼展（米）」，
+# 判定用 `${radius_m} * STAND_RADIUS_FACTOR >= wingspan`。现实 navdata 的编号本身就是
+# 翼展口径，所以系数 1.0；MSFS 场景库要折算，见 MSFS_STAND_RADIUS_SCALE。
+# 若将来 V-7 探针发现口径变化，只改这两个常量，不要散落在各处。
+STAND_RADIUS_FACTOR = 1.0
+# Little Navmap 从 MSFS 场景库扫出的 `parking.radius` **不是米**：实测 RJGG 18 号位
+# （真实 93 m）= 152、KSFO GG9（真实 66 m）= 108，比值 152/93≈1.634、108/66≈1.636，
+# 与 1/0.6096≈1.640 一致（差异来自库值取整）。即：库值是「模拟器内部半径的英尺数」，
+# 而模拟器 radius ≈ 该位允许翼展的一半 —— 两个 0.5 叠起来正好是英尺→米的倒数一半：
+# 0.3048 m/ft × 2 = 0.6096。折算后 RJGG 18 = 92.7 m（≈93）、KSFO GG9 = 65.8 m（≈66）。
+MSFS_STAND_RADIUS_SCALE = 2.0 / FT_PER_M
+# Little Navmap 的 `parking.name` 里，单字母 'G'（廊桥位）与 'P'（停机坪/远机位）是
+# **全局类别识别符**（全库 'P' 26.7 万行、'G' 9.1 千行），不是机位编号的一部分 ——
+# 展示与比较都去掉它们（`G18` → `18`）；`GA/GB/NP/...` 这类子区字母、现实库里
+# 完整的 `P212R` 这类 name 都保持原样。
+GLOBAL_STAND_PREFIXES = ("G", "P")
+# 到机位的真实样本与场景库编号的匹配半径（米，docs/12 S4）
+STAND_SAMPLE_MATCH_M = 80.0
 
 
 class NavDataError(RuntimeError):
@@ -146,8 +164,10 @@ class CoverageIndex:
 
 class NavData:
     def __init__(self, path: str | Path, scenery_path: str | Path | None = None,
-                 runway_source: str = "auto"):
+                 runway_source: str = "auto", stand_radius_scale: float = 1.0):
         self.path = Path(path)
+        # 机位半径的单位折算（docs/12 §4.1）：现实库 1.0，MSFS 场景库 MSFS_STAND_RADIUS_SCALE
+        self._stand_radius_scale = float(stand_radius_scale or 1.0)
         # 跑道几何的第二数据源（§36 / D-7）：Little Navmap 从 MSFS 场景扫出的库
         # （little_navmap_msfs24.sqlite）。命中优先用游戏内数据，缺失回落现实 navdata。
         self.runway_source = (runway_source or "auto").lower()
@@ -172,6 +192,11 @@ class NavData:
         self._runway_count_cache: int | None = None
         # §36 兜底 C（1.4）：手工覆盖的跑道几何，由 aoc-core 从本地库注入
         self._runway_overrides: dict[str, dict[str, dict]] = {}
+        # docs/12：停机位（parking 表）按机场懒加载 + 缓存；手工覆盖同理
+        self._stands: dict[str, list[dict]] = {}
+        self._stand_sql: str | None = None
+        self._stand_sql_checked = False
+        self._stand_overrides: dict[str, dict[str, dict]] = {}
         # 覆盖生效前机场表里的原值（删除覆盖时还原）
         self._override_backup: dict[str, dict] = {}
         self._prime_runway_units()
@@ -190,7 +215,9 @@ class NavData:
             if candidate.exists() and candidate.resolve() != self.path.resolve():
                 self.scenery_path = candidate
                 try:
-                    self._scenery = NavData(candidate, None, "navdata")
+                    # 场景库的 parking.radius 是 MSFS 内部值（英尺半径），读出来先折算成翼展口径
+                    self._scenery = NavData(candidate, None, "navdata",
+                                            stand_radius_scale=MSFS_STAND_RADIUS_SCALE)
                 except NavDataError:
                     self._scenery = None
 
@@ -654,6 +681,158 @@ class NavData:
         """现实 navdata 的跑道几何（用于「游戏内 / 现实」对照展示）。"""
         return [{**r, "source": "navdata"} for r in self._load_runways_for((ident or "").upper())]
 
+    # -- 停机位（docs/12 §3 / §4）-----------------------------------------
+    def _stand_query(self) -> str | None:
+        """按机场取停机位的 SQL（列名随 Little Navmap 版本变化，只探测一次）。"""
+        if self._stand_sql_checked:
+            return self._stand_sql
+        self._stand_sql_checked = True
+        cols = self._columns("parking")
+        if not {"airport_id", "laty", "lonx"} <= cols:
+            return None
+
+        def col(name: str, *aliases: str) -> str:
+            for candidate in (name, *aliases):
+                if candidate in cols:
+                    return f"p.{candidate} as {name}"
+            return f"null as {name}"
+
+        self._stand_sql = (
+            "select "
+            + col("parking_id")
+            + ", " + (col("name", "parking_name")) + ", " + col("number", "parking_number")
+            + ", " + col("suffix") + ", " + col("type") + ", " + col("radius")
+            + ", " + col("heading") + ", " + col("has_jetway", "jetway")
+            + ", " + col("airline_codes") + ", p.laty as lat, p.lonx as lon "
+            "from parking p join airport a on a.airport_id = p.airport_id where a.ident = ?"
+        )
+        return self._stand_sql
+
+    def _stand_row(self, row) -> dict:
+        name = (row["name"] or "").strip().upper()
+        suffix = (row["suffix"] or "").strip().upper()
+        try:
+            number = int(row["number"])
+        except (TypeError, ValueError):
+            number = None
+        if number is not None and number < 0:
+            number = None
+        # 'G'/'P' 是 LNM 的全局类别标记（G=廊桥位、P=停机坪，全库 27 万行），不是编号本身
+        prefix = "" if (name in GLOBAL_STAND_PREFIXES and number is not None) else name
+        ident = f"{prefix}{number if number is not None else ''}{suffix}"
+        if not ident:
+            ident = f"#{row['parking_id']}" if row["parking_id"] is not None else (name or "STAND")
+        jetway = row["has_jetway"]
+        radius = row["radius"]
+        return {
+            "ident": ident, "name": name or None, "number": number, "suffix": suffix or None,
+            "type": (row["type"] or "").strip().upper() or None,
+            "lat": row["lat"], "lon": row["lon"], "heading": row["heading"],
+            "radius_m": (round(float(radius) * self._stand_radius_scale, 1)
+                         if isinstance(radius, (int, float)) else None),
+            "has_jetway": (bool(jetway) if jetway is not None else None),
+            "airline_codes": row["airline_codes"],
+            "parking_id": row["parking_id"],
+        }
+
+    def _load_stands_for(self, ident: str) -> list[dict]:
+        """单机场停机位（懒加载 + 缓存）。没有 parking 表 / 机场不存在时返回空列表。"""
+        key = (ident or "").strip().upper()
+        if not key:
+            return []
+        with self._lock:
+            cached = self._stands.get(key)
+            if cached is not None:
+                return cached
+            rows: list[dict] = []
+            sql = self._stand_query()
+            if sql:
+                try:
+                    fetched = self._con.execute(sql, (key,)).fetchall()
+                except sqlite3.Error:
+                    fetched = []
+                seen: set[str] = set()
+                for row in fetched:
+                    stand = self._stand_row(row)
+                    if stand["lat"] is None or stand["lon"] is None:
+                        continue
+                    # 现实 navdata 的 `number` 常为 -1，编号来自 `name`，重名时补 parking_id 保证唯一
+                    if stand["ident"] in seen:
+                        stand["ident"] = f"{stand['ident']}#{stand['parking_id']}"
+                    seen.add(stand["ident"])
+                    rows.append(stand)
+            self._stands[key] = rows
+            return rows
+
+    def stands(self, ident: str | None) -> list[dict]:
+        """机场停机位：`auto`/`scenery` 先查游戏场景库，缺失回落现实 navdata。
+
+        与 `runways()` 完全同构（docs/12 §3）；手工覆盖（`airport_stand_override`）优先，
+        覆盖项以 `source=override` 合并进结果。
+        """
+        key = (ident or "").strip().upper()
+        if not key:
+            return []
+        if self._scenery is not None and self.runway_source != "navdata":
+            rows = self._scenery.stands(key)
+            if rows:
+                return self._with_stand_overrides(
+                    key, [{**r, "source": "scenery"} for r in rows])
+        return self._with_stand_overrides(
+            key, [{**r, "source": "navdata"} for r in self._load_stands_for(key)])
+
+    def nearest_stand(self, ident: str | None, lat: float, lon: float,
+                      max_m: float = STAND_SAMPLE_MATCH_M) -> dict | None:
+        """最近的机位（docs/12 S4：落地/收尾时校验场景库编号）。"""
+        best = None
+        best_m = float(max_m)
+        for stand in self.stands(ident):
+            if stand["lat"] is None or stand["lon"] is None:
+                continue
+            meters = haversine_nm(lat, lon, stand["lat"], stand["lon"]) * 1852.0
+            if meters <= best_m:
+                best_m = meters
+                best = {**stand, "distance_m": round(meters, 1)}
+        return best
+
+    def set_stand_overrides(self, overrides: dict | None) -> None:
+        """手工机位覆盖（docs/12 S3）：`{ICAO: {IDENT: {lat, lon, heading, radius_m, ...}}}`。"""
+        cleaned: dict[str, dict[str, dict]] = {}
+        for icao, items in (overrides or {}).items():
+            key = str(icao or "").strip().upper()
+            if len(key) != 4 or not isinstance(items, dict):
+                continue
+            for ident, data in items.items():
+                name = str(ident or "").strip().upper()
+                if not name or not isinstance(data, dict):
+                    continue
+                if data.get("lat") is None or data.get("lon") is None:
+                    continue
+                cleaned.setdefault(key, {})[name] = dict(data)
+        self._stand_overrides = cleaned
+
+    def stand_overrides(self) -> dict[str, dict[str, dict]]:
+        return {icao: {ident: dict(data) for ident, data in items.items()}
+                for icao, items in self._stand_overrides.items()}
+
+    def _with_stand_overrides(self, key: str, rows: list[dict]) -> list[dict]:
+        overrides = self._stand_overrides.get(key)
+        if not overrides:
+            return rows
+        out: list[dict] = []
+        matched: set[str] = set()
+        for row in rows:
+            data = overrides.get(str(row.get("ident") or "").upper())
+            if data is None:
+                out.append(row)
+                continue
+            matched.add(str(row["ident"]).upper())
+            out.append(_merge_stand_override(row, data))
+        for ident, data in overrides.items():
+            if ident not in matched:
+                out.append(_merge_stand_override({"ident": ident}, data))
+        return out
+
     def search_airports(self, query: str, limit: int = 20) -> list[dict]:
         q = (query or "").strip().upper()
         if not q:
@@ -895,6 +1074,36 @@ class NavData:
                 count = 0
         self._runway_count_cache = count
         return count
+
+
+def _merge_stand_override(row: dict, data: dict) -> dict:
+    """把一条手工机位覆盖叠到场景库/现实库的机位上（覆盖优先，非法值忽略）。"""
+    merged = {**row, "source": "override"}
+    try:
+        merged["lat"] = float(data["lat"])
+        merged["lon"] = float(data["lon"])
+    except (KeyError, TypeError, ValueError):
+        return {**row}
+    try:
+        if data.get("heading") is not None:
+            merged["heading"] = float(data["heading"]) % 360.0
+        if data.get("radius_m") is not None:
+            merged["radius_m"] = round(float(data["radius_m"]), 1)
+        if data.get("has_jetway") is not None:
+            merged["has_jetway"] = bool(data["has_jetway"])
+        if data.get("stand_type"):
+            merged["type"] = str(data["stand_type"]).strip().upper()
+    except (TypeError, ValueError):
+        pass
+    merged.setdefault("ident", str(data.get("ident") or "").upper())
+    merged.setdefault("name", None)
+    merged.setdefault("number", None)
+    merged.setdefault("suffix", None)
+    merged.setdefault("type", None)
+    merged.setdefault("radius_m", None)
+    merged.setdefault("has_jetway", None)
+    merged.setdefault("note", data.get("note"))
+    return merged
 
 
 def reciprocal_name(name: str) -> str | None:

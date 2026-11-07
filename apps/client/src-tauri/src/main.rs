@@ -5,6 +5,7 @@
 
 use std::{
     fs::OpenOptions,
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -12,9 +13,11 @@ use std::{
     thread,
     time::Duration,
 };
+use serde_json::Value;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 
 /// 单实例锁：已有一个 AOC 在跑时第二个进程直接退出，避免起两套 sidecar。
 const INSTANCE_PORT: u16 = 47821;
@@ -153,6 +156,138 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// 极简本机 HTTP 客户端（docs/12 §6：Rust 侧轮询 `/local/notifications`）。
+///
+/// 只连 127.0.0.1、只发 GET/POST JSON，不引 reqwest —— 打包体积与编译时间都省下来。
+/// 请求用 HTTP/1.0，避免 uvicorn 回 chunked 响应还要自己解块。
+fn aoc_http(port: u16, token: &str, method: &str, path: &str, body: Option<&str>) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let payload = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nX-AOC-Token: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (_, response_body) = text.split_once("\r\n\r\n")?;
+    Some(response_body.to_string())
+}
+
+/// 置顶迷你浮窗（docs/12 §6.3.2 / Q-10 ②）：无边框 + 透明 + always_on_top，
+/// 页面用的是同一份前端 bundle 的 `?overlay=1` 视图。首次需要时才创建。
+fn ensure_overlay(app: &tauri::AppHandle, port: u16) -> Option<tauri::WebviewWindow> {
+    if let Some(window) = app.get_webview_window("stand-overlay") {
+        return Some(window);
+    }
+    let url: tauri::Url = format!("http://127.0.0.1:{port}/?overlay=1").parse().ok()?;
+    tauri::WebviewWindowBuilder::new(app, "stand-overlay", tauri::WebviewUrl::External(url))
+        .title("AOC 到达提醒")
+        .inner_size(340.0, 176.0)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .visible(false)
+        .shadow(false)
+        .build()
+        .ok()
+}
+
+fn show_overlay(app: &tauri::AppHandle, port: u16) {
+    let handle = app.clone();
+    // 窗口创建要走主线程；创建后 3 分钟自动收起（机位看一眼就够）
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = ensure_overlay(&handle, port) {
+            let _ = window.show();
+            let hide = window.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(180));
+                let _ = hide.hide();
+            });
+        }
+    });
+}
+
+/// 到达提醒的常驻消费者：系统通知 + 置顶浮窗，ack 之后前端不会重复弹。
+fn spawn_notice_watcher(app: tauri::AppHandle, port: u16, token: String) {
+    thread::spawn(move || {
+        let mut cursor: u64 = 0;
+        let mut notice_on = true;
+        let mut overlay_on = true;
+        let mut tick: u32 = 0;
+        loop {
+            thread::sleep(Duration::from_secs(10));
+            if tick % 6 == 0 {
+                if let Some(text) = aoc_http(port, &token, "GET", "/local/settings", None) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        if let Some(settings) = value.get("settings") {
+                            notice_on = settings
+                                .get("stand_notice")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            overlay_on = settings
+                                .get("stand_show_overlay")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                        }
+                    }
+                }
+            }
+            tick = tick.wrapping_add(1);
+            if !notice_on {
+                continue;
+            }
+            let path = format!("/local/notifications?since={cursor}");
+            let Some(text) = aoc_http(port, &token, "GET", &path, None) else {
+                continue; // core 还没起好 / 正在重启
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let items = value
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in items {
+                if let Some(seq) = item.get("seq").and_then(Value::as_u64) {
+                    cursor = cursor.max(seq);
+                }
+                let title = item
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("AOC 到达提醒");
+                let body = item
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let _ = app.notification().builder().title(title).body(body).show();
+                if overlay_on {
+                    show_overlay(&app, port);
+                }
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    let ack = aoc_http(
+                        port,
+                        &token,
+                        "POST",
+                        &format!("/local/notifications/{id}/ack"),
+                        Some("{\"by\":\"tauri\"}"),
+                    );
+                    if ack.is_none() {
+                        eprintln!("通知 ack 失败: {id}");
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     // 单实例：端口被占用说明已有实例在跑，直接退出（不重复起 aoc-core / aoc-simlink）
     let _instance = match TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
@@ -164,6 +299,8 @@ fn main() {
     };
 
     tauri::Builder::default()
+        // docs/12：Windows 系统通知（关掉主窗口/全屏飞行时仍能弹出）
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let home = home_dir();
             std::fs::create_dir_all(&home).ok();
@@ -232,6 +369,8 @@ fn main() {
             let window = app.get_webview_window("main").unwrap();
             let url = format!("http://127.0.0.1:{port}/");
             let win = window.clone();
+            let watch_app = app.handle().clone();
+            let watch_token = token.clone();
             thread::spawn(move || {
                 for _ in 0..150 {
                     if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -243,6 +382,8 @@ fn main() {
                     let _ = win.navigate(parsed);
                 }
                 let _ = win.show();
+                // docs/12 §6：到达提醒的常驻消费者（页面隐藏时也照常弹）
+                spawn_notice_watcher(watch_app, port, watch_token);
             });
             Ok(())
         })

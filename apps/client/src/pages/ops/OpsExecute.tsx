@@ -10,6 +10,7 @@ import { api } from "../../api";
 import { SettlementSummary } from "../../components/SettlementSummary";
 import { SimBriefButton } from "../../components/SimBriefButton";
 import { SimlinkNotice } from "../../components/SimlinkNotice";
+import { StandCard } from "../../components/StandCard";
 import { useApp } from "../../context";
 import { useI18n } from "../../i18n";
 import { fmtBlock, fmtUtc, legStatus, money } from "../../ops";
@@ -416,6 +417,12 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
                 {" · "}
                 {flightStatus?.eta_utc ? fmtUtc(flightStatus.eta_utc) : "—"}
               </Descriptions.Item>
+              {/* docs/12 §5.2：三档修正后的 ETA（下降段按 250/180 kt 折算） */}
+              <Descriptions.Item label={tr("修正 ETA", "Refined ETA")}>
+                {flightStatus?.eta_refined_min != null
+                  ? `${num(flightStatus.eta_refined_min)} min · ${fmtUtc(flightStatus.eta_refined_utc)}`
+                  : "—"}
+              </Descriptions.Item>
             </Descriptions>
             {flightStatus && !flightStatus.available ? (
               <Text type="secondary">{tr("没有 SimLink 采样（检查 SimLink 是否在线）",
@@ -463,6 +470,11 @@ export function OpsExecute({ embedded = false }: { embedded?: boolean }) {
               </Descriptions.Item>
             </Descriptions>
           </Card>
+
+          <div style={{ marginTop: 16 }}>
+            <StandCard status={flightStatus} arrIcao={task.arr_icao}
+              onChanged={() => { void loadAll(); }} />
+          </div>
 
           {load ? (
             <Row gutter={16} style={{ marginTop: 16 }}>

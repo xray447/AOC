@@ -22,6 +22,8 @@ from aoc_navdata import NavData
 from ..aircraft import AircraftCatalog
 from ..db import Database, new_id, utcnow
 from . import economy as eco
+from . import hoppie
+from . import stands as stand_rules
 from .policy import SEVERITY, cost_item_allowed, detect_anomalies, evaluate, resolve_policy
 from .schema import ensure_schema
 from .specs import (
@@ -105,6 +107,37 @@ def _json_load(value: Any, default: Any) -> Any:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _airline_codes(value: Any) -> list[str]:
+    """承运人代码（多值）：`"9C, HBH,CXA"` / `["9C","HBH"]` → `["9C","HBH","CXA"]`。"""
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = re.split(r"[,;/\s]+", str(value or ""))
+    out: list[str] = []
+    for item in items:
+        code = re.sub(r"[^A-Za-z0-9]", "", str(item or "")).upper()[:4]
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def _callsign_carrier(callsign: str | None) -> str | None:
+    """呼号里的承运人前缀（AOC101 → AOC）；没有字母前缀时返回 None。"""
+    match = re.match(r"^([A-Za-z]{2,4})\d", str(callsign or "").strip())
+    return match.group(1).upper() if match else None
+
+
+def _find_stand(stands: list[dict[str, Any]], wanted: str) -> dict[str, Any] | None:
+    """按编号找机位；`G340`/`P532` 这种旧写法也认（编号里已不显示全局前缀）。"""
+    key = stand_rules.strip_global_prefix(wanted)
+    if not key:
+        return None
+    for stand in stands:
+        if stand_rules.strip_global_prefix(stand.get("ident")) == key:
+            return stand
+    return None
 
 
 def _clean_prefix(value: Any) -> str:
@@ -481,13 +514,16 @@ class OpsService:
             return None
         row["flight_prefix"] = (row.get("flight_prefix") or "").strip().upper() or "AOC"
         row["callsign_prefix"] = (row.get("callsign_prefix") or "").strip().upper() or "AUV"
+        row["airline_codes"] = _airline_codes(row.get("airline_codes"))
         row["no_show_count"] = int(self._meta_get(NO_SHOW_KEY, 0) or 0)
         return row
 
     def update_profile(self, patch: dict[str, Any]) -> dict[str, Any]:
         allowed = {k: v for k, v in (patch or {}).items()
                    if k in ("name", "icao_code", "callsign_prefix", "flight_prefix",
-                            "base_airport_icao", "currency")}
+                            "base_airport_icao", "currency", "airline_codes")}
+        if "airline_codes" in allowed:
+            allowed["airline_codes"] = ",".join(_airline_codes(allowed["airline_codes"])) or None
         for key in ("callsign_prefix", "flight_prefix"):
             if key in allowed:
                 cleaned = _clean_prefix(allowed[key])
@@ -1053,6 +1089,674 @@ class OpsService:
                 self._audit(con, "RUNWAY_OVERRIDE_DELETE", "airport_runway", f"{code}/{name}",
                             dict(before), None)
         return {"ok": True, "deleted": bool(before), "overrides": self.runway_overrides()}
+
+    # ------------------------------------------------------ 停机位覆盖（docs/12 S3）
+    @staticmethod
+    def _stand_key(icao: Any, ident: Any) -> tuple[str, str]:
+        code = str(icao or "").strip().upper()
+        name = str(ident or "").strip().upper()
+        if len(code) != 4 or not re.fullmatch(r"[A-Z0-9]{4}", code):
+            raise OpsError("VALIDATION", "机场必须是 4 字码", {"key": "icao"})
+        if not name:
+            raise OpsError("VALIDATION", "机位号不能为空", {"key": "stand_ident"})
+        return code, name
+
+    def stand_overrides(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """`{icao: {ident: {lat, lon, heading, radius_m, has_jetway, stand_type}}}`。"""
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in self._rows("select * from airport_stand_override order by icao, stand_ident"):
+            icao = (row["icao"] or "").upper()
+            out.setdefault(icao, {})[(row["stand_ident"] or "").upper()] = {
+                "lat": row.get("lat"), "lon": row.get("lon"), "heading": row.get("heading"),
+                "radius_m": row.get("radius_m"),
+                "has_jetway": None if row.get("has_jetway") is None else bool(row["has_jetway"]),
+                "stand_type": row.get("stand_type"), "note": row.get("note"),
+                "updated_at": row.get("updated_at"),
+            }
+        return out
+
+    def set_stand_override(self, icao: Any, ident: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """写入/更新一条手工机位；经纬度必填（其余可空），非法值直接拒绝。"""
+        code, name = self._stand_key(icao, ident)
+
+        def number(key: str, low: float, high: float, required: bool = False) -> float | None:
+            value = (data or {}).get(key)
+            if value in (None, ""):
+                if required:
+                    raise OpsError("VALIDATION", f"{key} 必填", {"key": key})
+                return None
+            try:
+                num = float(value)
+            except (TypeError, ValueError) as exc:
+                raise OpsError("PARAM_OUT_OF_RANGE", f"{key} 必须是数字", {"key": key}) from exc
+            if not (low <= num <= high):
+                raise OpsError("PARAM_OUT_OF_RANGE", f"{key} 需在 {low}–{high} 之间", {"key": key})
+            return num
+
+        values = {
+            "lat": number("lat", -90, 90, required=True),
+            "lon": number("lon", -180, 180, required=True),
+            "heading": number("heading", 0, 360),
+            "radius_m": number("radius_m", 10, 300),
+            "stand_type": (str((data or {}).get("stand_type") or "").strip().upper() or None),
+            "note": ((data or {}).get("note") or None),
+        }
+        jetway = (data or {}).get("has_jetway")
+        values["has_jetway"] = None if jetway in (None, "") else int(bool(jetway))
+        stamp = utcnow()
+        with self._tx() as con:
+            before = con.execute("select * from airport_stand_override where icao=? and stand_ident=?",
+                                 (code, name)).fetchone()
+            con.execute(
+                "insert or replace into airport_stand_override(icao, stand_ident, lat, lon, heading, "
+                "radius_m, has_jetway, stand_type, note, updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+                (code, name, values["lat"], values["lon"], values["heading"], values["radius_m"],
+                 values["has_jetway"], values["stand_type"], values["note"], stamp))
+            self._audit(con, "STAND_OVERRIDE_SET", "airport_stand", f"{code}/{name}",
+                        dict(before) if before else None, {**values, "updated_at": stamp})
+        return {"ok": True, "overrides": self.stand_overrides()}
+
+    def delete_stand_override(self, icao: Any, ident: Any) -> dict[str, Any]:
+        code, name = self._stand_key(icao, ident)
+        with self._tx() as con:
+            before = con.execute("select * from airport_stand_override where icao=? and stand_ident=?",
+                                 (code, name)).fetchone()
+            con.execute("delete from airport_stand_override where icao=? and stand_ident=?", (code, name))
+            if before:
+                self._audit(con, "STAND_OVERRIDE_DELETE", "airport_stand", f"{code}/{name}",
+                            dict(before), None)
+        return {"ok": True, "deleted": bool(before), "overrides": self.stand_overrides()}
+
+    # ------------------------------------------------ 航站楼与承运人（docs/12 §4.5）
+    @staticmethod
+    def _icao_key(icao: Any) -> str:
+        code = str(icao or "").strip().upper()
+        if len(code) != 4 or not re.fullmatch(r"[A-Z0-9]{4}", code):
+            raise OpsError("VALIDATION", "机场必须是 4 字码", {"key": "icao"})
+        return code
+
+    @staticmethod
+    def _terminal_name(value: Any) -> str:
+        name = str(value or "").strip().upper()
+        if not name or len(name) > 12 or not re.fullmatch(r"[A-Z0-9-]+", name):
+            raise OpsError("VALIDATION", "航站楼名不能为空（字母/数字/-，≤12 位）",
+                           {"key": "terminal"})
+        return name
+
+    @staticmethod
+    def _matchers(value: Any) -> list[dict[str, Any]]:
+        items = value
+        if isinstance(items, str):
+            items = _json_load(items, [])
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list) or not items:
+            raise OpsError("VALIDATION", "至少要有一个机位筛选条件", {"key": "matchers"})
+        cleaned: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "").strip().lower()
+            if kind not in stand_rules.MATCHER_TYPES:
+                raise OpsError("VALIDATION", f"不支持的筛选方式：{kind or '空'}", {"key": "matchers"})
+            if kind == "number_range":
+                ranges = []
+                for pair in item.get("ranges") or []:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    try:
+                        low, high = sorted((int(pair[0]), int(pair[1])))
+                    except (TypeError, ValueError) as exc:
+                        raise OpsError("VALIDATION", "编号区间必须是整数", {"key": "matchers"}) from exc
+                    ranges.append([low, high])
+                if not ranges:
+                    raise OpsError("VALIDATION", "编号区间不能为空", {"key": "matchers"})
+                cleaned.append({"type": kind, "ranges": ranges})
+            elif kind == "area_prefix":
+                prefixes = [str(p).strip().upper() for p in (item.get("prefixes") or []) if str(p).strip()]
+                if not prefixes:
+                    raise OpsError("VALIDATION", "区域字母不能为空", {"key": "matchers"})
+                cleaned.append({"type": kind, "prefixes": prefixes})
+            elif kind == "radius":
+                try:
+                    lat, lon = float(item["lat"]), float(item["lon"])
+                    r_m = float(item["r_m"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise OpsError("VALIDATION", "圈选需要圆心与半径（米）",
+                                   {"key": "matchers"}) from exc
+                cleaned.append({"type": kind, "lat": lat, "lon": lon, "r_m": r_m})
+            else:
+                idents = [str(i).strip().upper() for i in (item.get("idents") or []) if str(i).strip()]
+                if not idents:
+                    raise OpsError("VALIDATION", "指定机位不能为空", {"key": "matchers"})
+                cleaned.append({"type": kind, "idents": idents})
+        if not cleaned:
+            raise OpsError("VALIDATION", "至少要有一个有效的机位筛选条件", {"key": "matchers"})
+        return cleaned
+
+    def terminals(self, icao: Any) -> list[dict[str, Any]]:
+        """机场已声明的航站楼及命中的机位数（供地图框选/预览）。"""
+        code = self._icao_key(icao)
+        stands = self.nav.stands(code) if self.nav is not None else []
+        out: list[dict[str, Any]] = []
+        for row in self._rows("select * from airport_terminal where icao=? order by terminal", (code,)):
+            matchers = _json_load(row.get("matchers_json"), [])
+            matched = stand_rules.terminal_match(stands, matchers)
+            out.append({
+                "terminal": row["terminal"], "matchers": matchers, "note": row.get("note"),
+                "source": row.get("source") or "USER", "verified_at": row.get("verified_at"),
+                "updated_at": row.get("updated_at"),
+                "matched": len(matched), "idents": [s["ident"] for s in matched][:60],
+                "custom": bool(stands) and all(s.get("source") == "override" for s in matched),
+            })
+        return out
+
+    def set_terminal(self, icao: Any, terminal: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """保存「某航站楼是哪一片机位」；命中 0 个直接拒绝（避免保存一条死规则）。"""
+        code = self._icao_key(icao)
+        name = self._terminal_name(terminal)
+        matchers = self._matchers((data or {}).get("matchers"))
+        stands = self.nav.stands(code) if self.nav is not None else []
+        matched = stand_rules.terminal_match(stands, matchers)
+        if stands and not matched:
+            raise OpsError("VALIDATION", "这组条件没有命中任何机位，请调整后再保存",
+                           {"key": "matchers"})
+        stamp = utcnow()
+        verified = (data or {}).get("verified_at") or stamp
+        payload = json.dumps(matchers, ensure_ascii=False)
+        with self._tx() as con:
+            before = con.execute("select * from airport_terminal where icao=? and terminal=?",
+                                 (code, name)).fetchone()
+            con.execute(
+                "insert or replace into airport_terminal(icao, terminal, matchers_json, note, source, "
+                "verified_at, updated_at) values(?,?,?,?,?,?,?)",
+                (code, name, payload, (data or {}).get("note"),
+                 str((data or {}).get("source") or "USER").upper(), verified, stamp))
+            self._audit(con, "TERMINAL_SET", "airport_terminal", f"{code}/{name}",
+                        dict(before) if before else None,
+                        {"matchers": matchers, "matched": len(matched), "updated_at": stamp})
+        return {"ok": True, "matched": len(matched), "terminals": self.terminals(code)}
+
+    def delete_terminal(self, icao: Any, terminal: Any) -> dict[str, Any]:
+        code = self._icao_key(icao)
+        name = self._terminal_name(terminal)
+        with self._tx() as con:
+            before = con.execute("select * from airport_terminal where icao=? and terminal=?",
+                                 (code, name)).fetchone()
+            con.execute("delete from airport_terminal where icao=? and terminal=?", (code, name))
+            # 机位定义删了，指向它的承运人规则也一起清（否则会留下无效规则）
+            rules = con.execute("select * from terminal_rule where icao=? and terminal=?",
+                                (code, name)).fetchall()
+            con.execute("delete from terminal_rule where icao=? and terminal=?", (code, name))
+            if before:
+                self._audit(con, "TERMINAL_DELETE", "airport_terminal", f"{code}/{name}",
+                            dict(before), {"rules_removed": len(rules)})
+        return {"ok": True, "deleted": bool(before), "terminals": self.terminals(code)}
+
+    @staticmethod
+    def _rule_payload(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["id"], "icao": row["icao"], "terminal": row["terminal"],
+            "scope": row.get("scope") or "BOTH",
+            "airlines": _airline_codes(_json_load(row.get("airlines_json"), [])),
+            "priority": int(row.get("priority") or 0),
+            "enabled": bool(row.get("enabled", 1)),
+            "created_at": row.get("created_at"), "updated_at": row.get("updated_at"),
+        }
+
+    def terminal_rules(self, icao: Any | None = None) -> list[dict[str, Any]]:
+        sql = "select * from terminal_rule"
+        args: tuple[Any, ...] = ()
+        if icao:
+            sql += " where icao=?"
+            args = (str(icao).strip().upper(),)
+        sql += " order by icao, priority desc, created_at"
+        return [self._rule_payload(row) for row in self._rows(sql, args)]
+
+    def set_terminal_rule(self, data: dict[str, Any], rule_id: str | None = None) -> dict[str, Any]:
+        """新增/更新一条「哪台航站楼给谁用」；空 airlines = 任意承运人。"""
+        code = self._icao_key((data or {}).get("icao"))
+        terminal = self._terminal_name((data or {}).get("terminal"))
+        exists = self._one("select 1 as ok from airport_terminal where icao=? and terminal=?",
+                           (code, terminal))
+        if not exists:
+            raise OpsError("VALIDATION", "请先定义该航站楼包含哪些机位", {"key": "terminal"})
+        scope = str((data or {}).get("scope") or "BOTH").strip().upper()
+        if scope not in stand_rules.SCOPES:
+            raise OpsError("VALIDATION", "scope 只能是 DOMESTIC / INTERNATIONAL / BOTH",
+                           {"key": "scope"})
+        airlines = _airline_codes((data or {}).get("airlines"))
+        stamp = utcnow()
+        with self._tx() as con:
+            before = con.execute("select * from terminal_rule where id=?",
+                                 (rule_id,)).fetchone() if rule_id else None
+            new_id_ = rule_id or new_id()
+            if before:
+                con.execute(
+                    "update terminal_rule set icao=?, terminal=?, scope=?, airlines_json=?, "
+                    "priority=?, enabled=?, updated_at=? where id=?",
+                    (code, terminal, scope, json.dumps(airlines, ensure_ascii=False),
+                     int((data or {}).get("priority") or 0),
+                     1 if (data or {}).get("enabled", True) else 0, stamp, new_id_))
+            else:
+                con.execute(
+                    "insert into terminal_rule(id, icao, terminal, scope, airlines_json, priority, "
+                    "enabled, created_at, updated_at) values(?,?,?,?,?,?,?,?,?)",
+                    (new_id_, code, terminal, scope, json.dumps(airlines, ensure_ascii=False),
+                     int((data or {}).get("priority") or 0),
+                     1 if (data or {}).get("enabled", True) else 0, stamp, stamp))
+            self._audit(con, "TERMINAL_RULE_SET", "terminal_rule", new_id_,
+                        dict(before) if before else None,
+                        {"icao": code, "terminal": terminal, "scope": scope, "airlines": airlines})
+        return {"ok": True, "rules": self.terminal_rules(code)}
+
+    def delete_terminal_rule(self, rule_id: str) -> dict[str, Any]:
+        row = self._one("select * from terminal_rule where id=?", (rule_id,))
+        if not row:
+            raise OpsError("NOT_FOUND", "规则不存在")
+        with self._tx() as con:
+            con.execute("delete from terminal_rule where id=?", (rule_id,))
+            self._audit(con, "TERMINAL_RULE_DELETE", "terminal_rule", rule_id, dict(row), None)
+        return {"ok": True, "rules": self.terminal_rules(row["icao"])}
+
+    def terminal_context(self, icao: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        rows = self._rows("select * from airport_terminal where icao=? order by terminal", (icao,))
+        terminals = [{**row, "matchers": _json_load(row.get("matchers_json"), [])} for row in rows]
+        return terminals, self.terminal_rules(icao)
+
+    # ------------------------------------------------------------ 选位（§4）
+    def _arrival_airport(self, icao: str | None) -> dict[str, Any] | None:
+        return self.nav.airport(icao) if (self.nav is not None and icao) else None
+
+    def _stand_context(self, flight_record_id: str) -> dict[str, Any]:
+        flight = self._one("select * from flight_record where id=?", (flight_record_id,)) or {}
+        task = self.active_task() or {}
+        if task.get("flight_record_id") != flight_record_id:
+            task = {}
+        dep = str(task.get("dep_icao") or flight.get("dep_icao") or "").upper()
+        arr = str(task.get("arr_icao") or flight.get("arr_icao") or "").upper()
+        callsign = task.get("callsign") or flight.get("callsign")
+        sheet = self.load_sheet(flight_record_id) or {}
+        type_row = self.get_type(sheet.get("aircraft_type_id")) if sheet.get("aircraft_type_id") else None
+        if not type_row:
+            wanted = str(task.get("aircraft_type") or flight.get("aircraft_type") or "").upper()
+            type_row = next((t for t in self.list_types()
+                             if str(t.get("icao") or "").upper() == wanted), None)
+        aircraft = sheet.get("aircraft") or (self.get_aircraft(task["aircraft_id"])
+                                            if task.get("aircraft_id") else {}) or {}
+        scheduled_arr = None
+        if task.get("roster_leg_id"):
+            leg = self._one("select planned_arr_utc from roster_leg where id=?",
+                            (task["roster_leg_id"],)) or {}
+            scheduled_arr = leg.get("planned_arr_utc")
+        if not scheduled_arr and task.get("flight_instance_id"):
+            instance = self._one("select scheduled_arr_utc from flight_instance where id=?",
+                                 (task["flight_instance_id"],)) or {}
+            scheduled_arr = instance.get("scheduled_arr_utc")
+        return {
+            "flight_record_id": flight_record_id, "dep_icao": dep, "arr_icao": arr,
+            "callsign": callsign, "registration": aircraft.get("registration"),
+            "aircraft_id": aircraft.get("id") or task.get("aircraft_id"),
+            "type": type_row or {}, "scheduled_arr_utc": scheduled_arr,
+            "route_id": None,
+        }
+
+    def _stand_scope(self, dep: str | None, arr: str | None) -> str:
+        """国内/国际：起降机场国家不同即国际（§4.5 第 1 条，允许规则里显式覆盖）。"""
+        dep_info, arr_info = self._arrival_airport(dep), self._arrival_airport(arr)
+        if not dep_info or not arr_info:
+            return "DOMESTIC"
+        dep_country = str(dep_info.get("country") or "").strip().upper()
+        arr_country = str(arr_info.get("country") or "").strip().upper()
+        if dep_country and arr_country and dep_country != arr_country:
+            return "INTERNATIONAL"
+        return "DOMESTIC"
+
+    def _carriers(self, callsign: str | None) -> list[str]:
+        profile = self.profile() or {}
+        codes = list(profile.get("airline_codes") or [])
+        prefix = _callsign_carrier(callsign)
+        if prefix and prefix not in codes:
+            codes.append(prefix)
+        return codes
+
+    def pick_stand(self, ctx: dict[str, Any], *, size_filter: bool = True) -> dict[str, Any]:
+        """按 §4 挑一个机位（不落库，满足硬约束后随机）。无机位数据时 `stand=None, source="none"`。"""
+        arr = ctx.get("arr_icao") or ""
+        stands = self.nav.stands(arr) if (self.nav is not None and arr) else []
+        result: dict[str, Any] = {"stand": None, "source": "none", "candidates": 0,
+                                  "warnings": [], "terminal": None, "terminal_source": "none",
+                                  "scope": self._stand_scope(ctx.get("dep_icao"), arr)}
+        if not stands:
+            result["warnings"].append("该机场没有停机位数据")
+            return result
+        type_row = ctx.get("type") or {}
+        terminals, rules = self.terminal_context(arr)
+        picked = stand_rules.pick_for_flight(
+            stands,
+            wingspan_m=float(type_row.get("wingspan_m") or 0) or None,
+            role=type_row.get("role"), size_filter=size_filter,
+            military=bool((self._arrival_airport(arr) or {}).get("military")),
+            terminals=terminals, rules=rules,
+            carriers=self._carriers(ctx.get("callsign")),
+            scope=result["scope"])
+        result["candidates"] = picked.get("candidates") or 0
+        result["warnings"].extend(picked.get("warnings") or [])
+        stand = picked.get("stand")
+        if stand is None:
+            result["warnings"].append("没有符合条件（尺寸/用途）的机位")
+            return result
+        result.update({
+            "stand": stand, "source": stand.get("source") or "navdata",
+            "terminal": stand.get("terminal"), "terminal_source": stand.get("terminal_source") or "none",
+        })
+        return result
+
+    def flight_stand(self, flight_record_id: str | None) -> dict[str, Any] | None:
+        if not flight_record_id:
+            return None
+        row = self._one("select * from flight_stand where flight_record_id=?", (flight_record_id,))
+        if not row:
+            return None
+        if row.get("has_jetway") is not None:
+            row["has_jetway"] = bool(row["has_jetway"])
+        row["score"] = _json_load(row.get("score_json"), {})
+        return row
+
+    def _save_stand(self, ctx: dict[str, Any], picked: dict[str, Any], *,
+                    eta_min: float | None, remaining_nm: float | None,
+                    status: str) -> dict[str, Any]:
+        stand = picked.get("stand") or {}
+        stamp = utcnow()
+        payload = {
+            "score": stand.get("score"), "breakdown": stand.get("score_breakdown"),
+            "candidates": picked.get("candidates"), "warnings": picked.get("warnings") or [],
+            "scope": picked.get("scope"),
+        }
+        with self._tx() as con:
+            row = con.execute("select * from flight_stand where flight_record_id=?",
+                              (ctx["flight_record_id"],)).fetchone()
+            # sqlite3.Row 没有 .get()，先转 dict 再比较（重算已有定稿机位时会走到这里）
+            before = dict(row) if row is not None else None
+            con.execute(
+                "insert or replace into flight_stand(flight_record_id, airport_icao, stand_ident, "
+                "stand_name, stand_number, stand_suffix, stand_type, lat, lon, heading, radius_m, "
+                "has_jetway, source, terminal, terminal_source, score_json, status, eta_min_at_pick, "
+                "remaining_nm_at_pick, created_at, updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ctx["flight_record_id"], ctx["arr_icao"], stand.get("ident"),
+                 stand.get("name"), stand.get("number"), stand.get("suffix"), stand.get("type"),
+                 stand.get("lat"), stand.get("lon"), stand.get("heading"), stand.get("radius_m"),
+                 None if stand.get("has_jetway") is None else int(bool(stand["has_jetway"])),
+                 picked.get("source") or "none", picked.get("terminal"),
+                 picked.get("terminal_source") or "none",
+                 json.dumps(payload, ensure_ascii=False, default=str), status,
+                 eta_min, remaining_nm,
+                 (before["created_at"] if before else stamp), stamp))
+            if before is None or before.get("stand_ident") != stand.get("ident"):
+                self._audit(con, "STAND_ASSIGN", "flight_stand", ctx["flight_record_id"],
+                            dict(before) if before else None,
+                            {"stand_ident": stand.get("ident"), "source": picked.get("source"),
+                             "terminal": picked.get("terminal")})
+        return self.flight_stand(ctx["flight_record_id"]) or {}
+
+    def ensure_flight_stand(self, flight_record_id: str, *, eta_min: float | None = None,
+                            remaining_nm: float | None = None, force: bool = False,
+                            size_filter: bool = True) -> dict[str, Any] | None:
+        """定稿机位（§4.3）：第一次算出即写库；只有「数据从无到有」或 force 才重算。"""
+        ctx = self._stand_context(flight_record_id)
+        if not ctx.get("arr_icao"):
+            return None
+        existing = self.flight_stand(flight_record_id)
+        stands = self.nav.stands(ctx["arr_icao"]) if self.nav is not None else []
+        if existing and not force:
+            data_arrived = existing.get("source") in (None, "none") and bool(stands)
+            if not data_arrived:
+                return existing
+        picked = self.pick_stand(ctx, size_filter=size_filter)
+        status = "PROPOSED"
+        if existing and existing.get("stand_ident") and existing.get("stand_ident") != (
+                (picked.get("stand") or {}).get("ident")):
+            status = "CHANGED"
+        elif existing:
+            status = existing.get("status") or "PROPOSED"
+        row = self._save_stand(ctx, picked, eta_min=eta_min, remaining_nm=remaining_nm, status=status)
+        if status == "CHANGED":
+            self._create_notice(
+                kind="STAND_CHANGED", flight_record_id=flight_record_id,
+                airport_icao=ctx["arr_icao"],
+                title=f"{ctx['arr_icao']} 机位已变更",
+                body=f"机位已变更：{existing.get('stand_ident')} → {(picked.get('stand') or {}).get('ident')}",
+                payload={"stand": row.get("stand_ident"), "before": existing.get("stand_ident"),
+                         "source": row.get("source")})
+        return row
+
+    def set_flight_stand(self, flight_record_id: str, stand_ident: str,
+                         *, force: bool = False) -> dict[str, Any]:
+        """手工指定/重算（`force=true` 才允许覆盖已 NOTIFIED 的机位）。"""
+        ctx = self._stand_context(flight_record_id)
+        if not ctx.get("arr_icao"):
+            raise OpsError("INVALID_STATE", "这段航班没有到达机场，无法指定机位")
+        existing = self.flight_stand(flight_record_id)
+        if existing and existing.get("status") == "NOTIFIED" and not force:
+            raise OpsError("INVALID_STATE", "机位已通知机组，重算需要 force=true")
+        wanted = str(stand_ident or "").strip().upper()
+        if not wanted:
+            picked = self.pick_stand(ctx)
+            if not picked.get("stand"):
+                raise OpsError("NOT_FOUND", "该机场没有可用机位数据")
+            row = self._save_stand(ctx, picked, eta_min=None, remaining_nm=None,
+                                   status="CHANGED" if existing else "PROPOSED")
+            return row
+        stands = self.nav.stands(ctx["arr_icao"]) if self.nav is not None else []
+        stand = _find_stand(stands, wanted)
+        if stand is None:
+            raise OpsError("NOT_FOUND", f"{ctx['arr_icao']} 没有机位 {wanted}")
+        picked = {"stand": {**stand, "score": None, "score_breakdown": {"manual": True}},
+                  "source": stand.get("source") or "navdata", "candidates": len(stands),
+                  "warnings": ["手工指定机位"], "terminal": None, "terminal_source": "none",
+                  "scope": self._stand_scope(ctx.get("dep_icao"), ctx.get("arr_icao"))}
+        return self._save_stand(ctx, picked, eta_min=None, remaining_nm=None, status="CHANGED")
+
+    def record_stand_sample(self, flight_record_id: str | None, lat: float | None,
+                            lon: float | None) -> dict[str, Any] | None:
+        """收尾时把「到机位」的真实位置写进 `stand_sample`（§7.1）。"""
+        if lat is None or lon is None or self.nav is None:
+            return None
+        airport, _distance = self.nav.nearest_airport(float(lat), float(lon), max_nm=5.0)
+        if not airport:
+            return None
+        icao = airport["ident"]
+        stand = self.nav.nearest_stand(icao, float(lat), float(lon))
+        stamp = utcnow()
+        payload = {"airport": icao, "stand_ident": (stand or {}).get("ident"),
+                   "distance_m": (stand or {}).get("distance_m")}
+        with self._tx() as con:
+            con.execute(
+                "insert into stand_sample(id, airport_icao, lat, lon, heading, stand_ident, "
+                "flight_record_id, created_at) values(?,?,?,?,?,?,?,?)",
+                (new_id(), icao, float(lat), float(lon), None,
+                 (stand or {}).get("ident"), flight_record_id, stamp))
+            if flight_record_id and stand:
+                row = con.execute("select stand_ident, status from flight_stand "
+                                  "where flight_record_id=?", (flight_record_id,)).fetchone()
+                if row and row["stand_ident"] == stand["ident"]:
+                    con.execute("update flight_stand set status='CONFIRMED', updated_at=? "
+                                "where flight_record_id=?", (stamp, flight_record_id))
+                elif row:
+                    self._audit(con, "STAND_MISMATCH", "flight_stand", flight_record_id,
+                                {"stand_ident": row["stand_ident"]},
+                                {"actual": stand["ident"], "distance_m": stand.get("distance_m")},
+                                "落地后实际机位与预计不一致")
+        return payload
+
+    def stand_sample_for(self, flight_record_id: str) -> dict[str, Any] | None:
+        """这段航班收尾时记下的「实际到机位」样本（复盘用）。"""
+        return self._one("select rowid as seq, * from stand_sample where flight_record_id=? "
+                         "order by created_at desc limit 1", (flight_record_id,))
+
+    # ---------------------------------------------------------- 通知队列（§6）
+    def _create_notice(self, *, kind: str, flight_record_id: str | None, airport_icao: str | None,
+                       title: str, body: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        stamp = utcnow()
+        with self._tx() as con:
+            cursor = con.execute(
+                "insert or ignore into flight_notice(id, kind, flight_record_id, airport_icao, "
+                "title, body, payload_json, created_at) values(?,?,?,?,?,?,?,?)",
+                (new_id(), kind, flight_record_id, airport_icao, title, body,
+                 json.dumps(payload or {}, ensure_ascii=False, default=str), stamp))
+            if not cursor.rowcount:
+                return None
+            row = con.execute("select rowid as seq, * from flight_notice where flight_record_id is ? "
+                              "and kind=? order by rowid desc limit 1",
+                              (flight_record_id, kind)).fetchone()
+        if not row:
+            return None
+        payload_row = dict(row)
+        payload_row["payload"] = _json_load(payload_row.get("payload_json"), {})
+        return payload_row
+
+    def notice_for(self, flight_record_id: str | None, kind: str) -> dict[str, Any] | None:
+        if not flight_record_id:
+            return None
+        row = self._one("select rowid as seq, * from flight_notice where flight_record_id=? "
+                        "and kind=? order by rowid desc limit 1", (flight_record_id, kind))
+        if row:
+            row["payload"] = _json_load(row.get("payload_json"), {})
+        return row
+
+    def list_notices(self, *, since: int | None = None, limit: int = 50,
+                     include_acked: bool = False) -> list[dict[str, Any]]:
+        sql = "select rowid as seq, * from flight_notice where 1=1"
+        args: list[Any] = []
+        if since:
+            sql += " and rowid > ?"
+            args.append(int(since))
+        if not include_acked:
+            sql += " and ack_by is null"
+        sql += " order by rowid limit ?"
+        args.append(max(1, min(200, int(limit or 50))))
+        out = []
+        for row in self._rows(sql, tuple(args)):
+            row["payload"] = _json_load(row.get("payload_json"), {})
+            out.append(row)
+        return out
+
+    def update_notice_payload(self, notice_id: str, extra: dict[str, Any]) -> dict[str, Any] | None:
+        """把投递结果（ACARS 状态 / 通道原因）并回通知 payload，供界面与复盘使用。"""
+        row = self._one("select * from flight_notice where id=?", (notice_id,))
+        if not row:
+            return None
+        payload = _json_load(row.get("payload_json"), {})
+        payload.update(extra or {})
+        with self._tx() as con:
+            con.execute("update flight_notice set payload_json=? where id=?",
+                        (json.dumps(payload, ensure_ascii=False, default=str), notice_id))
+        return {**row, "payload": payload}
+
+    def ack_notice(self, notice_id: str, by: str = "ui") -> dict[str, Any]:
+        stamp = utcnow()
+        with self._tx() as con:
+            cursor = con.execute("update flight_notice set ack_by=?, ack_at=? "
+                                 "where id=? and ack_by is null", (by, stamp, notice_id))
+        return {"ok": True, "acked": bool(cursor.rowcount), "id": notice_id}
+
+    def stand_packet(self, stand: dict[str, Any] | None, *, airport: str | None,
+                     eta_utc: str | None = None) -> str:
+        """Hoppie telex 报文（§6.1）：大写、短、≤200 字符，`@` 可换行。"""
+        ident = str((stand or {}).get("stand_ident") or "").strip().upper()
+        parts = ["AOC ARR", str(airport or "").upper() or "----"]
+        if ident:
+            parts += ["GATE", ident]
+        if (stand or {}).get("has_jetway"):
+            parts.append("JETWAY")
+        if eta_utc:
+            stamp = str(eta_utc)
+            if len(stamp) >= 16:
+                parts.append(f"ETA {stamp[11:13]}{stamp[14:16]}Z")
+        if (stand or {}).get("terminal"):
+            parts.append("TERM RULE")   # 只表明「按承运人规则」，不写航站楼号（Q-4）
+        return " ".join(parts)[:200].upper()
+
+    def ensure_stand_notice(self, flight_record_id: str, *, eta_min: float | None = None,
+                            remaining_nm: float | None = None, eta_utc: str | None = None,
+                            trigger: str | None = None,
+                            size_filter: bool = True) -> dict[str, Any] | None:
+        """到达前提醒：算/取机位 + 落一条通知（幂等：`flight_record_id + kind`）。"""
+        ctx = self._stand_context(flight_record_id)
+        if not ctx.get("arr_icao"):
+            return None
+        stand = self.ensure_flight_stand(flight_record_id, eta_min=eta_min,
+                                         remaining_nm=remaining_nm, size_filter=size_filter)
+        ident = (stand or {}).get("stand_ident")
+        kind = "STAND_ETA" if ident else "ETA_ONLY"
+        if self.notice_for(flight_record_id, kind):
+            return None
+        arr = ctx["arr_icao"]
+        eta_text = f"预计到达 {eta_utc[11:16]}Z" if eta_utc else "预计即将到达"
+        if ident:
+            title = f"{arr} 预计停机位 {ident}"
+            extra = []
+            if (stand or {}).get("has_jetway"):
+                extra.append("廊桥")
+            extra.append(f"来源 {stand.get('source')}")
+            if (stand or {}).get("terminal_source") == "rule":
+                extra.append("按承运人规则")
+            body = f"{eta_text} · {' · '.join(extra)}"
+        else:
+            title = f"{arr} 预计到达"
+            body = f"{eta_text} · 该机场没有停机位数据（不编造机位）"
+        notice = self._create_notice(
+            kind=kind, flight_record_id=flight_record_id, airport_icao=arr,
+            title=title, body=body,
+            payload={"arr_icao": arr, "stand": ident, "source": (stand or {}).get("source"),
+                     "terminal_source": (stand or {}).get("terminal_source"),
+                     "eta_utc": eta_utc, "eta_min": eta_min, "remaining_nm": remaining_nm,
+                     "trigger": trigger,
+                     "packet": self.stand_packet(stand, airport=arr, eta_utc=eta_utc)})
+        if notice and ident and stand:
+            with self._tx() as con:
+                con.execute("update flight_stand set status='NOTIFIED', updated_at=? "
+                            "where flight_record_id=?", (utcnow(), flight_record_id))
+        return notice
+
+    # ------------------------------------------------------- Hoppie logon（§6.1）
+    HOPPIE_LOGON_KEY = "hoppie_logon"
+
+    def hoppie_logon(self) -> str:
+        """站点/个人 logon code（DPAPI 加密存 `ops_meta`，只在本机库里）。"""
+        row = self._one("select value from ops_meta where key=?", (self.HOPPIE_LOGON_KEY,))
+        return hoppie.unprotect(row["value"] if row else "") if row else ""
+
+    def set_hoppie_logon(self, logon: Any) -> dict[str, Any]:
+        value = str(logon or "").strip()
+        if value and len(value) < 8:
+            raise OpsError("VALIDATION", "logon code 至少 8 个字符（Hoppie 站点码通常 ≥24 位）",
+                           {"key": "logon"})
+        with self._tx() as con:
+            if value:
+                con.execute("insert or replace into ops_meta(key, value) values(?,?)",
+                            (self.HOPPIE_LOGON_KEY, hoppie.protect(value)))
+            else:
+                con.execute("delete from ops_meta where key=?", (self.HOPPIE_LOGON_KEY,))
+            self._audit(con, "HOPPIE_LOGON_SET", "ops_meta", self.HOPPIE_LOGON_KEY, None,
+                        {"configured": bool(value), "masked": hoppie.mask(value)})
+        return {"ok": True, "configured": bool(value), "masked": hoppie.mask(value)}
+
+    def hoppie_send(self, packet: str, *, from_: str, to: str,
+                    flight_record_id: str | None = None) -> dict[str, Any]:
+        """发一条 telex 并落审计（`SENT` 只代表已交网络）。"""
+        logon = self.hoppie_logon()
+        if not logon:
+            return {"ok": False, "verdict": "NOT_CONFIGURED", "error": "未配置 Hoppie logon code"}
+        result = hoppie.send_telex(logon, from_, to, packet)
+        with self._tx() as con:
+            self._audit(con, "HOPPIE_TELEX_SENT" if result.get("ok") else "HOPPIE_TELEX_FAILED",
+                        "flight_stand", flight_record_id or f"{from_}>{to}",
+                        None, {k: result.get(k) for k in
+                               ("verdict", "http_status", "elapsed_ms", "error")},
+                        packet)
+        return {**result, "packet": packet, "from": from_, "to": to}
 
     # ------------------------------------------------------------------ 航线/班期
     def list_routes(self) -> list[dict[str, Any]]:

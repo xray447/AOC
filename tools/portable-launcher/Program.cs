@@ -26,8 +26,12 @@ internal static class Program
     private const uint NifMessage = 0x01;
     private const uint NifIcon = 0x02;
     private const uint NifTip = 0x04;
+    // docs/12 §6：托盘气泡（NIM_MODIFY + NIF_INFO）承载到达提醒
+    private const uint NifInfo = 0x10;
     private const uint NimAdd = 0x00;
+    private const uint NimModify = 0x01;
     private const uint NimDelete = 0x02;
+    private const uint NiifInfo = 0x01;
     private const uint MfString = 0x0000;
     private const uint MfSeparator = 0x0800;
     private const uint TpmRightButton = 0x0002;
@@ -252,6 +256,8 @@ internal static class Program
         StartCore();
         StartSimlink();
         _ = Task.Run(OpenWhenReadyAsync);
+        // docs/12 §6：页面隐藏（浏览器最小化/全屏飞）时由启动器轮询通知队列弹托盘气泡
+        _ = Task.Run(WatchNoticesAsync);
 
         while (GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
@@ -313,6 +319,27 @@ internal static class Program
             szInfoTitle = "",
         };
         Shell_NotifyIconW(NimDelete, ref data);
+    }
+
+    /// <summary>托盘气泡：标题/正文都截断到 Win32 结构体允许的长度（szInfo 256 / szInfoTitle 64）。</summary>
+    private static void ShowBalloon(string title, string body)
+    {
+        string Clamp(string text, int max) => text.Length <= max ? text : text[..(max - 1)] + "…";
+        var data = new NotifyIconData
+        {
+            cbSize = (uint)Marshal.SizeOf<NotifyIconData>(),
+            hWnd = _hwnd,
+            uID = 1,
+            uFlags = NifInfo,
+            szTip = "",
+            szInfo = Clamp(body ?? "", 250),
+            szInfoTitle = Clamp(title ?? "AOC", 60),
+            dwInfoFlags = NiifInfo,
+        };
+        if (!Shell_NotifyIconW(NimModify, ref data))
+        {
+            Log("launcher", $"托盘气泡显示失败（Win32 错误 {Marshal.GetLastWin32Error()}）");
+        }
     }
 
     private static IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -570,7 +597,88 @@ internal static class Program
         Log("launcher", "健康检查超时，请手动打开托盘菜单里的客户端");
     }
 
-    private static string? ReadRuntimeUrl()
+    // -- 到达提醒（docs/12 §6）：托盘气泡 -------------------------------------
+    private static async Task WatchNoticesAsync()
+    {
+        long cursor = 0;
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            var runtime = ReadRuntime();
+            if (runtime is null)
+            {
+                continue;
+            }
+            var (url, token) = runtime.Value;
+            var body = await HttpGetAsync($"{url.TrimEnd('/')}/local/notifications?since={cursor}", token);
+            if (string.IsNullOrEmpty(body))
+            {
+                continue;
+            }
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (!doc.RootElement.TryGetProperty("items", out var items))
+                {
+                    continue;
+                }
+                foreach (var item in items.EnumerateArray())
+                {
+                    if (item.TryGetProperty("seq", out var seq) && seq.TryGetInt64(out var value))
+                    {
+                        cursor = Math.Max(cursor, value);
+                    }
+                    var title = item.TryGetProperty("title", out var t) ? t.GetString() ?? "AOC" : "AOC";
+                    var text = item.TryGetProperty("body", out var b) ? b.GetString() ?? "" : "";
+                    ShowBalloon(title, text);
+                    if (item.TryGetProperty("id", out var id) && id.GetString() is { } noticeId)
+                    {
+                        await HttpPostAsync(
+                            $"{url.TrimEnd('/')}/local/notifications/{noticeId}/ack",
+                            token, "{\"by\":\"portable\"}");
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // 响应不完整（core 正在退出）：下一轮再取
+            }
+        }
+    }
+
+    private static async Task<string?> HttpGetAsync(string url, string token)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.TryAddWithoutValidation("X-AOC-Token", token);
+            using var response = await Http.SendAsync(request);
+            return response.IsSuccessStatusCode ? await response.Content.ReadAsStringAsync() : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task HttpPostAsync(string url, string token, string json)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new StringContent(json, Encoding.UTF8, "application/json"),
+            };
+            request.Headers.TryAddWithoutValidation("X-AOC-Token", token);
+            using var response = await Http.SendAsync(request);
+        }
+        catch
+        {
+            // ack 失败只影响会不会重复弹一次，不写日志
+        }
+    }
+
+    private static (string url, string token)? ReadRuntime()
     {
         try
         {
@@ -580,16 +688,26 @@ internal static class Program
                 return null;
             }
             using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            if (doc.RootElement.TryGetProperty("url", out var url))
+            if (!doc.RootElement.TryGetProperty("url", out var urlElement))
             {
-                var value = url.GetString();
-                return string.IsNullOrWhiteSpace(value) ? null : value;
+                return null;
             }
+            var url = urlElement.GetString();
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return null;
+            }
+            var token = doc.RootElement.TryGetProperty("token", out var tokenElement)
+                ? tokenElement.GetString() ?? ""
+                : "";
+            return (url!, token);
         }
         catch
         {
             // runtime.json 可能正写到一半
+            return null;
         }
-        return null;
     }
+
+    private static string? ReadRuntimeUrl() => ReadRuntime()?.url;
 }

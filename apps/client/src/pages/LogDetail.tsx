@@ -10,7 +10,9 @@ import { projectOnRunway } from "../components/RunwayTouchdown";
 import { useApp } from "../context";
 import { useI18n } from "../i18n";
 import { anomalyLabel, eventLabel } from "../ops";
-import type { AirportDetail, AirportRunway, FlightRecord, OpsSettlement, TrackData } from "../types";
+import type {
+  AirportDetail, AirportRunway, FlightRecord, FlightStand, OpsSettlement, StandSample, TrackData,
+} from "../types";
 import {
   fmtAltitude, fmtDateTime, fmtDistance, fmtMinutes, fmtSignedKg, fmtWeight, ratingLabels, statusLabels,
 } from "../utils";
@@ -55,6 +57,9 @@ export function LogDetail() {
   const [flight, setFlight] = useState<FlightRecord | null>(null);
   const [track, setTrack] = useState<TrackData | null>(null);
   const [airport, setAirport] = useState<AirportDetail | null>(null);
+  // docs/12：计划机位 vs 实际到机位（复盘）
+  const [stand, setStand] = useState<FlightStand | null>(null);
+  const [standSample, setStandSample] = useState<StandSample | null>(null);
   const [notes, setNotes] = useState("");
   // IA-05：同一条航班的「轨迹」与「结算」不再分在两页，详情里直接折叠展示
   const [settlement, setSettlement] = useState<OpsSettlement | null>(null);
@@ -97,6 +102,16 @@ export function LogDetail() {
       }
     } else {
       setAirport(null);
+    }
+    // docs/12：计划机位 + 收尾时记下的实际到机位（没有就静默跳过）
+    try {
+      const res = await api<{ stand: FlightStand | null; sample: StandSample | null }>(
+        `/local/flights/${id}/stand`);
+      setStand(res.stand);
+      setStandSample(res.sample);
+    } catch {
+      setStand(null);
+      setStandSample(null);
     }
     setLoading(false);
   }, [id]);
@@ -281,6 +296,16 @@ export function LogDetail() {
                             {" "}({flight.runway_source === "scenery"
                               ? tr("游戏内", "in-game")
                               : "navdata"})
+                          </span>
+                        ) : null}
+                      </Descriptions.Item>
+                      {/* docs/12：计划机位 vs 实际到机位（A-36 复盘口径） */}
+                      <Descriptions.Item label={tr("停机位", "Stand")}>
+                        {stand?.stand_ident || "—"}
+                        {stand?.has_jetway ? <Tag color="green" style={{ marginLeft: 6 }}>{tr("廊桥", "jetway")}</Tag> : null}
+                        {standSample?.stand_ident ? (
+                          <span className="muted">
+                            {" "}({tr("实际", "actual")} {standSample.stand_ident})
                           </span>
                         ) : null}
                       </Descriptions.Item>
