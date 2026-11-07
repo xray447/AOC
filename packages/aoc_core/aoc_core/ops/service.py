@@ -1748,7 +1748,10 @@ class OpsService:
         """发一条 telex 并落审计（`SENT` 只代表已交网络）。"""
         logon = self.hoppie_logon()
         if not logon:
-            return {"ok": False, "verdict": "NOT_CONFIGURED", "error": "未配置 Hoppie logon code"}
+            # 早退也要把 from/to/packet 带上：前端「测试报文」直接展示这份结构
+            return {"ok": False, "verdict": "NOT_CONFIGURED", "http_status": None,
+                    "elapsed_ms": 0.0, "error": "未配置 Hoppie logon code",
+                    "packet": packet, "from": from_, "to": to}
         result = hoppie.send_telex(logon, from_, to, packet)
         with self._tx() as con:
             self._audit(con, "HOPPIE_TELEX_SENT" if result.get("ok") else "HOPPIE_TELEX_FAILED",

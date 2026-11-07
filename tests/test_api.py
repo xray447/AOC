@@ -1,8 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import re
+from pathlib import Path
 
 from .conftest import make_points
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_core_handlers_only_reference_existing_members(app_client):
+    """`main.py`（与 aoc-core 的分发逻辑）只能碰真实存在的成员。
+
+    曾把 `_stand_callsign` 写成 `stand_callsign` → `/local/hoppie/test` 直接 500。
+    """
+    text = (ROOT / "apps" / "aoc-core" / "main.py").read_text(encoding="utf-8")
+    service = app_client.app.state.service
+    missing = sorted({name for name in re.findall(r"\bservice\.([A-Za-z_]\w*)", text)
+                      if not hasattr(service, name)})
+    assert missing == []
+    # 同一个类里 `self.<method>(` 也必须真的定义过
+    tree = ast.parse((ROOT / "packages" / "aoc_core" / "aoc_core" / "service.py")
+                     .read_text(encoding="utf-8"))
+    defined = {node.name for node in ast.walk(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    called = set(re.findall(r"\bself\.([a-z_]\w*)\(", text))
+    assert called <= defined | {"state"}
 
 
 def test_health_and_bootstrap_without_token(app_client):

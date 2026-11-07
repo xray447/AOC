@@ -66,13 +66,17 @@ export function StandNoticeCard({ draft, patch }: {
   const sendTest = async () => {
     setBusy(true);
     try {
-      const res = await api<{ verdict: string; error?: string | null }>("/local/hoppie/test", {
-        method: "POST", body: JSON.stringify({}),
-      });
-      const ok = ["OK", "UNKNOWN"].includes(res.verdict);
-      (ok ? message.success : message.warning)(
-        tr(`已交网络（${res.verdict}）——Hoppie 没有回执，要去机上确认`,
-          `Handed to the network (${res.verdict}) — Hoppie has no ACK; confirm in the cockpit`));
+      const res = await api<{ verdict: string; ok?: boolean; error?: string | null }>(
+        "/local/hoppie/test", { method: "POST", body: JSON.stringify({}) });
+      if (res.ok ?? ["OK", "UNKNOWN"].includes(res.verdict)) {
+        message.success(
+          tr(`已交网络（${res.verdict}）——Hoppie 没有回执，要去机上确认`,
+            `Handed to the network (${res.verdict}) — Hoppie has no ACK; confirm in the cockpit`));
+      } else {
+        message.warning(
+          tr(`没有发出（${res.verdict}）${res.error ? `：${res.error}` : ""}`,
+            `Not sent (${res.verdict})${res.error ? `: ${res.error}` : ""}`));
+      }
     } catch (e) {
       message.error((e as Error).message);
     } finally {

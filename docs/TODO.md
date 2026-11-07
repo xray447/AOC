@@ -832,6 +832,7 @@
 - **落库/接口不变**：`score = null`、`score_json.breakdown = {"random": true, "candidates": N}`，`flight_stand` 表与前端 `FlightStand` 类型不动；定稿语义不变（随机只发生在首次落库与显式重算）。
 - **机位编号去掉 `G`/`P` 前缀**：LNM 的 `parking.name` 里单字母 `G`（廊桥位）/ `P`（停机坪）是全局类别识别符（全库 `P` 26.7 万、`G` 9.1 千行），不是编号本身 → `navdata._stand_row()` 新增 `GLOBAL_STAND_PREFIXES`，`G18`→`18`、`P532`→`532`、`G23V`→`23V`；`GA/GB/NP/…` 子区字母与现实库的完整 name（`P212R`）不动，撞号仍补 `#parking_id`。手工指定兼容旧写法：`set_flight_stand()` 走 `_find_stand()`，输入 `G340` 也能命中 `340`。前端手工输入提示改成 `532 / 212R`。
 - **联机（P3）只写文档**：占用键 `(airport_icao, stand_ident, time_window)`、服务端在未占用候选里随机、冲突重抽 + `ops_audit(STAND_REASSIGN)`、客户端不得自行定稿（对齐 IA-07）。见 [12](12-预计停机位与到达提醒.md) §4.4，本轮不实作。
+- **修 Hoppie 测试报文 500 / 自动投递不发**（同日）：`POST /local/hoppie/test` 调 `service.stand_callsign()`，但方法实际叫 `_stand_callsign` → `AttributeError` 直接 500；同一个拼错也在 `_dispatch_notice()` 里（发送前就炸，所以自动 ACARS 一直没发出去）。已把方法改名为公开的 `stand_callsign()`（设置里的 `hoppie_callsign` 优先，其次当前任务呼号）。`hoppie_send()` 未配置 logon 的早退也补上 `from/to/packet`，前端「测试报文」按 `ok` 区分「已交网络」与「没有发出（原因）」。新增用例：`test_hoppie_test_endpoint_returns_verdict`、`test_dispatch_notice_does_not_raise`、`test_stand_callsign_prefers_settings_then_task`。
 - **测试**：`test_pick_is_deterministic` 改成 `test_pick_is_random_within_rules`（40 次都落在候选内且不止一个结果）；新增 `test_size_only_filters_not_prefers`（GM/GH 都会出现）。`pytest` 208 项、`ruff` 全绿。
 
 ---

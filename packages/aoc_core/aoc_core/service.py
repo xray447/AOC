@@ -1073,7 +1073,8 @@ class PersonalService:
         result["reason_text"] = self.STAND_REASON_TEXT.get(result["reason"] or "")
         return result
 
-    def _stand_callsign(self) -> str | None:
+    def stand_callsign(self) -> str | None:
+        """Hoppie 目的呼号：设置里填的优先，否则用当前任务呼号（`/local/hoppie/test` 也用这个）。"""
         task = self.ops.active_task() or {}
         settings_callsign = str(self._settings.get("hoppie_callsign") or "").strip().upper()
         if settings_callsign:

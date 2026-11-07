@@ -323,6 +323,26 @@ def test_hoppie_logon_roundtrip(service: PersonalService):
     assert service.ops.hoppie_logon() == ""
 
 
+def test_stand_callsign_prefers_settings_then_task(service: PersonalService):
+    """Hoppie 目的呼号：设置优先，其次当前任务（`/local/hoppie/test` 与投递共用）。"""
+    assert service.stand_callsign() is None
+    service.update_settings({"hoppie_callsign": "aoc1234"})
+    assert service.stand_callsign() == "AOC1234"
+
+
+def test_dispatch_notice_does_not_raise(service: PersonalService,
+                                        monkeypatch: pytest.MonkeyPatch):
+    """投递分支不能炸（曾因 `stand_callsign` 名字拼错：发送前就 AttributeError）。"""
+    _flight(service, flight_id="flight-dispatch")
+    notice = service.ops.ensure_stand_notice(
+        "flight-dispatch", eta_min=20, remaining_nm=90,
+        eta_utc="2026-11-07T12:00:00Z", trigger="distance")
+    monkeypatch.setenv("AOC_NO_NET", "1")
+    service._dispatch_notice(notice, {"arr_icao": "ZSSS", "callsign": "AOC101"})
+    again = service.ops.notice_for("flight-dispatch", "STAND_ETA") or {}
+    assert "acars" in (again.get("payload") or {})
+
+
 # ------------------------------------------------------------------- API ----
 def test_scenery_library_preferred(app_client, navdata_path: Path, tmp_path: Path,
                                    monkeypatch: pytest.MonkeyPatch):
@@ -377,6 +397,16 @@ def test_stand_api_endpoints(app_client, navdata_path: Path):
     assert saved["configured"] is True
     assert "gTESTLOGON0123456789" not in saved["masked"]
     assert app_client.post("/local/hoppie/logon", json={"logon": ""}).json()["configured"] is False
+
+
+def test_hoppie_test_endpoint_returns_verdict(app_client):
+    """`POST /local/hoppie/test` 以前直接 500（`PersonalService` 没有 `stand_callsign`）。"""
+    assert app_client.post("/local/hoppie/test", json={}).status_code == 422
+    res = app_client.post("/local/hoppie/test", json={"callsign": "AOC1234"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is False and body["verdict"] == "NOT_CONFIGURED"
+    assert body["to"] == "AOC1234" and body["packet"] == "AOC TEST ACARS LINK"
 
 
 def test_notification_queue_endpoints(app_client, navdata_path: Path):
